@@ -379,7 +379,7 @@ async def action(world_id: int, body: ActionIn, _rl: None = Depends(make_guard("
         return _slash_board(world_id)
     if low == "/risk" or low.startswith("/risk "):
         return _slash_risk(world_id, text[5:].strip())
-    if low in ("/journal", "/хроника", "/дневник"):
+    if low == "/journal" or low.startswith(("/journal ", "/хроника ", "/дневник ")) or low in ("/хроника", "/дневник"):
         return _slash_journal(world_id, text)
     if low in ("/help", "/помощь"):
         return {"reply": ("Команды: /roll <куб>, /hint, /memory <запрос>, /where, /status, /quests, /stats, "
@@ -857,6 +857,11 @@ def _slash_journal(world_id: int, text: str = ""):
     from .. import journal as _jr
     setting = json.loads(db.get_world(world_id)["setting"])
     arg = (text or "").strip()
+    # в chat может прийти полный ввод («/journal note …») — срезаем префикс команды
+    for pfx in ("/journal", "/хроника", "/дневник"):
+        if arg.lower().startswith(pfx):
+            arg = arg[len(pfx):].strip()
+            break
     low = arg.lower()
     if low.startswith("note ") or low.startswith("заметка "):
         note = arg.split(" ", 1)[1].strip()[:400]

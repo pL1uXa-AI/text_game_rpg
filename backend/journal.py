@@ -203,7 +203,9 @@ def record_turn(world_id: int, prev: dict, now: dict, seq: int, action: str = ""
     """
     saved: list[dict] = []
     try:
-        for item in notable_diff(prev, now, action, sys_msgs):
+        diff = notable_diff(prev, now, action, sys_msgs)
+        log.debug("дневник (world %s, seq %s): значимых событий %d", world_id, seq, len(diff))
+        for item in diff:
             cat = str(item.get("cat") or CAT_WORLD)
             title = str(item.get("title") or "").strip()[:120]
             if not title:

@@ -367,7 +367,9 @@ def select_relevant_entities(world_id: int, setting: dict, action: str, limit: i
         return pv
 
     scored = sorted(all_cards, key=priority, reverse=True)
-    return scored[:limit]
+    # Карточки дневника (kind=journal) — слой для ИГРОКА (вкладка «Дневник»), их НЕ
+    # должно быть в контексте модели: хроника вытеснила бы живые карточки NPC из окна.
+    return [c for c in scored[:limit] if c.get("kind") != "journal"]
 
 
 def _origin_for(name: str, origins: list[str] | None) -> str | None:

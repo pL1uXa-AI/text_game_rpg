@@ -4,7 +4,7 @@
 const $ = (id) => document.getElementById(id);
 const state = { worlds: [], themes: [], genres: [], selectedGenres: [], plots: [], narrators: [], providers: null, providersEffective: null,
                 currentWorld: null, setting: null, gen: {}, streaming: false, seenSeq: 0, pollTimer: null,
-                tts: null, ttsStatus: null, ttsSettingsRaw: {}, playingTts: null, memoryDefaults: {} };
+                tts: null, ttsStatus: null, ttsSettingsRaw: {}, playingTts: null, memoryDefaults: {}, eventSource: null };
 
 const API = (path, opts = {}) =>
   fetch(path, { headers: { "Content-Type": "application/json" }, ...opts })
@@ -335,6 +335,7 @@ async function openWorld(id) {
   requestAnimationFrame(() => { $("log").scrollTop = $("log").scrollHeight; });
   if (state.pollTimer) clearInterval(state.pollTimer);
   state.pollTimer = setInterval(pollEvents, 15000);
+  startLiveBus();          // D3 (сессия 34): SSE-лента мира; поллинг остаётся запасным
   loadEntities();
   loadLore();
   loadSaves();
@@ -345,6 +346,7 @@ async function openWorld(id) {
 
 function goMenu() {
   state.currentWorld = null;
+  stopLiveBus();
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
   $("screen-game").style.display = "none";
   $("screen-start").style.display = "";
@@ -355,6 +357,156 @@ function goMenu() {
 }
 
 /* ─────────────── Живой чат: подтягиваем фоновые события мира ─────────────── */
+/* D3 (сессия 34): SSE-лента мира (bus.py + GET /events/stream). Поверх поллинга:
+   если EventSource упал/не поддерживается — поллинг pollEvents остаётся запасным. */
+function startLiveBus() {
+  stopLiveBus();
+  if (!state.currentWorld) return;
+  try {
+    const es = new EventSource(`/api/worlds/${state.currentWorld}/events/stream?after=${state.seenSeq || 0}`);
+    state.eventSource = es;
+    es.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (!data || data.type !== "event" || !data.event) return;
+        const e = data.event;
+        if (e.seq > (state.seenSeq || 0)) state.seenSeq = +e.seq;
+        if (e.folded || e.role === "player") return;
+        if (document.querySelector(`.msg[data-seq="${e.seq}"]`)) return;
+        appendMsg(e, true);
+      } catch (_) { /* битое сообщение шины — игнор, поллинг догонит */ }
+    };
+    es.onerror = () => {
+      // EventSource сам переподключается; при недоступности — поллинг уже работает
+    };
+  } catch (_) { state.eventSource = null; }
+}
+
+function stopLiveBus() {
+  if (state.eventSource) { try { state.eventSource.close(); } catch (_) {} state.eventSource = null; }
+}
+
+/* ─────────────── C4: часы мира + компас соседних локаций ─────────────── */
+function renderWorldClock(s) {
+  const el = $("world-clock");
+  if (!el) return;
+  const parts = [];
+  if (s.time) parts.push(`🕐 ${s.time}`);
+  if (s.weather) parts.push(`☁ ${s.weather}`);
+  if (s.date && s.date.season) parts.push(`🍂 ${s.date.season}`);
+  el.textContent = parts.join(" · ");
+  el.title = parts.join(", ") || "время и погода мира";
+}
+
+function renderCompass(s) {
+  const el = $("compass-bar");
+  if (!el) return;
+  const locs = s.locations || {};
+  const cur = s.current_location;
+  const here = cur && locs[cur];
+  const conns = (here && Array.isArray(here.connections)) ? here.connections : [];
+  // подстраховка: если рёбер в состоянии нет — возьмём из кэша карты (граф) при его наличии
+  let items = conns.map((id) => ({ id, name: (locs[id] && locs[id].name) || id }))
+    .filter((x) => x.id !== cur);
+  if (!items.length && state.mapGraph && state.mapGraph.edges) {
+    items = state.mapGraph.edges
+      .filter((e) => e[0] === cur || e[1] === cur)
+      .map((e) => { const id = e[0] === cur ? e[1] : e[0]; return { id, name: (locs[id] && locs[id].name) || id }; });
+  }
+  if (!items.length) { el.style.display = "none"; return; }
+  el.style.display = "";
+  el.innerHTML = `<span class="compass-label">🧭 рядом:</span> ` + items.slice(0, 6).map((it) =>
+    `<button class="btn small compass-btn" data-loc="${esc(it.id)}" title="Идти в ${esc(it.name)}">→ ${esc(it.name)}</button>`
+  ).join("");
+  el.querySelectorAll(".compass-btn").forEach((b) => {
+    b.onclick = () => sendAsAction(`Идти в ${b.dataset.loc}`);
+  });
+}
+
+/* Отправить текст как действие игрока (общий путь для компас/кнопок). */
+async function sendAsAction(text) {
+  if (!text || !text.trim() || state.streaming) return;
+  const input = $("cmd");
+  if (input) input.value = "";
+  appendMsg({ role: "player", content: text.trim(), seq: "" });
+  await streamTurn(text.trim(), false);
+}
+
+/* ─────────────── C2: дневник приключений (вкладка) ─────────────── */
+async function loadJournal() {
+  if (!state.currentWorld) return;
+  const list = $("journal-list");
+  if (!list) return;
+  try {
+    const cat = ($("jr-cat") && $("jr-cat").value) || "";
+    const d = await API(`/api/worlds/${state.currentWorld}/journal?limit=150&cat=${encodeURIComponent(cat)}`);
+    const sel = $("jr-cat");
+    if (sel && sel.options.length <= 1 && d.categories && d.categories.length) {
+      sel.innerHTML = `<option value="">все записи</option>` +
+        d.categories.map((c) => `<option value="${esc(c.cat)}">${esc(c.icon)} ${esc(c.cat)} (${c.count})</option>`).join("");
+    }
+    // «на горизонте» (ружья Чехова, C9)
+    const chk = $("jr-chekhov");
+    const guns = (state.setting && state.setting._chekhov) || [];
+    if (chk && guns.length) {
+      chk.style.display = "";
+      chk.innerHTML = `🏹 На горизонте: ` + guns.map((g) => esc(g.subject || "")).join(" · ") +
+        ` <small>(верни в сюжет, когда уместно)</small>`;
+    } else if (chk) { chk.style.display = "none"; chk.innerHTML = ""; }
+    list.innerHTML = d.entries.length ? d.entries.map((e) =>
+      `<li class="item-clickable" onclick="scrollToSeq(${e.seq})" title="к ходу ${e.seq}">` +
+      `<small class="right">ход ${e.seq}</small>${esc(e.icon)} <b>${esc(e.title)}</b>` +
+      (e.text ? `<small>${esc(e.text)}</small>` : ``) + `</li>`
+    ).join("") : `<li class="muted">Пока пусто — дневник заполняется значимыми событиями (встречи, квесты, находки, смена роли).</li>`;
+  } catch (_) {
+    list.innerHTML = `<li class="muted">Дневник недоступен.</li>`;
+  }
+}
+
+function scrollToSeq(seq) {
+  const msg = document.querySelector(`.msg[data-seq="${seq}"]`);
+  if (msg) { msg.scrollIntoView({ block: "center" }); msg.classList.add("flash-seq"); return; }
+  // если события ещё не загружены (пагинация) — открываем историю
+  alert(`Событие хода ${seq} не в загруженной части лога. Поднимись в начало и нажми «⬆ Показать ранние события».`);
+}
+
+/* ─────────────── C1: перемотка к ходу ─────────────── */
+async function openRewindModal() {
+  if (!state.currentWorld) return;
+  let pts;
+  try { pts = (await API(`/api/worlds/${state.currentWorld}/rewind/points`)).points || []; }
+  catch (_) { alert("Точки перемотки недоступны."); return; }
+  if (!pts.length) { alert("Точек перемотки пока нет — дойди до пары ходов, и появятся."); return; }
+  const body = `<p class="muted">Перемотка возвращает мир к началу выбранного хода: состояние, память, дневник. Ходы после точки будут удалены (сохрани заранее, если дорого).</p>` +
+    `<ul class="list rewind-list">` + pts.map((p) =>
+      `<li><button class="btn small rewind-btn" data-seq="${p.seq}">⏪ к ходу ${p.seq}</button>` +
+      ` <small class="muted">${esc(p.preview || "—")}</small></li>`
+    ).join("") + `</ul>`;
+  openModal("⏪ Вернуть мир к ходу", body, async () => {
+    const btn = document.querySelector(".rewind-btn:focus");
+    if (!btn) { alert("Выбери ход из списка."); throw new Error("no-seq"); }
+    const seq = btn.dataset.seq;
+    if (!confirm(`Точно вернуть мир к ходу ${seq}? Ходы после него будут удалены.`)) throw new Error("cancel");
+    const res = await API(`/api/worlds/${state.currentWorld}/rewind`, {
+      method: "POST", body: JSON.stringify({ seq: +seq, mode: "delete" }),
+    });
+    await openWorld(state.currentWorld);   // перезагрузка лога/состояния/памяти
+  });
+}
+
+/* ─────────────── C7: /risk (мои средства) ─────────────── */
+async function openRiskModal() {
+  if (!state.currentWorld) return;
+  const idea = ($("cmd") && $("cmd").value.trim()) || "";
+  let reply = "";
+  try {
+    const d = await API(`/api/worlds/${state.currentWorld}/risk?idea=${encodeURIComponent(idea)}`);
+    reply = d.reply || "";
+  } catch (_) { reply = "Справка /risk недоступна."; }
+  openModal("🧭 Мои средства", `<pre class="risk-pre">${esc(reply)}</pre>`,
+    async () => { $("cmd").focus(); });
+}
+
 async function pollEvents() {
   if (!state.currentWorld || state.streaming) return;
   try {
@@ -789,6 +941,9 @@ function renderSetting(s) {
     `<span class="item-clickable flag-pill" onclick="showFlag(${fi})" title="${esc(k)}=${esc(JSON.stringify(v))}">🚩 ${esc(flagLabel(k))}: ${flagWord(v)}</span>`).join("") || `<span class="flags-none">нет</span>`;
   renderMap();
   renderSuggestionBar();
+  // C4 (сессия 34): часы мира (время/погода/сезон) и компас соседних локаций
+  renderWorldClock(s);
+  renderCompass(s);
 }
 
 /* ─────────────── Карта мира (SVG-граф локаций) ─────────────── */
@@ -2535,6 +2690,20 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-divine").onclick = divineModal;
 
   $("btn-hint").onclick = () => { $("cmd").value = "/hint"; sendAction(); };
+  // C1: перемотка к ходу (сессия 34)
+  $("btn-rewind").onclick = openRewindModal;
+  // C7: справка «мои средства» (сессия 34)
+  $("btn-risk").onclick = openRiskModal;
+  // C2: заметка игрока в дневник
+  $("btn-jr-note").onclick = async () => {
+    const note = ($("jr-note") || {}).value;
+    if (!note || !note.trim()) return;
+    $("cmd").value = `/journal note ${note.trim()}`;
+    sendAction();
+    if ($("jr-note")) $("jr-note").value = "";
+  };
+  if ($("jr-cat")) $("jr-cat").onchange = loadJournal;
+  if ($("jr-note")) $("jr-note").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-jr-note").click(); });
   $("btn-export").onclick = async () => {
     const txt = await fetch(`/api/worlds/${state.currentWorld}/export`).then((r) => r.text());
     const blob = new Blob([txt], { type: "text/plain;charset=utf-8" });
@@ -2593,6 +2762,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (t.dataset.tab === "entities") loadEntities();
       if (t.dataset.tab === "lore") loadLore();
       if (t.dataset.tab === "saves") loadSaves();
+      if (t.dataset.tab === "journal") loadJournal();
       // вкладки могут гулять по горизонтали (скролл) — подсвеченную вкладку делаем видимой
       t.scrollIntoView({ inline: "start", block: "nearest" });
     };

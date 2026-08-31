@@ -485,3 +485,19 @@ input[type="range"]::-moz-range-track { height: 6px; border-radius: 999px; backg
 ::-webkit-scrollbar { width: 9px; }
 ::-webkit-scrollbar-thumb { background: #2c3152; border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
+/* ── Сессия 34: часы мира, компас, дневник, перемотка, /risk ── */
+.world-clock { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.compass-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  padding: 6px 8px; margin: 4px 0; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg2); }
+.compass-label { color: var(--muted); font-size: 12px; }
+.compass-btn { cursor: pointer; }
+.jr-chekhov { padding: 6px 8px; margin-bottom: 8px; border: 1px dashed var(--accent);
+  border-radius: 8px; color: var(--text); font-size: 13px; background: var(--bg2); }
+.journal-list li { display: flex; flex-direction: column; gap: 2px; }
+.journal-list .right { color: var(--muted); font-size: 11px; }
+.rewind-list { max-height: 240px; overflow-y: auto; }
+.rewind-list li { display: flex; gap: 8px; align-items: center; }
+.risk-pre { white-space: pre-wrap; font-family: inherit; font-size: 13px; line-height: 1.5; }
+.flash-seq { animation: flashSeq 1.4s ease; }
+@keyframes flashSeq { 0%, 60% { background: rgba(124, 108, 255, 0.18); } 100% { background: transparent; } }

@@ -113,12 +113,14 @@
           <button id="btn-menu" class="btn small" title="Вернуться в меню миров">← Меню</button>
         </div>
         <div class="world-meta" id="world-meta"></div>
+        <div class="world-clock" id="world-clock" title="Время суток, погода и сезон в мире"></div>
       </div>
       <nav class="tabs">
         <button class="tab active" data-tab="state">Состояние</button>
         <button class="tab" data-tab="map">Карта</button>
         <button class="tab" data-tab="entities">Карточки</button>
         <button class="tab" data-tab="lore">Лор</button>
+        <button class="tab" data-tab="journal">Дневник</button>
         <button class="tab" data-tab="saves">Сохранения</button>
         <button class="tab" data-tab="settings">Настройки</button>
       </nav>
@@ -223,6 +225,20 @@
             <button id="btn-lore-add" class="btn small">+ Статья</button>
           </div>
           <div id="lore-list" class="entities"></div>
+        </div>
+
+        <!-- Сохранения -->
+        <!-- Дневник приключений (сессия 34, C2) -->
+        <div class="panel-body" id="tab-journal" style="display:none">
+          <div class="toolbar">
+            <select id="jr-cat" class="small-select" title="Фильтр по категории">
+              <option value="">все записи</option>
+            </select>
+            <input id="jr-note" placeholder="✍️ своя заметка в дневник">
+            <button id="btn-jr-note" class="btn small" title="Записать заметку в дневник (кодирует, смысл за тобой)">Записать</button>
+          </div>
+          <div id="jr-chekhov" class="jr-chekhov" style="display:none"></div>
+          <ul id="journal-list" class="list journal-list"></ul>
         </div>
 
         <!-- Сохранения -->
@@ -350,6 +366,8 @@
             <summary class="settings-head"><span class="s-ico">🧭</span><span class="s-mid"><span class="s-title">Действия</span><span class="s-sub">подсказка · экспорт · удалить</span></span><span class="s-caret"></span></summary>
             <div class="settings-body">
               <button id="btn-hint" class="btn small">💡 Подсказка</button>
+              <button id="btn-risk" class="btn small" title="Что у персонажа есть для твоей идеи: ресурсы, навыки, вещи, станция, вес">🧭 Мои средства</button>
+              <button id="btn-rewind" class="btn small" title="Вернуть мир к выбранному ходу (состояние + память + дневник)">⏪ Назад к ходу</button>
               <button id="btn-export" class="btn small">📤 Экспорт истории</button>
               <button id="btn-export-json" class="btn small">🗄 Полный дамп (JSON)</button>
               <button id="btn-import-json" class="btn small">📥 Импорт из дампа</button>
@@ -384,6 +402,7 @@
     <main class="chat">
       <button id="btn-divine" class="btn small divine-btn" title="Воззвать к Провидению — если рассказчик ошибся (не выдал предмет / не списал ресурс и т.п.), Провидение проверит логику и исправит мир">👁 Воззвать к Провидению</button>
       <div id="log" class="log"></div>
+      <div id="compass-bar" class="compass-bar" style="display:none"></div>
       <div id="suggestion-bar" class="suggestion-bar" style="display:none"></div>
       <div class="input-row">
         <input id="cmd" autocomplete="off" placeholder="Что ты делаешь? (например: осмотреться, поговорить с трактирщиком, обыскать стол…)">
