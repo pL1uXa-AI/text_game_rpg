@@ -10,6 +10,9 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from .. import db, narrator
+from ..logsetup import get_logger
+
+log = get_logger(__name__)
 from ..schemas import LoreIn
 
 router = APIRouter(tags=["Лор мира"])
@@ -42,8 +45,9 @@ async def lore_create(world_id: int, body: LoreIn):
         w = db.get_world(world_id)
         await narrator.index_lore_entry(world_id, entry,
                                         provider=_wp(w).get("embedding") if w else None)
-    except Exception:
-        pass  # индексация не критична — статья уже сохранена
+    except Exception as e:
+        # статья уже сохранена в БД — не удалось только попасть в RAG-поиск
+        log.warning("лор: переиндексация статьи (world %s) не удалась: %s", world_id, e)
     return {"ok": True, "lore": entry}
 
 
@@ -61,8 +65,8 @@ async def lore_update(world_id: int, lore_id: int, body: LoreIn):
         w = db.get_world(world_id)
         await narrator.index_lore_entry(world_id, entry,
                                         provider=_wp(w).get("embedding") if w else None)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("лор: переиндексация статьи (world %s) не удалась: %s", world_id, e)
     return {"ok": True, "lore": entry}
 
 
@@ -76,8 +80,9 @@ async def lore_delete(world_id: int, lore_id: int):
         from .. import chroma_client
         await chroma_client.delete_by_where({"$and": [{"world_id": world_id}, {"kind": "lore"},
                                                      {"lore_id": lore_id}]})
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("лор: удаление чанков статьи %s (world %s) из Chroma не удалось: %s",
+                    lore_id, world_id, e)
     return {"ok": True}
 
 

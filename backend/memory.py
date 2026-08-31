@@ -331,6 +331,10 @@ def select_relevant_entities(world_id: int, setting: dict, action: str, limit: i
     def priority(c: dict) -> float:
         pv = 0.0
         kind = c.get("kind")
+        # Дневник (kind=journal, сессия 34 / C2) — отдельный слой для ИГРОКА, а не для
+        # модели: хроника не должна попадать в контекст и вытеснять живые карточки NPC.
+        if kind == "journal":
+            return -100.0
         try:
             meta = json.loads(c.get("meta") or "{}")
         except Exception:

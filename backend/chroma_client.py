@@ -19,6 +19,10 @@ from typing import Optional
 import httpx
 
 from .config import get_config
+from .logsetup import get_logger, log_once
+from .retry import is_transient, with_retries
+
+log = get_logger(__name__)
 
 _TENANT = "default_tenant"
 _DATABASE = "default_database"
@@ -50,22 +54,33 @@ def _collection_url(cid: str, suffix: str = "") -> str:
     return f"{_collections_url()}/{cid}{suffix}"
 
 
-async def _raw(method: str, api_path: str, payload: dict | None = None) -> any:
-    cfg = get_config()
-    url = f"http://{cfg.chroma_host}:{cfg.chroma_port}{api_path}"
-    c = _get_client()
+async def _attempt(method: str, url: str, payload: dict | None):
     try:
-        resp = await c.request(method, url, json=payload)
+        return await _get_client().request(method, url, json=payload)
     except httpx.ConnectError as e:
         raise RuntimeError(
-            f"ChromaDB не отвечает на http://{cfg.chroma_host}:{cfg.chroma_port} "
-            f"({e}). Запусти start_chroma.bat в корне игры."
+            f"ChromaDB не отвечает на {url} ({e}). Запусти start_chroma.bat в корне игры."
         ) from e
-    if resp.status_code == 404:
-        return None
-    if resp.status_code >= 400:
-        raise RuntimeError(f"ChromaDB HTTP {resp.status_code} on {api_path}: {resp.text[:300]}")
-    return resp.json() if resp.text else None
+
+
+async def _raw(method: str, api_path: str, payload: dict | None = None):
+    """Запрос к ChromaDB. Временные сбои (429/5xx/обрыв) повторяются — локальная база
+    регулярно «отходит» после перезапуска, а один пропущенный вызов значил молча
+    потерянную индексацию памяти (сессия 34, B2)."""
+    cfg = get_config()
+    url = f"http://{cfg.chroma_host}:{cfg.chroma_port}{api_path}"
+    retries = max(0, int(getattr(cfg, "chroma_retries", 1) or 0))
+
+    async def _go():
+        resp = await _attempt(method, url, payload)
+        if resp.status_code == 404:
+            return None
+        if resp.status_code >= 400:
+            raise RuntimeError(f"ChromaDB HTTP {resp.status_code} on {api_path}: {resp.text[:300]}")
+        return resp.json() if resp.text else None
+
+    return await with_retries(_go, what=f"ChromaDB {method} {api_path}", retries=retries,
+                              config_key="chroma_retries", backoff=0.3)
 
 
 def collection_name_for_dim(dim: int) -> str:
@@ -152,8 +167,11 @@ async def delete_by_ids(ids: list[str]) -> None:
         try:
             cid = await ensure_collection(name)
             await _raw("POST", _collection_url(cid, "/delete"), {"ids": ids})
-        except Exception:
-            continue
+        except Exception as e:
+            # удаление из одной коллекции (другая может не существовать) — не фатально,
+            # но молчать нельзя: иначе «память помнит удалённое» станет невидимой проблемой
+            log_once(log, f"chroma-del-{name}", 30, "ChromaDB: удаление из %s не удалось: %s",
+                     name, e)
 
 
 async def delete_by_where(where: dict) -> None:
@@ -162,8 +180,9 @@ async def delete_by_where(where: dict) -> None:
         try:
             cid = await ensure_collection(name)
             await _raw("POST", _collection_url(cid, "/delete"), {"where": where})
-        except Exception:
-            continue
+        except Exception as e:
+            log_once(log, f"chroma-delw-{name}", 30, "ChromaDB: delete where из %s не удалось: %s",
+                     name, e)
 
 
 async def query(query_embedding: list[float], n_results: int = 10, where: dict | None = None) -> list[dict]:

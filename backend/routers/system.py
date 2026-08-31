@@ -7,6 +7,9 @@ from fastapi.responses import FileResponse
 
 from .. import chroma_client, db, llm, metrics, tts
 from ..config import get_config
+from ..logsetup import get_logger
+
+log = get_logger(__name__)
 from .core import FRONTEND_DIR, _mask_provider
 
 router = APIRouter(tags=["Система"])
@@ -39,19 +42,20 @@ async def system_status():
     try:
         r = await llm._get_client().get(f"{prov_main['base_url']}/models", timeout=10)
         llm_up = r.status_code == 200
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("статус: основная модель недоступна (%s): %s", prov_main.get('base_url'), e)
     chroma_up = await chroma_client.ping()
     chroma_count = 0
     if chroma_up:
         try:
             chroma_count = await chroma_client.count()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("статус: счётчик Chroma недоступен: %s", e)
     tts_st = tts.engine_status()
     try:
         tts_cache_count = db.count_tts_cache()
-    except Exception:
+    except Exception as e:
+        log.debug("статус: кэш озвучки не посчитан: %s", e)
         tts_cache_count = 0
     return {"llm": {"up": llm_up, "base_url": prov_main["base_url"],
                      "provider": prov_main["id"], "model": prov_main.get("model")},

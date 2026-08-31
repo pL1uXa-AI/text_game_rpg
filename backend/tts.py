@@ -29,7 +29,10 @@ from array import array
 from pathlib import Path
 
 from . import db
-from .config import get_config, ROOT
+from .config import ROOT, get_config
+from .logsetup import get_logger
+
+log = get_logger(__name__)
 
 # ═══════════ Пути и реестр голосов ═══════════
 
@@ -468,8 +471,10 @@ async def ensure_event_audio(world_id: int, event_id: int, text: str, opts: dict
     except Exception as e:
         try:
             db.set_event_tts(event_id, -1, "")
-        except Exception:
-            pass
+        except Exception as e2:
+            # сам синтез уже упал с понятной причиной; это — вторая беда (статус не проставлен)
+            log.warning("TTS: не удалось пометить ошибку синтеза для события %s: %s",
+                        event_id, e2)
         return {"status": -1, "error": str(e)}
 
 
@@ -596,8 +601,9 @@ def preload_configured_voices() -> None:
         prov = (cfg.tts_provider or "none").lower()
         if prov in ("piper", "kokoro"):
             preload_voice(prov)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("предзагрузка голосов TTS при старте не удалась (озвучка прогреется "
+                    "при первом синтезе): %s", e)
 
 
 __all__ = ["ensure_event_audio", "synthesize", "tts_effective", "status_for_ui",

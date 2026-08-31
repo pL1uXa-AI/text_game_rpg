@@ -199,8 +199,11 @@ async def create_world(body: WorldCreate):
         else:
             narrator.seed_lore_from_theme(world_id, theme)
         asyncio.get_event_loop().create_task(_index_world_lore(world_id, providers))
-    except Exception:
-        pass  # лор не критичен — мир создаётся без него
+    except Exception as e:
+        # лор не критичен для создания мира, но без него рассказчик не знает канон —
+        # молча потерять сидинг нельзя (правило 14)
+        log.warning("сидинг лора (мир %s) не удался — мир создан без «библии» вселенной: %s",
+                    world_id, e)
 
     # 🌐 Графовая база данных: первичная синхронизация карты мира на старте.
     # Источник истины рёбер — setting.locations; здесь граф строится из начального мира.
@@ -377,9 +380,14 @@ async def action(world_id: int, body: ActionIn, _rl: None = Depends(make_guard("
         return _slash_story(world_id)
     if low == "/board":
         return _slash_board(world_id)
+    if low == "/risk" or low.startswith("/risk "):
+        return _slash_risk(world_id, text[5:].strip())
+    if low in ("/journal", "/хроника", "/дневник"):
+        return _slash_journal(world_id, text)
     if low in ("/help", "/помощь"):
         return {"reply": ("Команды: /roll <куб>, /hint, /memory <запрос>, /where, /status, /quests, /stats, "
-                          "/map, /inventory, /shops (или /economy, /craft), /board, /story, /help. Во всём остальном просто описывай действия."),
+                          "/map, /inventory, /shops (или /economy, /craft), /board, /story, /journal, "
+                          "/risk <идея>, /help. Во всём остальном просто описывай действия."),
                 "events": [], "state": json.loads(db.get_world(world_id)["setting"]), "game_over": False}
     return await _process_action(world_id, text, regenerate=bool(body.regenerate))
 
@@ -842,6 +850,47 @@ def _slash_board(world_id: int):
     return {"reply": "📜 Доска объявлений:\n" + board, "events": [], "state": setting, "game_over": False}
 
 
+def _slash_risk(world_id: int, idea: str = ""):
+    """/risk <идея> — «чем я могу это закрыть» (сессия 34, C7). Чистый форматировщик
+    состояния без LLM: перечень фактов, а не вердикт (законы 2/3)."""
+    from ..risk import describe_risk
+    setting = json.loads(db.get_world(world_id)["setting"])
+    return {"reply": describe_risk(setting, idea), "events": [], "state": setting,
+            "game_over": False}
+
+
+def _slash_journal(world_id: int, text: str = ""):
+    """/journal — дневник приключений (сессия 34, C2). Хроника значимого, детерминированная.
+
+    `/journal note <текст>` — заметка ИГРОКА (закон 2: код лишь хранит и показывает,
+    смысл записи решает игрок). /journal <слово> — поиск по хронике.
+    """
+    from .. import journal as _jr
+    setting = json.loads(db.get_world(world_id)["setting"])
+    arg = (text or "").strip()
+    low = arg.lower()
+    if low.startswith("note ") or low.startswith("заметка "):
+        note = arg.split(" ", 1)[1].strip()[:400]
+        if note:
+            seq = db.latest_seq(world_id)
+            db.upsert_entity(world_id, _jr.KIND, f"t{seq}-note-{abs(hash(note)) % 100000}",
+                             name=note, summary="", meta={"seq": seq, "cat": "note",
+                                                           "icon": "✍️"}, seq=seq)
+            return {"reply": "✍️ Записано в дневник.", "events": [], "state": setting,
+                    "game_over": False}
+    body = _jr.render(world_id, limit=40)
+    if arg and not low.startswith(("note ", "заметка ")):
+        q = arg.lower()
+        hits = [it for it in _jr.entries(world_id, limit=500)
+                if q in it["title"].lower() or q in (it["text"] or "").lower()]
+        if not hits:
+            body = f"📔 По запросу «{arg}» в дневнике ничего нет."
+        else:
+            body = f"📔 Дневник — «{arg}» ({len(hits)}):\n" + "\n".join(
+                f"  {h['icon']} [ход {h['seq']}] {h['title']}" for h in hits[:25])
+    return {"reply": body, "events": [], "state": setting, "game_over": False}
+
+
 # ───────────────────────────── Сохранения ─────────────────────────────
 @router.get("/api/worlds/{world_id}/rewind/points")
 async def rewind_points(world_id: int):
@@ -1098,8 +1147,9 @@ async def delete_world(world_id: int):
     db.delete_world(world_id)
     try:
         await chroma_client.delete_by_where({"world_id": world_id})
-    except Exception:
-        pass
+    except Exception as e:
+        # векторы удалённого мира останутся в Chroma (сожрут место и могут всплыть в поиске)
+        log.warning("удаление мира %s: чистка векторов в Chroma не удалась: %s", world_id, e)
     return {"ok": True}
 
 

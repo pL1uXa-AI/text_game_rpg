@@ -134,7 +134,7 @@ def read_journal(tail: int | None = None) -> list[dict]:
                 from .config import get_config
                 cfg_tail = int(get_config().metrics_tail or 500)
             except Exception:
-                pass
+                pass  # легальный фолбэк: нет конфига — читаем стандартный хвост
             tail = cfg_tail
         with p.open("r", encoding="utf-8") as fh:
             lines = fh.readlines()[-max(1, int(tail)) * 4:]  # с запасом на битые строки

@@ -511,6 +511,19 @@ def environment_mods(time_of_day: str, weather: str, season: str = "") -> list[s
             break
     return out
 
+def _notes_text(notes: Any) -> str:
+    """C5: заметки мастера о NPC (dict/str/список) в одну строку; '' если пусто."""
+    if not notes:
+        return ""
+    if isinstance(notes, str):
+        return notes.strip()[:200]
+    if isinstance(notes, list):
+        return "; ".join(str(x).strip()[:100] for x in notes[:4] if x)
+    if isinstance(notes, dict):
+        return "; ".join(f"{k}: {str(v).strip()[:120]}" for k, v in list(notes.items())[:5] if v)
+    return ""
+
+
 def npc_schedule_text(setting: dict, npc_id: str, npc: dict) -> str:
     """Активная запись расписания NPC под текущее время: "расписание: …" или "" (нет)."""
     sch = npc.get("schedule")
@@ -761,6 +774,13 @@ def format_state(setting: dict) -> str:
             _coin = f", {v['money']} 🪙" if v.get("money") else ""
             npc_lines.append(f"{k}={v.get('name',k)}({alive}{_coin}, {v.get('mood','')}{frac}){extra}")
         lines.append("NPC: " + "; ".join(npc_lines))
+        # C5 (сессия 34): «заметки мастера» — что персонаж знает/скрывает/хочет. Ведёт
+        # их мастер: подача игроку (намёк, проверка, цена молчания) — его решение.
+        note_lines = [f"{v.get('name', k)}: {_notes_text(v.get('notes'))}"
+                      for k, v in list(npc.items())[:12] if _notes_text(v.get("notes"))]
+        if note_lines:
+            lines.append("🗝 Знания и тайны NPC (не вываливай прямо — веди через намёки,"
+                         " проверки и поведение по репутации):\n  " + "\n  ".join(note_lines))
     enemies = setting.get("enemies", {})
     if enemies:
         _ai_phrase = {"attack": "преследует/рвётся в бой", "guard": "в обороне/держит дистанцию",
@@ -774,8 +794,24 @@ def format_state(setting: dict) -> str:
             ai = str(v.get("ai") or "").strip().lower()
             if ai in _ai_phrase:
                 base += f" (намерение: {_ai_phrase[ai]})"
+            # C6: статусы и метки на враге — ПОДСКАЗКА мастеру. Авто-тика по врагам нет:
+            # урон/лечение ведит рассказчик директивой enemy_apply (правило 9а, закон 3).
+            eefs = v.get("effects")
+            if isinstance(eefs, dict) and eefs:
+                base += " [статусы: " + ", ".join(
+                    f"{n}×{(e or {}).get('stacks', 1)}"
+                    + (f" {int((e or {}).get('damage') or 0)}/ход" if (e or {}).get("damage") else "")
+                    for n, e in list(eefs.items())[:4]) + "]"
+            marks = v.get("marks")
+            if isinstance(marks, dict) and marks:
+                base += " (" + ", ".join(f"{kk}: {val}" for kk, val in list(marks.items())[:3]
+                                         if val) + ")"
             en_line.append(base)
         lines.append("Враги: " + "; ".join(en_line))
+        if any(isinstance(v, dict) and (v.get("effects") or v.get("marks"))
+               for v in enemies.values()):
+            lines.append("⚠ Статусы врагов сами не тикают — урон по врагам применяй"
+                         " директивой enemy_apply, когда это происходит по сюжету.")
     companions = setting.get("companions", {})
     if companions:
         comp_lines = []
@@ -790,6 +826,17 @@ def format_state(setting: dict) -> str:
             st = v.get("status", "active")
             prog = v.get("progress")
             prog_s = f" | шаг: {prog}" if prog else ""
+            # C8: итог квеста (success/failed + причина) и привязанный дедлайн
+            if st == "success":
+                st = "🏅 выполнен"
+            elif st == "failed":
+                st = "💀 провален"
+            if v.get("outcome_reason"):
+                prog_s += f" | итог: {v['outcome_reason']}"
+            if v.get("timer"):
+                _t = (setting.get("timers") or {}).get(v["timer"])
+                if isinstance(_t, dict):
+                    prog_s += f" | ⏳ срок: {_t.get('turns_left')} ход."
             q_lines.append(f"[{st}] {v.get('title',k)}{prog_s}: {v.get('desc','')[:120]}")
         lines.append("Квесты:\n  " + "\n  ".join(q_lines))
     shops = setting.get("shops", {})
@@ -1016,7 +1063,9 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
                     "Доступные ключи (комбинируются; список не исчерпывающий — полный набор в описании инструмента): player (hp/mp/gold/xp/stats/actions/level [явное повышение уровня по сюжету]), race_change, class, class_rank, class_evolve, "
                     "secondary_class, secondary_rank, profession, skill_add, skill_rank, skill_remove, title, reputation, "
                     "effect_add, effect_remove, add_item, remove_item, enemy_add, enemy_apply, enemy_remove, quest, quest_done (id или {{id, next}} — цепочка), quest_advance, quest_choose, "
-                    "npc_set (name/mood/alive/faction/schedule [расписание по времени суток]), npc_kill, faction_add/faction_update/faction_remove (фракции и их связи), location_add, location_update, move, flag, time, weather, roll, game_over (true/false). "
+                    "quest_success/quest_fail (итог: {{id, reason, next}}), quest {{id, timer: {{name, turns}}}} (дедлайн квеста), "
+                    "enemy_effect_add/enemy_effect_remove (статусы на врагах — сами не тикают), enemy_mark (позиция/инициатива/цель), "
+                    "npc_set (name/mood/alive/faction/schedule [расписание по времени суток]/notes [что знает и скрывает]), npc_kill, faction_add/faction_update/faction_remove (фракции и их связи), location_add, location_update, move, flag, time, weather, roll, game_over (true/false). "
                     "Экономика: shop_add, shop_remove, shop_update, trade_buy, trade_sell. Крафт: gather, craft_learn, craft_remove, craft. "
                     "Компаньоны: companion_add, companion_remove, companion_update, companion_apply. "
                     "Способности: ability_add, ability_remove, ability_update, ability_use. "
@@ -1080,6 +1129,25 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
         "32. ЛОКАЦИИ-ЗОНЫ: если у текущей локации есть «Влияние места» (эффекты зоны: радиация, "
         "ядовитый туман, проклятие, невесомость) — оно уже действует на игрока (движок наложил). "
         "Учитывай в описаниях и проверках; способ защититься/снять — на твоё усмотрение.\n"
+        "33. ИТОГ КВЕТА (сессия 34): у квеста есть исход — quest_success {id, reason, next} или "
+        "quest_fail {id, reason, next} (state: 🏅 выполнен / 💀 провален). Ставь итог явно в момент, "
+        "когда сюжетно всё решилось, и продолжай цепочку через next. Провал — не тупик: предложи путь "
+        "дальше (долг, последствия, новая ветка). Квесту можно дать срок: quest {id, timer: {name, "
+        "turns, desc}} — движок напомнит «⏳ срок вышел», а провален он или спасён в последний миг — твоё "
+        "решение (quest_fail/quest_success).\n"
+        "34. СТАТУСЫ НА ВРАГАХ И ТАКТИКА (сессия 34): enemy_effect_add {id, name, turns, damage, desc} "
+        "и enemy_effect_remove заводят статусы на врагах (горение/окоченение/страх), enemy_mark {id, "
+        "position, initiative, target, stance} — тактические метки (кто кого держит, порядок схватки). "
+        "ВАЖНО: эти статусы НЕ тикают сами и урон врагам не списывают — это хранилище правды о поле боя. "
+        "Реальное изменение HP врага применяй директивой enemy_apply в том ходу, где это происходит по "
+        "тексту (иначе задвоишь урон). В описаниях опирайся на метки: инициатива/позиция подсказывают, "
+        "кто бьёт первым и что открыто для флангового удара.\n"
+        "35. ТАЙНЫ NPC (сессия 34): у персонажей есть «🗝 Знания и тайны» (npc_set {id, notes: {"
+        "знает, тайна, хочет, долг}}) — что ОН знает, что скрывает, чего хочет. Держи это в тайне от "
+        "игрока: раскрывай через намёки, поведение по репутации (правило 26), удачные проверки (roll) и "
+        "цену молчания. Заметки — источник живости мира: NPC помнит, лжёт, торгуется. Не меняй их без "
+        "сюжетной причины и не противоречь им (тайна, которую NPC уже выдал игроку, перестает быть тайной — "
+        "обнови notes).\n"
     )
     if canon_note:
         pass  # правило 29 уже добавлено выше
@@ -1136,6 +1204,11 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
 <<ENGINE>>{{"quest_advance": {{"id": "find_book"}}}}   — перейти на следующий шаг многоступенчатого квеста (если заданы steps)
 <<ENGINE>>{{"quest_choose": {{"id": "find_book", "branch": "уговорить"}}}}   — зафиксировать выбранную игроком ветку
 <<ENGINE>>{{"quest_done": {{"id": "find_book", "next": {{"id": "next_quest", "title": "…"}}}}}}   — выполнить квест и сразу начать следующий (цепочка действие 1→2→3)
+<<ENGINE>>{{"quest_success": {{"id": "find_book", "reason": "гримуар у игрока", "next": {{"id": "read_book", "title": "Прочитать гримуар"}}}}}}   — итог квеста (бывает quest_fail)
+<<ENGINE>>{{"quest": {{"id": "find_book", "title": "Найти гримуар", "status": "active", "timer": {{"name": "до рассвета", "turns": 8}}}}}}   — дедлайн квеста (тикает сам, исход решаешь ты)
+<<ENGINE>>{{"enemy_effect_add": {{"id": "goblin", "name": "горение", "turns": 3, "damage": 5, "desc": "магическое пламя"}}}}   — статус НА враге (сам не тикает: урон по врагам — твоим enemy_apply)
+<<ENGINE>>{{"enemy_mark": {{"id": "goblin", "position": "фланг", "initiative": 14, "target": "лучник"}}}}   — тактическая метка (порядок боя)
+<<ENGINE>>{{"npc_set": {{"id": "barman", "notes": {{"знает": "кто подпалил амбар", "тайна": "подпалил сам"}}}}}}   — заметки мастера: что персонаж знает/скрывает
 <<ENGINE>>{{"npc_set": {{"id": "barman", "name": "Трактирщик", "mood": "радушен", "alive": true}}}}
 <<ENGINE>>{{"npc_set": {{"id": "tavern", "name": "Таверна «У камина»", "faction": "", "schedule": {{"ночь": "закрыта, хозяин спит", "день": "открыта, подают эль"}}}}}}   — расписание NPC по времени суток
 <<ENGINE>>{{"location_add": {{"id": "cellar", "name": "Подвал", "desc": "Тёмный, пахнет плесенью"}}, "move": "cellar"}}
@@ -1495,6 +1568,8 @@ _EFFECT_KEYS = frozenset({
     "trade_sell", "gather", "craft_learn", "craft_remove", "craft", "companion_add",
     "companion_remove", "companion_update", "companion_apply", "ability_add", "ability_remove",
     "ability_update", "ability_use", "progress_add", "achievement_add",
+    # сессия 34 (C5/C6/C8): без них audit не сочтёт эти директивы «механикой»
+    "quest_success", "quest_fail", "enemy_effect_add", "enemy_effect_remove", "enemy_mark",
 })
 
 
@@ -1861,7 +1936,11 @@ GAME_ENGINE_TOOL = [{"type": "function", "function": {
         "player (hp/mp/gold/xp/stats/actions/level), race_change, class, class_rank, class_evolve, "
         "secondary_class, secondary_rank, profession, skill_add/skill_rank/skill_remove, title, "
         "reputation, effect_add (name — человекочитаемо, desc — описание)/effect_remove, add_item/remove_item, enemy_add/enemy_apply/enemy_remove, "
-        "quest/quest_done (можно {id, next} — авто-цепочка), quest_advance (ступень), quest_choose (ветка), npc_set/npc_kill, location_add/location_update/move, flag, time, weather, "
+        "quest/quest_done (можно {id, next} — авто-цепочка), quest_advance (ступень), quest_choose (ветка), "
+        "quest_success/quest_fail ({id, reason, next} — ИТОГ квеста: success/failed), quest {{id, timer: {{name, turns, desc}}}} (дедлайн квеста), "
+        "npc_set (id,name,mood,alive,desc,faction,schedule,money,notes,voice)/npc_kill, location_add/location_update/move, flag, time, weather, "
+        "enemy_effect_add/enemy_effect_remove (статусы НА врагах: {{id,name,turns,damage,desc}} — ХРАНИЛИЩЕ, сами не тикают: урон по врагам только твоим enemy_apply), "
+        "enemy_mark ({{id, position, initiative, target, stance}} — тактические метки для порядка боя), "
         "timer_add/timer_remove (таймеры-дедлайны мира: {name, turns, desc}), equip/unequip (экипировка по слотам: у предмета должен быть slot), "
         "needs (потребности/рассудок: {голод: {value: -10}}), board_add (доска объявлений {title, text}), faction_rank (звание во фракции {faction, rank}), "
         "date (календарь {day, month, season}), vision_add (видение в очередь {text, hint}), trigger_vision (разыграть видение), "
@@ -2295,8 +2374,10 @@ def _apply_enemy_ai(setting: dict, eid: str, mode: str, directives: dict) -> lis
     if directives:
         try:
             msgs += apply_directives(setting, _strip_damage(directives))
-        except Exception:
-            pass
+        except Exception as e:
+            # намерение врага записано, а его директивы (флаг/квест/предмет) не применены —
+            # без лога это выглядит как «боевой ИИ ничего не делает»
+            log.warning("боевой ИИ: директивы врага %s не применены: %s", eid, e, exc_info=True)
     return msgs
 
 

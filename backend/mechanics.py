@@ -661,6 +661,16 @@ def tick_world_timers(setting: dict) -> list[str]:
         d = timers.pop(name, None) or {}
         tail = f" — {d.get('desc')}" if isinstance(d, dict) and d.get("desc") else ""
         msgs.append(f"⏰ Таймер «{name}» истёк.{tail}")
+        # C8: если дедлайн был привязан к квесту — снимаем ссылку и подсказываем мастеру,
+        # что срок вышел; провален квест или нет решает ТОЛЬКО мастер (закон 3, правило 30).
+        qid = d.get("quest") if isinstance(d, dict) else None
+        if qid:
+            quest = (setting.get("quests") or {}).get(qid)
+            if isinstance(quest, dict):
+                quest.pop("timer", None)
+                msgs.append(f"⏳ Срок квеста «{quest.get('title', qid)}» вышел — "
+                            f"исход (💀 провал / 🏅 успех) решай директивой quest_fail "
+                            f"или quest_success {{\"id\": \"{qid}\"}}.")
     return msgs
 
 
@@ -1257,7 +1267,13 @@ class AbilityHandler(DirectiveHandler):
                     "cost": _safe_int(aa.get("cost", aa.get("mp_cost", 0)), 0),
                     "cooldown": _safe_int(aa.get("cooldown"), 0),
                     "desc": str(aa.get("desc") or "")[:200],
+                    # C6 (сессия 34): зона поражения — ХРАНЕНИЕ подсказки для мастера.
+                    # Сколько целей реально задето и какой урон — решает рассказчик
+                    # (закон 3): area не считает урон, он описывает умение.
+                    "area": str(aa.get("area") or "").strip()[:60],
                 }
+                if ab[nm]["area"]:
+                    msgs.append(f"⚡ Область действия: {ab[nm]['area']}")
                 tag = f" [{ab[nm]['school']}]" if ab[nm]["school"] else ""
                 msgs.append(f"⚡ Освоена способность: «{nm}»{tag}")
         if "ability_update" in d:
@@ -1265,7 +1281,7 @@ class AbilityHandler(DirectiveHandler):
             if isinstance(au, dict) and au.get("name"):
                 nm = str(au["name"]).strip()[:80]
                 if nm in ab:
-                    for k in ("school", "source", "cost", "cooldown", "desc"):
+                    for k in ("school", "source", "cost", "cooldown", "desc", "area"):
                         if k in au:
                             ab[nm][k] = _safe_int(au[k], 0) if k in ("cost", "cooldown") else str(au[k])[:200]
                     msgs.append(f"⚡ Способность «{nm}» обновлена")
@@ -1281,12 +1297,26 @@ class AbilityHandler(DirectiveHandler):
                 nm = str(au["name"]).strip()[:80]
                 if nm in ab:
                     cost = _safe_int(au.get("cost", ab[nm].get("cost", 0)), 0)
+                    # C6: цели применения — записываем факт (для состояния/аудита), урон не наносим
+                    tgts = au.get("targets")
+                    if isinstance(tgts, str):
+                        tgts = [tgts]
+                    if isinstance(tgts, list) and tgts:
+                        ab[nm]["last_targets"] = [str(t)[:60] for t in tgts[:12]]
+                        area = str(au.get("area") or ab[nm].get("area") or "").strip()
+                    else:
+                        area = str(au.get("area") or "").strip()
+                    tail = ""
+                    if tgts:
+                        tail += " → цели: " + ", ".join(ab[nm].get("last_targets", []))
+                    if area:
+                        tail += f" ({area})"
                     if cost:
                         m0 = p.get("mp", 0)
                         p["mp"] = max(0, m0 - cost)
-                        msgs.append(f"⚡ Использована «{nm}» (энергия −{cost})")
+                        msgs.append(f"⚡ Использована «{nm}» (энергия −{cost}){tail}")
                     else:
-                        msgs.append(f"⚡ Использована «{nm}»")
+                        msgs.append(f"⚡ Использована «{nm}»{tail}")
                 else:
                     msgs.append(f"⚠ Нет способности «{nm}» — сначала ability_add")
         return msgs
@@ -1649,8 +1679,15 @@ class CompanionHandler(DirectiveHandler):
 
 
 class EnemyHandler(DirectiveHandler):
-    """Враги: нанесение урона, добавление, удаление."""
-    keys = frozenset({"enemy_apply", "enemy_add", "enemy_remove"})
+    """Враги: нанесение урона, добавление, удаление.
+
+    Сессия 34 (C6): `enemy_effect_add` / `enemy_effect_remove` — статусы НА врагах и
+    `enemy_mark` — тактические метки (позиция/инициатива/цель). Это ТОЛЬКО хранение и
+    показ рассказчику: авто-тика по врагам здесь НЕТ и быть не может — урон/лечение ведёт
+    мастер своими директивами (закон 3, правило 9а), иначе боевой ИИ и рассказчик
+    задвоили бы урон."""
+    keys = frozenset({"enemy_apply", "enemy_add", "enemy_remove",
+                      "enemy_effect_add", "enemy_effect_remove", "enemy_mark"})
 
     def apply(self, setting: dict, d: dict) -> list[str]:
         msgs: list[str] = []
@@ -1691,14 +1728,125 @@ class EnemyHandler(DirectiveHandler):
             if isinstance(eid, dict):
                 eid = eid.get("id")
             setting["enemies"].pop(eid, None)
+        # ── C6: статусы и метки на врагах (храним, НЕ тикаем) ──
+        for key, add in (("enemy_effect_add", True), ("enemy_effect_remove", False)):
+            if key not in d:
+                continue
+            raw = d[key]
+            items = raw if isinstance(raw, list) else [raw]
+            for it in items:
+                if not isinstance(it, dict):
+                    it = {"id": it}
+                eid = str(it.get("id") or "").strip()
+                enemy = setting["enemies"].get(eid)
+                if not enemy:
+                    msgs.append(f"🩸 {key}: враг «{eid or '?'}» не найден — статус не наложен.")
+                    continue
+                effs = enemy.setdefault("effects", {})
+                if not isinstance(effs, dict):
+                    effs = {}
+                    enemy["effects"] = effs
+                name = str(it.get("name") or "").strip()
+                if not name:
+                    continue
+                if add:
+                    effs[name] = {
+                        "turns": _safe_int(it.get("turns", -1), -1),
+                        "stacks": max(1, _safe_int(it.get("stacks", 1), 1)),
+                        "kind": str(it.get("kind") or "состояние")[:40],
+                        "desc": str(it.get("desc") or "")[:200],
+                        # урон/лечение храним КАК ФАКТ, но не списываем сами (закон 3)
+                        "damage": max(0, _safe_int(it.get("damage"), 0)),
+                        "heal": max(0, _safe_int(it.get("heal"), 0)),
+                    }
+                    msgs.append(f"🩸 {enemy.get('name', eid)}: {name}"
+                                + (f" — {effs[name]['desc']}" if effs[name]["desc"] else ""))
+                else:
+                    if effs.pop(name, None) is not None:
+                        msgs.append(f"🩸 {enemy.get('name', eid)}: {name} снят")
+        if "enemy_mark" in d:
+            em = d["enemy_mark"]
+            if isinstance(em, dict) and str(em.get("id") or "").strip() in setting["enemies"]:
+                enemy = setting["enemies"][str(em["id"]).strip()]
+                marks = enemy.setdefault("marks", {})
+                if not isinstance(marks, dict):
+                    marks = {}
+                    enemy["marks"] = marks
+                for field in ("position", "initiative", "target", "stance"):
+                    if em.get(field) is not None:
+                        marks[field] = str(em[field])[:60]
+                if marks:
+                    msgs.append(f"♟ {enemy.get('name', em.get('id'))}: "
+                                + ", ".join(f"{k} — {v}" for k, v in list(marks.items())[:4]))
         return msgs
+
+
+def _quest_timer_add(setting: dict, qid: str, quest: dict, t: dict) -> list[str]:
+    """Завести дедлайн квеста как таймер мира (C8). Тот же setting.timers, что и с32."""
+    timers = setting.setdefault("timers", {})
+    if not isinstance(timers, dict):
+        timers = {}
+        setting["timers"] = timers
+    name = str(t.get("name") or f"срок: {quest.get('title', qid)}")[:60]
+    try:
+        turns = int(t.get("turns", -1))
+    except (TypeError, ValueError):
+        turns = -1
+    timers[name] = {"turns_left": turns,
+                    "desc": str(t.get("desc") or quest.get("title", qid))[:200],
+                    "quest": qid}
+    quest["timer"] = name
+    dur = "без срока" if turns in (-1, None) else f"{turns} ход."
+    return [f"⏳ Срок квеста «{quest.get('title', qid)}»: {dur}"]
+
+
+def _quest_timer_finish(setting: dict, qid: str, msgs: list[str]) -> None:
+    """Квест завершён/провален — снимаем его неоттикавший дедлайн (иначе висел бы мусор)."""
+    timers = setting.get("timers")
+    quest = (setting.get("quests") or {}).get(qid)
+    if not isinstance(timers, dict) or not isinstance(quest, dict):
+        return
+    name = quest.get("timer")
+    if name and isinstance(name, str) and name in timers:
+        timers.pop(name, None)
+        quest.pop("timer", None)     # не оставляем ссылку на уже снятый таймер
+        msgs.append(f"⏳ Срок квеста «{quest.get('title', qid)}» снят.")
+    elif name:
+        quest.pop("timer", None)
+
+
+def _quest_chain(setting: dict, nxt) -> list[str]:
+    """Запустить следующий квест цепочки (общий код для quest_done/quest_success/fail)."""
+    quests = setting.setdefault("quests", {})
+    msgs: list[str] = []
+    if isinstance(nxt, dict) and (nxt.get("id") or "").strip():
+        nid = nxt["id"]
+        if nid not in quests:
+            quests[nid] = {"title": nxt.get("title", nid), "desc": nxt.get("desc", ""),
+                           "status": "active"}
+            for k, v in nxt.items():
+                if k not in ("id", "title", "desc", "status"):
+                    quests[nid][k] = v
+            msgs.append(f"📜 Цепочка продолжена — новый квест: {quests[nid].get('title', nid)}")
+    elif isinstance(nxt, str) and nxt.strip() and nxt.strip() in quests:
+        if quests[nxt.strip()].get("status") != "active":
+            quests[nxt.strip()]["status"] = "active"
+            msgs.append(f"📜 Продолжение: {quests[nxt.strip()].get('title', nxt)}")
+    return msgs
 
 
 class QuestHandler(DirectiveHandler):
     """Квесты: создание/обновление (с прогрессом и ступенями), ветвление, цепочки завершения.
     Дополнительные директивы: quest_advance (перейти к следующей стадии), quest_choose (выбрать ветку),
-    а quest_done может принимать {id, next} → автоматически запустить следующий квест (цепочка)."""
-    keys = frozenset({"quest", "quest_done", "quest_advance", "quest_choose"})
+    а quest_done может принимать {id, next} → автоматически запустить следующий квест (цепочка).
+
+    Сессия 34 (C8): `quest_success` / `quest_fail` — итог квеста отдельной ступенью
+    (`success`/`failed`); движок записывает статус и опциональную цепочку `next`, а чем
+    именно закончился провал решает мастер (закон 3). Квесту можно дать дедлайн:
+    `quest {id, timer: {name, turns, desc}}` — заводится таймер в setting.timers со ссылкой
+    `quest`, тикает общим механизмом (с32) и при истечении только напоминает (правило 30)."""
+    keys = frozenset({"quest", "quest_done", "quest_advance", "quest_choose",
+                      "quest_success", "quest_fail"})
 
     def apply(self, setting: dict, d: dict) -> list[str]:
         msgs: list[str] = []
@@ -1723,6 +1871,10 @@ class QuestHandler(DirectiveHandler):
             elif "progress" in q and q["progress"] != existing.get("progress"):
                 prog = q["progress"]
                 msgs.append(f"📜 Прогресс квеста «{entry.get('title', qid)}»: {prog}")
+            # C8: дедлайн квеста = обычный таймер мира с пометкой, к какому квесту он относится
+            t = q.get("timer")
+            if isinstance(t, dict):
+                msgs.extend(_quest_timer_add(setting, qid, entry, t))
         if "quest_advance" in d and isinstance(d["quest_advance"], dict) and (d["quest_advance"].get("id") or "").strip():
             ad = d["quest_advance"]
             qid = ad["id"]
@@ -1747,13 +1899,36 @@ class QuestHandler(DirectiveHandler):
                     quest["chosen"] = branch
                     quest["branch"] = branch
                     msgs.append(f"🔀 Квест «{quest.get('title', qid)}»: ветка — {branch}")
+        for key, status, icon in (("quest_success", "success", "🏅"),
+                                  ("quest_fail", "failed", "💀")):
+            if key not in d:
+                continue
+            raw = d[key]
+            qid = (raw if isinstance(raw, str) else (raw or {}).get("id")) or ""
+            qid = qid.strip() if isinstance(qid, str) else qid
+            quest = setting["quests"].get(qid) if isinstance(qid, str) else None
+            if not quest:
+                msgs.append(f"{icon} Итог квеста «{qid or '?'}» не записан: такого квеста нет.")
+                continue
+            quest["status"] = status
+            if isinstance(raw, dict) and raw.get("reason"):
+                quest["outcome_reason"] = str(raw["reason"])[:200]
+            word = "выполнен" if status == "success" else "провален"
+            msgs.append(f"{icon} Квест «{quest.get('title', qid)}» {word}"
+                        + (f" — {quest['outcome_reason']}" if quest.get("outcome_reason") else ""))
+            if status == "success":
+                _bump(setting["player"], "quests_done")
+            _quest_timer_finish(setting, qid, msgs)
+            if isinstance(raw, dict):
+                msgs.extend(_quest_chain(setting, raw.get("next")))
         if "quest_done" in d:
             qd = d["quest_done"]
             qid = qd if isinstance(qd, str) else qd.get("id")
             if qid in setting["quests"]:
-                setting["quests"][qid]["status"] = "done"
+                setting["quests"][qid]["status"] = str(qd.get("outcome") or "done")                     if isinstance(qd, dict) else "done"
                 _bump(setting["player"], "quests_done")
                 msgs.append(f"✔ Квест выполнен: {setting['quests'][qid].get('title', qid)}")
+            _quest_timer_finish(setting, qid, msgs)
             # цепочка: после выполнения автоматически запускаем следующий квест (next)
             if isinstance(qd, dict):
                 nxt = qd.get("next")
@@ -1840,6 +2015,26 @@ class NpcHandler(DirectiveHandler):
             _npc = setting["npc"][ns["id"]]
             if ns.get("money") is not None:
                 _npc["money"] = max(0, _safe_int(ns.get("money"), 0))
+            # C5 (сессия 34): «заметки мастера» — что ЭТОТ NPC знает/скрывает/хочет.
+            # Хранение и выдача в промпт (закон 2): как NPC себя поведёт решает мастер.
+            # Структура: {"знает": [...], "тайна": "...", "хочет": "...", "долг": "..."}
+            # либо строка. Правка — только директивой мастера (закон 3).
+            notes = ns.get("notes")
+            if notes is not None:
+                if isinstance(notes, dict):
+                    merged = dict(_npc.get("notes") or {})
+                    for k, v in notes.items():
+                        if v is None:
+                            merged.pop(str(k), None)
+                        else:
+                            merged[str(k)] = v if isinstance(v, str) else json.dumps(
+                                v, ensure_ascii=False)
+                    _npc["notes"] = merged
+                elif isinstance(notes, str):
+                    _npc["notes"] = notes[:400]
+            # голоса озвучки (зарезервировано под мультиголос NPC): shell-настройка, не механика
+            if ns.get("voice") is not None:
+                _npc["voice"] = str(ns["voice"])[:60]
             # Расписание NPC: {время: "что делает/доступен ли"}. Напр. {"ночь": "таверна закрыта", "день": "рынок"}.
             # В format_state показывается активная запись под текущее время — рассказчик учитывает её.
             sch = ns.get("schedule")

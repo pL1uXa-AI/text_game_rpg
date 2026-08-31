@@ -377,8 +377,9 @@ async def _migrate_worlds(conn: aiosqlite.Connection) -> None:
         pcols = {r[1] for r in await pcur.fetchall()}
         if "lore" not in pcols:
             await conn.execute("ALTER TABLE story_plots ADD COLUMN lore TEXT NOT NULL DEFAULT ''")
-    except Exception:
-        pass
+    except Exception as e:
+        # без колонки «свой сюжет» не сохранит лор — молча терять это нельзя
+        log.warning("миграция story_plots.lore не удалась (свои сюжеты будут без лора): %s", e)
     await conn.commit()
 
 
@@ -1030,8 +1031,9 @@ async def _prune_tts_cache(cutoff: float) -> int:
         try:
             if p.exists():
                 p.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            # файл кэша остался на диске (занят плеером/антивирусом) — не фатально
+            log.debug("кэш озвучки: файл %s не удалён: %s", p, e)
         deleted += 1
     await conn.execute("DELETE FROM tts_cache WHERE created_at < ?", (cutoff,))
     await _maybe_commit()

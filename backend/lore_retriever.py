@@ -130,8 +130,10 @@ async def index_lore_entry(world_id: int, entry: dict, provider: dict | None = N
         try:
             await chroma_client.delete_by_where({"$and": [{"world_id": world_id}, {"kind": "lore"},
                                                            {"lore_id": entry["id"]}]})
-        except Exception:
-            pass
+        except Exception as e:
+            # старые чанки могут остаться в поиске — переиндексация их перетрёт, но факт виден
+            log.debug("лор: чистка старых чанков статьи %s (world %s): %s",
+                      entry.get("id"), world_id, e)
         docs = [f"[ЛОР: {entry.get('title','')}] {c}" for c in chunks]
         vecs = await embeddings.embed_documents(docs, provider=provider)
         if not vecs:
