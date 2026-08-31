@@ -29,7 +29,9 @@ from typing import Any, Optional
 from . import chroma_client, db, embeddings, llm
 from .config import est_tokens, get_config
 
-log = logging.getLogger("textgame")
+from .logsetup import get_logger
+
+log = get_logger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -54,10 +56,18 @@ def cosine_threshold(cfg, emb_prov) -> float:
 
 
 async def retrieve_memory(world_id: int, action: str, setting: dict, k: Optional[int] = None,
-                          providers: dict | None = None) -> list[str]:
+                          providers: dict | None = None,
+                          scores_out: list | None = None) -> list[str]:
+    """RAG-память: релевантные фрагменты обменов/сводок/карточек по действию игрока.
+
+    `scores_out` (если передан список) дополняется оценками релевантности в том же порядке,
+    что и возвращённые куски: [{"similarity":..., "hybrid":..., "rerank":...}] — нужно для
+    прозрачности RAG в UI (E3: «попало ли вспомненное в тему хода»), раньше был виден
+    только счётчик «🧠 Память (N)». Паттерн `*_out` как у llm.stream_chat(tool_calls_out).
+    """
     cfg = get_config()
-    events_count = len(db.get_events(world_id, limit=4000))
-    if events_count < 3:
+    # B5: считаем события на стороне SQLite (было len(get_events(limit=4000)) — весь лог в Python)
+    if db.count_events(world_id) < 3:
         return []
     # Динамический K: при большом контексте мира (128k/256k) вспоминаем больше фактов,
     # а не фиксированные RAG_MEMORY_K (жалоба: «рассказчик всегда вспоминает 9 фактов,
@@ -88,7 +98,17 @@ async def retrieve_memory(world_id: int, action: str, setting: dict, k: Optional
         out = embeddings.hybrid_rerank(query, out, weight_bm25=cfg.hybrid_weight_bm25)
         if cfg.rerank_enabled:
             out = await embeddings.rerank_results(query, out, top_n=k, provider=rerank_prov)
-        return [c["content"] for c in out[:k]]
+        out = out[:k]
+        if scores_out is not None:
+            # оценки, реально решившие отдачу: косинус, гибрид (BM25+косинус), реранкер
+            for c in out:
+                rr = c.get("_rerank")
+                scores_out.append({
+                    "similarity": round(float(c.get("similarity", 0) or 0), 3),
+                    "hybrid": round(float(c.get("_hybrid", 0) or 0), 3),
+                    "rerank": round(float(rr), 3) if rr is not None else None,
+                })
+        return [c["content"] for c in out]
     except Exception as e:
         # Память не критична — ход не роняем. НО молча глотать нельзя (AGENT.md, правило 14):
         # отказ Chroma/облака неотличим от «эмбеддинги выключены», и диагностика теряется.
@@ -167,12 +187,13 @@ async def _make_summary(text: str, lang: str = "ru", provider: dict | None = Non
 async def summarize_and_compress(world_id: int, provider: dict | None = None) -> None:
     """Сворачивает старые события в сводку при переполнении недавнего окна."""
     cfg = get_config()
-    events = db.get_events(world_id)
     world = db.get_world(world_id)
     # локальный импорт: world_recent_budget живёт в narrator (бюджеты контекста)
     from .narrator import world_recent_budget
     budget = world_recent_budget(world) if world else cfg.recent_token_budget
-    unfolded = [e for e in events if not e["folded"] and e["role"] in ("player", "narrator")]
+    # Б5: окно недавней истории умещается в токен-бюджет, поэтому целиком мир из БД тянуть
+    # незачем — берём с запасом последние события (×6 на случай коротких реплик).
+    unfolded = db.get_unfolded_events(world_id, limit=max(60, int(budget / 60) * 6))
     if not unfolded:
         return
 
@@ -204,15 +225,21 @@ async def summarize_and_compress(world_id: int, provider: dict | None = None) ->
     if not summary:
         return
     seq = db.latest_seq(world_id) + 1
-    db.add_event(world_id, "summary", summary, seq)
     last_fold_seq = to_fold[-1]["seq"]
+    # A1 (сессия 34): сводка ПОКРЫВАЕТ конкретный диапазон seq. Без этой отметки нельзя
+    # отличить «свёрнуто в сводку (разворачивать не надо)» от «сокрыто перемоткой
+    # (обязательно вернуть)» — именно из-за этого загрузка сохранения когда-то съела всю
+    # недавнюю историю. Пишем в meta события-сводки (роль summary = служебная, не художка).
+    db.add_event(world_id, "summary", summary, seq,
+                 meta={"covers": {"from": to_fold[0]["seq"], "to": last_fold_seq,
+                                  "tokens": folded_tokens}})
     db.mark_folded(world_id, last_fold_seq)
     await index_summary(world_id, seq, summary, provider=wprov["embedding"])
 
 
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
 # Карточки сущностей (LLM-архивариус) + знания (детерминированно)
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
 
 def compact_entity(e: dict) -> str:
     """Компактная строка карточки для подачи в контекст модели."""

@@ -23,7 +23,9 @@ from . import chroma_client, db, embeddings
 from .config import est_tokens, get_config
 from .memory import memory_query_text, cosine_threshold  # общие с памятью хелперы
 
-log = logging.getLogger("textgame")
+from .logsetup import get_logger
+
+log = get_logger(__name__)
 
 
 def _provider_settings(world: dict) -> dict:

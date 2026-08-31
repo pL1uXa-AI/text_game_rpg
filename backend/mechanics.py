@@ -23,7 +23,9 @@ from typing import Any, Optional
 
 from .directives import normalize as _normalize_directives
 
-log = logging.getLogger("textgame")
+from .logsetup import get_logger
+
+log = get_logger(__name__)
 log.setLevel(logging.WARNING)
 
 # ══════════════════════════════════════════════════════════════

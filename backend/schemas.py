@@ -45,6 +45,13 @@ class SaveIn(BaseModel):
     name: str
 
 
+class RewindIn(BaseModel):
+    """Перемотка мира к началу хода `seq` (сессия 34, C1): состояние из снапшота этого хода,
+    более новые ходы убираются (mode="delete") или сокрыты (mode="hide")."""
+    seq: int
+    mode: str = "delete"
+
+
 class DivineIn(BaseModel):
     """Воззвание к Провидению (Божественный арбитр): жалоба игрока на ошибку Рассказчика"""
     complaint: str

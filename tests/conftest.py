@@ -22,6 +22,10 @@ os.environ.setdefault("DB_PATH", str(Path(_TMP) / "test.db"))
 os.environ["BACKUP_DB_ON_START"] = "false"
 os.environ["METRICS_PERSIST"] = "false"
 os.environ["DETECT_MODEL_CONTEXT"] = "false"
+# Лог тестов — в temp-папку прогона, а не в боевой data/logs/game.log (иначе pytest
+# забивает рабочий журнал诊断ики мусором заглушенных вызовов).
+os.environ["LOG_FILE"] = str(Path(_TMP) / "test-game.log")
+os.environ["LOG_LEVEL"] = "WARNING"
 os.environ["TTS_ENABLED"] = "false"
 os.environ["DYNAMIC_EVENTS_ENABLED"] = "false"
 os.environ["EMBEDDING_PROVIDER"] = "none"

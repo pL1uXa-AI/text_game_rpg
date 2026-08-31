@@ -24,7 +24,9 @@ from .config import get_config
 from .mechanics import (RACE_NAMES, CLASS_NAMES, PROFESSION_NAMES,
                         ensure_player_schema, norm_rank, recalc_derived, apply_directives)
 
-log = logging.getLogger("textgame")
+from .logsetup import get_logger, log_once
+
+log = get_logger(__name__)
 
 
 # Маппинг ключей характеристик: модель может вернуть статы англоязычными ключами
@@ -315,7 +317,8 @@ def apply_character(setting: dict, data: dict, hook: str = "", genre: str = "") 
         if 1 <= lv <= 99:
             p["level"] = lv
     except Exception:
-        pass
+        # легальный фолбэк: модель могла не вернуть level — но если вернула мусор, это видно в debug
+        log.debug("generate/apply character: уровень не разобран из %r", data.get("level"))
     # Статы (абсолютные значения). Если модель не вернула валидные статы (None/не dict) —
     # распределяем сами по роли, чтобы персонаж не был «все 10».
     st = data.get("stats")
@@ -328,7 +331,7 @@ def apply_character(setting: dict, data: dict, hook: str = "", genre: str = "") 
             try:
                 p["stats"][ru] = max(1, min(99, int(v)))
             except Exception:
-                pass
+                log.debug("персонаж: стат %s не разобран из %r", k, v)
     # Навыки
     for sk in (data.get("skills") or []):
         if isinstance(sk, str) and str(sk).strip():
@@ -396,8 +399,9 @@ async def generate_opening(world: dict, setting: dict, persona: str | None = Non
             core = [f"• {e['title']}: {e['content'][:500]}" for e in entries if e.get("is_core")]
             extra = [f"• {e['title']}: {e['content'][:350]}" for e in entries if not e.get("is_core")]
             lore_block = "\n\n[ЛОР МИРА — факты вселенной, по ним строй сцену]\n" + "\n".join((core + extra)[:6])
-    except Exception:
-        pass
+    except Exception as e:
+        log_once(log, "opening-lore", 30,
+                 "открытие мира: лор мира не подан в промпт (world %s): %s", world["id"], e)
 
     # Персонаж: из зацепа игрока или из уже заданной identity в состоянии
     ident = setting.get("player", {}).get("identity", "").strip()

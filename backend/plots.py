@@ -23,7 +23,9 @@ from pathlib import Path
 
 from .narrator_data import GENRE_HINTS
 
-log = logging.getLogger("textgame")
+from .logsetup import get_logger
+
+log = get_logger(__name__)
 
 PLOTS_ROOT = Path(__file__).resolve().parent.parent / "plots"
 PLOT_SEARCH = ("system", "user")  # порядок: system первая, user переопределяет

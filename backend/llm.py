@@ -6,6 +6,8 @@ llm.py — клиент основной модели (OpenAI-совместим
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
 from typing import AsyncGenerator, Optional
@@ -14,15 +16,48 @@ import httpx
 
 from .config import get_config
 
-log = logging.getLogger("textgame")
+from .logsetup import get_logger
+from .retry import with_retries, is_transient
+
+log = get_logger(__name__)
 
 _client: Optional[httpx.AsyncClient] = None
+
+
+def _retry_conf() -> tuple[int, float]:
+    """(повторы, базовая задержка) из конфига — для стрима, где with_retries неприменим."""
+    try:
+        cfg = get_config()
+        return max(0, int(getattr(cfg, "llm_retries", 2) or 0)), max(0.0, float(
+            getattr(cfg, "llm_retry_backoff", 0.8) or 0.8))
+    except Exception:
+        return 0, 0.8
+
+
+def _bg_retries() -> int:
+    return _retry_conf()[0]
+
+
+def _backoff_delay(attempt: int) -> float:
+    import random
+    base = _retry_conf()[1]
+    return base * (2 ** max(0, attempt - 1)) * (1.0 + random.random() * 0.25)
+
+
+def _timeout() -> httpx.Timeout:
+    """Таймаут запроса к модели: общий из LLM_TIMEOUT (по умолчанию 300с — локальная 8B на
+    длинном промпте считается долго), connect — жёсткий (сервис либо есть, либо его нет)."""
+    try:
+        total = float(getattr(get_config(), "llm_timeout", 300.0) or 300.0)
+    except Exception:
+        total = 300.0
+    return httpx.Timeout(total, connect=10.0)
 
 
 def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+        _client = httpx.AsyncClient(timeout=_timeout())
     return _client
 
 
@@ -203,17 +238,32 @@ def _collect_tool_calls(message: dict, out: list[dict] | None) -> None:
 async def complete(messages: list[dict], temperature: float = 0.8, max_tokens: int = 2000,
                    top_p: float = 0.95, provider: dict | None = None,
                    tools: list | None = None, tool_choice: str | None = None,
-                   tool_calls_out: list[dict] | None = None) -> str:
+                   tool_calls_out: list[dict] | None = None,
+                   finish_out: dict | None = None) -> str:
+    """Один тарелочный проход к модели.
+
+    `finish_out` (если передан dict) дополняется служебными сведениями ответа:
+    finish_reason / usage (prompt_tokens, completion_tokens) — нужно для метрики
+    «ответ обрезан лимитом» (E3), которую иначе по одному тексту не увидеть.
+    Временные сбои (429/5xx/таймаут) повторяются по LLM_RETRIES (сессия 34, B2).
+    """
     prov = provider or _provider()
     url = f"{prov['base_url']}/chat/completions"
     headers = {"Authorization": f"Bearer {prov['api_key']}"} if prov.get("api_key") else {}
     payload = _payload(messages, temperature, max_tokens, top_p, False, prov, tools=tools, tool_choice=tool_choice)
-    resp = await _get_client().post(url, json=payload, headers=headers)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"LLM HTTP {resp.status_code} ({prov['id']}): {resp.text[:400]}")
+
+    async def _attempt():
+        resp = await _get_client().post(url, json=payload, headers=headers)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"LLM HTTP {resp.status_code} ({prov['id']}): {resp.text[:400]}")
+        return resp
+
+    resp = await with_retries(_attempt, what=f"LLM complete ({prov['id']})")
     data = resp.json()
     if data.get("error"):
         raise RuntimeError(f"LLM error ({prov['id']}): {data['error']}")
+    if finish_out is not None:
+        _capture_finish(data, finish_out)
     choices = data.get("choices") or []
     if not choices:
         return ""
@@ -222,45 +272,82 @@ async def complete(messages: list[dict], temperature: float = 0.8, max_tokens: i
     return (message.get("content") or "") if message else ""
 
 
+def _capture_finish(data: dict, out: dict) -> None:
+    """Достаёт из ответа OpenAI-совместимого API finish_reason и usage (в поля `out`)."""
+    try:
+        ch = (data.get("choices") or [{}])[0]
+        if ch.get("finish_reason"):
+            out["finish_reason"] = str(ch["finish_reason"])
+        u = data.get("usage") or {}
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            if isinstance(u.get(key), int):
+                out[key] = u[key]
+    except Exception as e:      # служебная информация — не роняет ход
+        log.debug("finish_out: не разобран ответ модели: %s", e)
+
+
 async def stream_chat(messages: list[dict], temperature: float = 0.8, max_tokens: int = 2000,
                       top_p: float = 0.95, provider: dict | None = None,
                       tools: list | None = None, tool_choice: str | None = None,
-                      tool_calls_out: list[dict] | None = None) -> AsyncGenerator[str, None]:
+                      tool_calls_out: list[dict] | None = None,
+                      finish_out: dict | None = None) -> AsyncGenerator[str, None]:
     """Потоковая генерация: отдаёт дельты текста. SSE из провайдера → [DONE].
-    tools — если заданы, дельты tool_calls накапливаются в tool_calls_out (по индексам)."""
+    tools — если заданы, дельты tool_calls накапливаются в tool_calls_out (по индексам).
+    finish_out — см. complete(): собирает finish_reason/usage из последнего чанка.
+
+    Повторы: стрим повторяется ТОЛЬКО если сбой произошёл ДО первого отданного токена
+    (иначе игрок увидел бы склеенный из двух генераций текст)."""
     prov = provider or _provider()
     url = f"{prov['base_url']}/chat/completions"
     headers = {"Authorization": f"Bearer {prov['api_key']}"} if prov.get("api_key") else {}
     payload = _payload(messages, temperature, max_tokens, top_p, True, prov, tools=tools, tool_choice=tool_choice)
-    tools_acc: dict[int, dict] = {}
-    async with _get_client().stream("POST", url, json=payload, headers=headers) as resp:
-        if resp.status_code >= 400:
-            body = await resp.aread()
-            raise RuntimeError(f"LLM HTTP {resp.status_code} ({prov['id']}): {body[:400]}")
-        async for line in resp.aiter_lines():
-            if not line or not line.startswith("data:"):
-                continue
-            chunk = line[5:].strip()
-            if chunk == "[DONE]":
-                break
-            try:
-                data = __import__("json").loads(chunk)
-            except Exception:
-                continue
-            choices = data.get("choices") or []
-            for c in choices:
-                delta = (c.get("delta") or {}) or {}
-                content = delta.get("content")
-                if content:
-                    yield content
-                for tc in (delta.get("tool_calls") or []):
-                    idx = int(tc.get("index", 0))
-                    acc = tools_acc.setdefault(idx, {"name": "", "arguments": ""})
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        acc["name"] += fn["name"]
-                    if fn.get("arguments"):
-                        acc["arguments"] += fn["arguments"]
+    headers["Accept"] = "text/event-stream"
+    retries = _bg_retries()
+    attempt = 0
+    while True:
+        tools_acc: dict[int, dict] = {}
+        yielded = False
+        try:
+            async with _get_client().stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    raise RuntimeError(f"LLM HTTP {resp.status_code} ({prov['id']}): {body[:400]}")
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    chunk = line[5:].strip()
+                    if chunk == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(chunk)
+                    except Exception:
+                        continue
+                    if finish_out is not None:
+                        _capture_finish(data, finish_out)
+                    for c in (data.get("choices") or []):
+                        delta = (c.get("delta") or {}) or {}
+                        content = delta.get("content")
+                        if content:
+                            yielded = True
+                            yield content
+                        for tc in (delta.get("tool_calls") or []):
+                            idx = int(tc.get("index", 0))
+                            acc = tools_acc.setdefault(idx, {"name": "", "arguments": ""})
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                acc["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                acc["arguments"] += fn["arguments"]
+            break
+        except Exception as e:
+            # повтор допустим, только если игрок ещё НЕ увидел ни одного токена
+            if yielded or attempt >= retries or not is_transient(e):
+                raise
+            attempt += 1
+            delay = _backoff_delay(attempt)
+            log.warning("LLM stream (%s): сбой до первого токена (%s), повтор %d/%d через %.1fс",
+                        prov['id'], str(e)[:160], attempt, retries, delay)
+            await asyncio.sleep(delay)
     if tool_calls_out is not None:
         for idx in sorted(tools_acc):
             acc = tools_acc[idx]

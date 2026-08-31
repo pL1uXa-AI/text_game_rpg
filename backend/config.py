@@ -167,6 +167,48 @@ class Config:
     # на локальной llama.cpp 8192 при стандарте .env 32768).
     detect_model_context: bool = True
 
+    # ── Наблюдаемость (сессия 34, логирование) ──
+    # Уровень логгера `textgame` (DEBUG/INFO/WARNING/ERROR). DEBUG показывает и легальные
+    # фолбэки (log_once-повторы, тихие деградации RAG).
+    log_level: str = "INFO"
+    # JSON-лог с контекстом хода (world_id/turn_seq/agent). Пусто/off = только консоль.
+    # Относительный путь считается от корня игры.
+    log_file: str = "data/logs/game.log"
+    log_max_bytes: int = 5_242_880     # размер файла до ротации (~5 МБ)
+    log_backup_count: int = 3          # сколько архивных файлов держать
+    # Отладочный дамп собранного промпта хода в лог (DEBUG) — видно, что реально ушло в модель.
+    log_prompt_dump: bool = False
+
+    # ── Устойчивость обращений к LLM/Chroma/облаку (сессия 34) ──
+    # Фоновые агенты и ход игрока переживают временные сбои (429/5xx/таймаут/обрыв
+    # соединения): повтор с экспоненциальной задержкой. 0 = отключить повторы.
+    llm_retries: int = 2              # повторов ПОСЛЕ первой попытки (итого до 3 запросов)
+    llm_retry_backoff: float = 0.8    # базовая задержка, удваивается (0.8с → 1.6с)
+    llm_timeout: float = 300.0        # общий таймаут запроса к модели (connect — жёстче)
+    chroma_retries: int = 1           # ChromaDB — локальный сервис: один быстрый повтор
+    embedding_retries: int = 1        # облачные эмбеддинги/реранкер
+
+    # ── Очередь фоновых агентов (сессия 34) ──
+    # Все LLM-проходы (ход игрока + судья/мастер/боевой ИИ/события/карточки/видения) делят
+    # ОДН очередь к модели. Без этого 5–6 фоновых задач ставятся в тот же слот сразу после
+    # ответа и «съедают» следующий ход игрока. Семафор ограничивает параллельность,
+    # приоритет решает, кто пойдёт первым, а очередь видна в /api/metrics.
+    llm_bg_concurrency: int = 2       # сколько фоновых LLM-проходов одновременно
+    llm_bg_max_queue: int = 32        # потолок очереди (переполнение = отказ с логом)
+    llm_bg_yield_turn: bool = True    # фоновые агенты ждут окончания хода игрока
+
+    # Сколько точек перемотки (состояний перед ходом) хранить на мир. Каждая ~1-5 КБ JSON.
+    # 0 = хранить все. Нужно для «назад к ходу N» (C1) и честной загрузки сохранений (A1).
+    turn_snapshot_keep: int = 120
+
+    # ── Ярусы системного промпта (сессия 34) ──
+    # Промпт рассказчика ≈ 6к токенов каждый ход. «Полный» промпт нужен, когда модель обязана
+    # сама эмитить механику (локальные провайдеры, формат <<ENGINE>>). В tools-режиме список
+    # директив уже отдан схемой инструмента game_engine — многостраничные примеры во
+    # промпте избыточны и только съедают контекст, поэтому промпт собирается тоньше.
+    # (Замер сессии 34: полный ≈ 6.2к токенов против ≈ 4.2к без дубля schemas-примеров.)
+    prompt_tiers_enabled: bool = True
+
     # ── Озвучка (TTS): piper | kokoro | edge | none ──
     tts_enabled: bool = True          # глобальный включатель озвучки (per-world поверх)
     tts_provider: str = "edge"
@@ -352,6 +394,21 @@ class Config:
             metrics_file=get("METRICS_FILE", default="data/metrics.jsonl"),
             metrics_tail=it(500, "METRICS_TAIL"),
             detect_model_context=get("DETECT_MODEL_CONTEXT", default="true").lower() in ("1", "true", "yes", "on"),
+            log_level=get("LOG_LEVEL", default="INFO"),
+            log_file=get("LOG_FILE", default="data/logs/game.log"),
+            log_max_bytes=it(5242880, "LOG_MAX_BYTES"),
+            log_backup_count=it(3, "LOG_BACKUP_COUNT"),
+            log_prompt_dump=get("LOG_PROMPT_DUMP", default="false").lower() in ("1", "true", "yes", "on"),
+            llm_retries=it(2, "LLM_RETRIES"),
+            llm_retry_backoff=flt(0.8, "LLM_RETRY_BACKOFF"),
+            llm_timeout=flt(300.0, "LLM_TIMEOUT"),
+            chroma_retries=it(1, "CHROMA_RETRIES"),
+            embedding_retries=it(1, "EMBEDDING_RETRIES"),
+            llm_bg_concurrency=it(2, "LLM_BG_CONCURRENCY"),
+            llm_bg_max_queue=it(32, "LLM_BG_MAX_QUEUE"),
+            llm_bg_yield_turn=get("LLM_BG_YIELD_TURN", default="true").lower() in ("1", "true", "yes", "on"),
+            prompt_tiers_enabled=get("PROMPT_TIERS_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
+            turn_snapshot_keep=it(120, "TURN_SNAPSHOT_KEEP"),
             tts_enabled=get("TTS_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             tts_provider=get("TTS_PROVIDER", default="edge").lower(),
             tts_voice=get("TTS_VOICE", default="ru-RU-DmitryNeural"),

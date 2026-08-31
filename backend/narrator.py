@@ -27,7 +27,9 @@ from .mechanics import (  # RPG-движок директив (вынесено 
     board_add, board_text, location_effects_for, apply_location_effects,
 )
 
-log = logging.getLogger("textgame")
+from .logsetup import get_logger
+
+log = get_logger(__name__)
 
 from . import plots
 from .narrators_loader import (
@@ -278,16 +280,20 @@ def genre_hint_text(genre: str) -> str:
 
 
 # ── Размер контекста мира (per-world): чем больше — тем точнее память ──
-CONTEXT_OVERHEAD = 2600   # системный промпт + сводки + RAG-воспоминания + карточки + действие + запас
+CONTEXT_OVERHEAD = 2600   # ЗАПАС, если реальный размер системного промпта ещё не измерен
 MIN_RECENT_BUDGET = 400
 # База шкалы масштабирования памяти/лора: СТАНДАРТ 32k (как в .env CONTEXT_TOKENS=32768).
 # Не используем get_config().context_tokens, потому что админка может поставить глобальный
 # контекст 262144 — тогда формула «контекст/база» схлопывалась к 1.0 и память не росла.
 CONTEXT_BASE_TOKENS = 32768
 # Резерв токенов под RAG-память + лор + сводки + карточки (поверх recent).
-# Достаточен для МАКСИМАЛЬНОГО RAG/лора при 262k (RAG 24×~220=5280 + лор 6000 + сводки 10×120
-# + карточки ~1500 ≈ 14-15k), чтобы даже самый «жадный» мир влезал в контекст без переполнения.
-MEMORY_EXTRA_BUDGET = 16384
+# (сессия 34, A2) Раньше это была плоская константа MEMORY_EXTRA_BUDGET=16384 — и при
+# локальном окне 8192 она была БОЛЬШЕ всего контекста: recent всегда падал на пол 400,
+# а суммарный промпт с системными ~6200 токенов всё равно вылезал за n_ctx (молчаливый
+# обрез). Теперь резерв = доля окна, но не больше MAX_MEMORY_EXTRA_BUDGET.
+MEMORY_EXTRA_RATIO = 0.2
+MAX_MEMORY_EXTRA_BUDGET = 16384   # достаточно для МАКСИМАЛЬНОГО RAG/лора при 262k
+MEMORY_EXTRA_BUDGET = MAX_MEMORY_EXTRA_BUDGET   # обратная совместимость (тесты/скрипты)
 
 
 def world_gen_settings(world: dict) -> dict:
@@ -306,16 +312,48 @@ def world_context_tokens(world: dict) -> int:
     return ctx if ctx > 0 else get_config().context_tokens
 
 
-def world_recent_budget(world: dict) -> int:
-    """Сколько токенов мира уходит под недавнюю историю исходя из размера контекста.
-    total ≈ context_tokens = оверхед + недавняя история + max_tokens (ответ) + РЕЗЕРВ.
-    Резерв (MEMORY_EXTRA_BUDGET) оставляем под RAG-факты, лор, сводки и карточки сущностей,
-    которые идут ПОВЕРХ базы (иначе при большом контексте recent съедал всё и происходило
-    переполнение ~3k токенов)."""
-    g = world_gen_settings(world)
+def memory_extra_budget(world: dict) -> int:
+    """Резерв окна под память (RAG/лор/сводки/карточки): доля контекста, но не больше
+    MAX_MEMORY_EXTRA_BUDGET. При локальном n_ctx 8192 это ~1.6k вместо прежних 16k."""
     ctx = world_context_tokens(world)
+    return max(512, min(MAX_MEMORY_EXTRA_BUDGET, int(ctx * MEMORY_EXTRA_RATIO)))
+
+
+def world_prompt_overhead(world: dict, setting: dict | None = None,
+                          prompt_tokens: int | None = None) -> int:
+    """Сколько окно съедают системный промпт + max_tokens ответа.
+
+    A2: оверхед берётся ИЗМЕРЕННЫЙ (т.ч. реальный размер промпта этого мира), а не из
+    догадки. Порядок приоритета:
+      1) prompt_tokens — передан вызывающим (ядро хода уже считает его для метрик);
+      2) setting["_ctx_prompt_tokens"] — измерение с последнего хода этого мира;
+      3) CONTEXT_OVERHEAD — запас для нового мира/старых сохранений (после первого хода
+         само-корректируется).
+    """
+    g = world_gen_settings(world)
     mtok = int(g.get("max_tokens") or get_config().max_tokens)
-    return max(MIN_RECENT_BUDGET, ctx - CONTEXT_OVERHEAD - mtok - MEMORY_EXTRA_BUDGET)
+    pt = prompt_tokens
+    if not pt:
+        try:
+            st = setting if isinstance(setting, dict) else json.loads(world.get("setting") or "{}")
+            pt = int(st.get("_ctx_prompt_tokens") or 0)
+        except Exception:
+            pt = 0
+    return max(CONTEXT_OVERHEAD, int(pt or 0)) + mtok
+
+
+def world_recent_budget(world: dict, prompt_tokens: int | None = None) -> int:
+    """Сколько токенов мира уходит под недавнюю историю.
+
+    total ≈ context_tokens = (системный промпт + ответ) + recent + резерв на память.
+    A2 (сессия 34): раньше из окна вычиталась плоская догадка CONTEXT_OVERHEAD=2600 при
+    реальном промпте ~6200 токенов и резерв 16384 — больше всего локального окна. Теперь
+    оверхед измеряется, резерв — доля окна.
+    """
+    ctx = world_context_tokens(world)
+    return max(MIN_RECENT_BUDGET,
+               ctx - world_prompt_overhead(world, prompt_tokens=prompt_tokens)
+               - memory_extra_budget(world))
 
 
 def dynamic_memory_k(world: dict, base_k: int, max_k: int) -> int:
@@ -788,11 +826,150 @@ def format_state(setting: dict) -> str:
     return "\n".join(lines)
 
 
+# ════════════════════════════════════════════════════════════
+# Ярусы промпта (сессия 34, B4): отсечь правила о подсистемах, которых в мире нет
+# ════════════════════════════════════════════════════════════
+#
+# Замер: системный промпт рассказчика ≈ 6200 токенов, из них ≈ 4400 — блок «Правила
+# рассказчика». На локальной модели (llama.cpp, n_ctx 8192) это окно тратится каждый ход,
+# хотя правила про крафт/фракции/таймеры/зоны бесполезны, пока в мире нет ни одного
+# объекта такой подсистемы. Здесь тяжёлые правила НЕ ПОДАЮТСЯ, если подсистема не живёт в
+# состоянии И действие игрока о ней не просит.
+#
+# Это только объём контекста, а не решения за мастера (закон 3): возможность обратиться к
+# директиве сохраняется (её имя остаётся в «словаре» RULE_VOCAB и в блоке «Механика»), а
+# полный текст правила мгновенно возвращается, как только подсистема появляется в мире.
+#
+# Чего здесь СОЗНАТЕЛЬНО нет: правила 9/9а/16 (бой, аудит, тик эффектов) не выкладываются
+# даже без врагов/эффектов — их отсутствие в момент ПЕРВОГО effect_add/enemy_apply могло бы
+# дать задвоенный урон (модель не знала бы, что код уже тикает сам). Экономия того не стоит.
+
 # ══════════════════════════════════════════════════════════════
 # Системный промпт рассказчика
 # ══════════════════════════════════════════════════════════════
+_RULE_LINE = re.compile(r"^\s*(\d+[а-яa-z]?)\.\s")
+
+# правило → (признак живости подсистемы, ключевые слова действия, имя для словаря)
+_GATED_RULES: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "15": ("identity", ("ранг", "класс", "раса", "професси", "мультиклас", "эволюц",
+                       "rank", "class", "race"), "вшитые расы/классы/профессии и ранги F..G"),
+    "18а": ("abilities", ("маг", "заклин", "пси", "способност", "каст", "умени",
+                         "spell", "magic", "ability"), "сверхспособности (ability_*/ability_use)"),
+    "20а": ("progress", (), "счётчики пути и достижения (progress_add/achievement_add)"),
+    "21": ("shops", ("куп", "прода", "цен", "лавк", "торгов", "магат", "вес", "рюкзак",
+                    "buy", "sell", "shop", "trade", "price"), "магазины, цены, вес рюкзака"),
+    "22": ("crafts", ("кова", "крафт", "создат", "рецепт", "собр", "ресурс", "станц",
+                     "craft", "smelt", "gather", "ремон", "ингредиент"), "крафт, станции, сбор, кошельки врагов"),
+    "23": ("companions", ("спутник", "компаньон", "напарник", "питом", "верност",
+                         "companion", "pet"), "спутники (companion_*)"),
+    "25": ("schedules", ("расписан", "ночь", "утро", "вечер", "днём", "рынок", "таверн",
+                        "schedule"), "расписания NPC по времени суток"),
+    "26": ("factions", ("гильд", "фракц", "репутац", "стража", "банд", "клан", "зван",
+                       "faction", "guild", "reputation"), "фракции, ступени репутации, звания"),
+    "30": ("timers", ("время вышло", "дедлайн", "секунд", "минут", "бомба", "осад",
+                     "timer", "deadline"), "таймеры-дедлайны мира (timer_add)"),
+    "31": ("needs", ("есть", "пь", "голод", "жажд", "устал", "отдохн", "спат", "сон",
+                    "рассуд", "морал", "стресс", "stress", "hungry", "thirst", "rest",
+                    "sleep", "sanity"), "потребности и рассудок (needs)"),
+    "32": ("zone", ("туман", "радиац", "зон", "ядовит", "проклят", "атмосфер"), "локации-зоны с эффектами"),
+}
+
+# Короткий «словарь»: что умеет движок, когда подробности правила убраны.
+RULE_VOCAB = ("[Механики этого хода кратко] {caps} — эти директивы доступны и сейчас,"
+              " подробные правила появятся, когда подсистема войдёт в игру; уже заведённые"
+              " сущности (магазины/крафт/фракции/спутники) вёди по тому же смыслу.")
+
+
+def _need_rule_full(key: str, setting: dict) -> bool:
+    """Есть ли подсистема в состоянии мира. Липко: появилась — правило сразу возвращается."""
+    p = setting.get("player") or {}
+    loc = (setting.get("locations") or {}).get(setting.get("current_location") or "") or {}
+    try:
+        if key == "identity":
+            # держим правило, пока роль не собрана (там список вшитых + ранги)
+            return not (p.get("race") and p.get("class") and (p.get("profession") or p.get("skills")))
+        if key == "abilities":
+            return bool(p.get("abilities"))
+        if key == "progress":
+            return bool(p.get("progress")) or bool(p.get("achievements"))
+        if key == "shops":
+            return bool(setting.get("shops"))
+        if key == "crafts":
+            if setting.get("crafts"):
+                return True
+            return bool(loc.get("stations")) or any(str(f).startswith("station:")
+                                                   for f in (setting.get("flags") or {}))
+        if key == "companions":
+            return bool(setting.get("companions"))
+        if key == "schedules":
+            return any((n or {}).get("schedule") for n in (setting.get("npc") or {}).values())
+        if key == "factions":
+            return bool(setting.get("factions")) or bool(p.get("reputation")) \
+                or bool(p.get("faction_ranks"))
+        if key == "timers":
+            return bool(setting.get("timers"))
+        if key == "needs":
+            return bool(p.get("needs")) or bool(p.get("mental"))
+        if key == "zone":
+            return bool(loc.get("effects"))
+    except Exception as e:
+        # не разобрали состояние — консервативно оставляем полное правило
+        log.warning("ярус промпта: признак %s не разобран, оставляю правило целиком: %s", key, e)
+        return True
+    return False
+
+
+def gated_rules(setting: dict, action: str = "") -> set[str]:
+    """Номера правил, которые НЕ нужны в этом ходу (подсистема мертва и игрок про неё не пишет)."""
+    if not get_config().prompt_tiers_enabled:
+        return set()
+    low = (action or "").lower()
+    drop: set[str] = set()
+    for num, (key, words, _name) in _GATED_RULES.items():
+        if _need_rule_full(key, setting):
+            continue
+        if any(w in low for w in words):
+            continue          # игрок явно про это — правило нужно прямо сейчас
+        drop.add(num)
+    return drop
+
+
+def trim_prompt(prompt: str, drop: set[str]) -> tuple[str, int]:
+    """Убирает строки-правила из `drop`, оставляя вместо них краткий «словарь» механик.
+    Возвращает (новый промпт, сэкономлено токенов). Чистая функция над текстом: сами
+    правила по-прежнему живут одним местом в build_system_prompt."""
+    if not drop:
+        return prompt, 0
+    kept: list[str] = []
+    removed: list[str] = []
+    caps: list[str] = []
+    for line in prompt.splitlines():
+        m = _RULE_LINE.match(line)
+        if m and m.group(1) in drop:
+            removed.append(line)
+            caps.append(_GATED_RULES[m.group(1)][2])
+            continue
+        kept.append(line)
+    if not removed:
+        return prompt, 0
+    vocab = RULE_VOCAB.format(caps="; ".join(caps))
+    out: list[str] = []
+    injected = False
+    for line in kept:
+        # словарь вставляем перед блоком механики — сразу после правил
+        if not injected and line.startswith(("## Формат блока", "## Механика — инструмент")):
+            out.append(vocab)
+            out.append("")
+            injected = True
+        out.append(line)
+    if not injected:
+        out.append(vocab)
+    saved = est_tokens("\n".join(removed)) - est_tokens(vocab)
+    return "\n".join(out), max(0, saved)
+
+
 def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
-                        use_tools: bool = False) -> str:
+                        use_tools: bool = False, action: str = "") -> str:
     theme = _world_theme(world, setting)
     style = theme.get("style", "")
     world_genre = world.get("genre") or theme.get("genre", "")
@@ -996,6 +1173,17 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
         # в tools-режиме убираем объёмные примеры с маркером <<ENGINE>> (путают модель;
         # правильная форма — вызов инструмента game_engine)
         prompt = "\n".join(l for l in prompt.splitlines() if "<<ENGINE>>" not in l)
+    # ── Ярусы промпта (сессия 34, B4): минус правила о подсистемах, которых в мире нет ──
+    try:
+        drop = gated_rules(setting, action or "")
+        if drop:
+            prompt, saved = trim_prompt(prompt, drop)
+            if saved:
+                log.debug("промпт уощён на %d токенов (правила вне игры: %s)",
+                          saved, ",".join(sorted(drop)))
+    except Exception as e:
+        # сокращение промпта — оптимизация, а не обязательная часть хода
+        log.warning("ярусы промпта не применились (ухожу на полный промпт): %s", e, exc_info=True)
     return prompt
 
 
@@ -1039,39 +1227,119 @@ def build_messages(world: dict, setting: dict, action: str,
                    rag_chunks: list[str], entity_cards: list[dict] | None = None,
                    persona: str | None = None, use_tools: bool = False,
                    lore: list[str] | None = None) -> list[dict]:
-    sys_prompt = build_system_prompt(world, setting, persona=persona, use_tools=use_tools)
+    """Собирает единственный system-message хода. Гарантирует, что промпт НЕ вылезет за
+    контекст модели (A2, сессия 34): если после бюджета recent всё равно перебор —
+    в порядке меньшей важности выкидываются лор-чанки → воспоминания RAG → сводки →
+    карточки, а затем самая старая недавняя история. Каждый отказ — в лог (правило 14).
+    Возвращает (messages, meta): meta содержит размеры секций и число выкинутого."""
+    sys_prompt = build_system_prompt(world, setting, persona=persona, use_tools=use_tools,
+                                     action=action)
     fb_note = feedback_style_note(world["id"])
     if fb_note:
         sys_prompt += "\n\n" + fb_note
 
-    mem_blocks = []
-    if lore:
-        mem_blocks.append("[ЛОР МИРА — факты вселенной (из библиотеки мира, актуально)]\n"
-                          + "\n\n".join(lore))
-    if summaries:
-        # Сводок в промпт — больше при большом контексте (жалоба: «всегда 9 фактов»):
-        # окно 262к позволяет показывать историю, а не последние 3 сводки.
-        from .narrator import dynamic_memory_k
-        max_summaries = dynamic_memory_k(world, 3, 10)
-        smry_text = "\n\n".join(f"Сводка {i + 1}: {s['content']}"
-                                for i, s in enumerate(summaries[-max_summaries:]))
-        mem_blocks.append(f"[ПРОШЛЫЕ СОБЫТИЯ (сводки)]\n{smry_text}")
-    if rag_chunks:
-        mem_blocks.append("[ВОСПОМИНАНИЯ (из долгосрочной памяти)]\n"
-                          + "\n---\n".join(f"• {c[:400]}" for c in rag_chunks))
-    if entity_cards:
-        mem_blocks.append("[КАРТОЧКИ СУЩНОСТЕЙ — кто/что рядом и важно]\n"
-                          + format_entity_cards(entity_cards))
+    lore = list(lore or [])
+    rag_chunks = list(rag_chunks or [])
+    # Сводки в промпт — больше при большом контексте (жалоба: «всегда 9 фактов»).
+    # A3 (сессия 34): окно считалось здесь, но routers/core._summaries() резал список до 3
+    # раньше — масштабирование было мёртвым. Теперь количество задаёт ЭТА функция, а вызывающий
+    # передаёт сводки с запасом.
+    max_summaries = dynamic_memory_k(world, 3, 10)
+    summaries = list(summaries or [])[-max_summaries:]
+    recent_events = list(recent_events or [])
 
-    parts = [sys_prompt]
-    if mem_blocks:
-        parts.append("\n\n".join(mem_blocks))
-    recent = format_memory(recent_events)
-    if recent:
-        parts.append(f"[НЕДАВНЯЯ ИСТОРИЯ]\n{recent}")
-    parts.append(f"[ДЕЙСТВИЕ ИГРОКА]\n{action}")
+    def assemble():
+        mem_blocks = []
+        if lore:
+            mem_blocks.append("[ЛОР МИРА — факты вселенной (из библиотеки мира, актуально)]\n"
+                              + "\n\n".join(lore))
+        if summaries:
+            smry_text = "\n\n".join(f"Сводка {i + 1}: {s['content']}"
+                                     for i, s in enumerate(summaries))
+            mem_blocks.append(f"[ПРОШЛЫЕ СОБЫТИЯ (сводки)]\n{smry_text}")
+        if rag_chunks:
+            mem_blocks.append("[ВОСПОМИНАНИЯ (из долгосрочной памяти)]\n"
+                              + "\n---\n".join(f"• {c[:400]}" for c in rag_chunks))
+        if entity_cards:
+            mem_blocks.append("[КАРТОЧКИ СУЩНОСТЕЙ — кто/что рядом и важно]\n"
+                              + format_entity_cards(entity_cards))
+        parts = [sys_prompt]
+        if mem_blocks:
+            parts.append("\n\n".join(mem_blocks))
+        recent = format_memory(recent_events)
+        if recent:
+            parts.append(f"[НЕДАВНЯЯ ИСТОРИЯ]\n{recent}")
+        parts.append(f"[ДЕЙСТВИЕ ИГРОКА]\n{action}")
+        return "\n\n".join(parts)
 
-    return [{"role": "system", "content": "\n\n".join(parts)}]
+    ctx = world_context_tokens(world)
+    mtok = int(world_gen_settings(world).get("max_tokens") or get_config().max_tokens)
+    hard = max(1500, ctx - mtok)          # что реально можно отправить модели
+    meta: dict = {"trimmed": [], "overflow_tokens": 0}
+    content = assemble()
+    over = est_tokens(content) - hard
+
+    # Жертвуем в порядке ОТ наименее важного к наиболее важному, и ПОСТЕПЕННО (отдать
+    # половину лора лучше, чем отдать весь): промпт может быть больше плана всего на
+    # пару сотен токенов, а «молча обрезать» — ровно то, от чего защищаемся.
+    # Порядок: лор → RAG-воспоминания → карточки (кроме текущей локации/активных квестов)
+    # → сводки → самая старая недавняя история (её уже помнят сводки и RAG).
+    def half(lst: list) -> int:
+        return max(1, len(lst) // 2)
+
+    def shrink_cards(keep: int) -> None:
+        """Оставить `keep` карточек, но NEVER без текущей локации/активных квестов —
+        без них модель не знает, кто в сцене (select_relevant_entities уже отсортировал
+        по важности, поэтому режем с хвоста)."""
+        nonlocal entity_cards
+        cards = list(entity_cards or [])
+        if len(cards) <= keep:
+            return
+        must = [c for c in cards
+                if c.get("kind") == "location" or c.get("entity_key") == setting.get("current_location")
+                or (c.get("kind") == "quest" and
+                    ((setting.get("quests") or {}).get(c.get("entity_key")) or {}).get("status") == "active")]
+        rest = [c for c in cards if c not in must]
+        entity_cards = (must + rest)[:max(keep, len(must))]
+
+    plan = (
+        ("лор", lambda: len(lore) > 1, lambda: lore.__delitem__(slice(half(lore), None))),
+        ("лор", lambda: bool(lore), lambda: lore.clear()),
+        ("воспоминания", lambda: len(rag_chunks) > 1, lambda: rag_chunks.__delitem__(slice(half(rag_chunks), None))),
+        ("воспоминания", lambda: bool(rag_chunks), lambda: rag_chunks.clear()),
+        ("карточки", lambda: len(entity_cards or []) > 4,
+         lambda: shrink_cards(max(2, len(entity_cards or []) // 2))),
+        ("сводки", lambda: len(summaries) > 1, lambda: summaries.__delitem__(slice(0, half(summaries)))),
+        ("сводки", lambda: bool(summaries), lambda: summaries.clear()),
+    )
+    for label, has_it, shrink in plan:
+        if over <= 0:
+            break
+        if has_it():
+            before = est_tokens(content)
+            shrink()
+            content = assemble()
+            after = est_tokens(content)
+            over = after - hard
+            if before != after:
+                meta["trimmed"].append(f"{label}(-{before - after})")
+    # крайний случай: самая старая недавняя история
+    while over > 0 and len(recent_events) > 2:
+        recent_events.pop(0)
+        content = assemble()
+        over = est_tokens(content) - hard
+        meta["trimmed"].append("недавняя история")
+    if over > 0:
+        meta["overflow_tokens"] = over
+        log.warning("промпт мира %s больше окна модели на %d токенов даже после усечения — "
+                    "уменьши «Размер контекста»/«Max токенов» в настройках мира",
+                    world.get("id"), over)
+    if meta["trimmed"]:
+        log.info("промпт усечён под окно (%s): −%d токенов сверх плана",
+                 ", ".join(meta["trimmed"][:6]), sum(
+                     int(x.split("-")[1].rstrip(")")) for x in meta["trimmed"]
+                     if "-" in x and x.split("-")[1].rstrip(")").isdigit()))
+    return [{"role": "system", "content": content}], meta
 
 
 # ══════════════════════════════════════════════════════════════

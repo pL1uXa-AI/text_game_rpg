@@ -128,6 +128,9 @@ def rag_env(monkeypatch, fake_config):
     monkeypatch.setattr(memory, "get_config", lambda: cfg)
     monkeypatch.setattr(memory.db, "get_events",
                         lambda wid, limit=None, since_seq=0: [{"id": i} for i in range(state["events"])])
+    # сессия 34 (B5): retrieve_memory считает события на стороне SQLite, а не длиной списка
+    monkeypatch.setattr(memory.db, "count_events",
+                        lambda wid, roles=None, unfolded_only=False: state["events"])
     monkeypatch.setattr(memory.db, "get_world", lambda wid: {"gen_settings": "{}"})
     return cfg, state
 
@@ -303,15 +306,111 @@ def test_index_entities_logs_and_never_raises_when_cloud_dead(monkeypatch, fake_
 # ═════════════════════ бюджеты памяти (narrator.py) ═════════════════════
 
 def test_world_recent_budget_math(fake_config):
+    """A2 (сессия 34): бюджет recent = контекст − (измеренный промпт + ответ) − резерв памяти,
+    где резерв — ДОЛЯ окна, а не плоские 16384 (которые были больше всего локального n_ctx)."""
     cfg = fake_config(context_tokens=32768, max_tokens=2000)
     w = {"gen_settings": json.dumps({"context_tokens": 32768, "max_tokens": 2000})}
     b = narrator.world_recent_budget(w)
-    # контекст − оверхед − ответ − резерв, и никогда не отрицательно
+    extra = narrator.memory_extra_budget(w)
     assert 0 < b < 32768 - 2000
-    assert b == max(narrator.MIN_RECENT_BUDGET,
-                    32768 - narrator.CONTEXT_OVERHEAD - 2000 - narrator.MEMORY_EXTRA_BUDGET)
+    assert b == max(narrator.MIN_RECENT_BUDGET, 32768 - narrator.CONTEXT_OVERHEAD - 2000 - extra)
+    # резерв растёт с окном, но ограничен сверху
+    assert extra == int(32768 * narrator.MEMORY_EXTRA_RATIO)
+    assert narrator.MEMORY_EXTRA_BUDGET == narrator.MAX_MEMORY_EXTRA_BUDGET  # обратная совместимость
     assert narrator.world_recent_budget({}) == narrator.world_recent_budget(
         {"gen_settings": "{}"}) or b  # без gen_settings — дефолты конфига, не падение
+
+
+def test_recent_budget_uses_measured_prompt_size(fake_config):
+    """A2: реальный размер системного промпта (~6к токенов) обязан вычитаться из бюджета —
+    иначе recent переполняет окно и модель молча обрезает ответ (локальный n_ctx 8192)."""
+    fake_config(context_tokens=32768, max_tokens=2000)
+    w = {"gen_settings": json.dumps({"context_tokens": 32768, "max_tokens": 2000})}
+    guess = narrator.world_recent_budget(w)
+    measured = narrator.world_recent_budget(w, prompt_tokens=12000)
+    assert measured < guess, "измеренный промпт должен уменьшать окно истории"
+    assert guess - measured == 12000 - narrator.CONTEXT_OVERHEAD
+    # smaller-than-guess measurement не помогает молча съесть бюджет: держим запас
+    assert narrator.world_recent_budget(w, prompt_tokens=500) == guess
+
+
+def test_local_window_gets_real_budget_not_floor(fake_config):
+    """A2: при llama.cpp n_ctx=8192 старая формула всегда давала пол 400 токенов
+    (резерв 16384 > весь контекст). Теперь там реальное окно истории."""
+    fake_config(context_tokens=8192, max_tokens=2000)
+    w = {"gen_settings": json.dumps({"context_tokens": 8192, "max_tokens": 2000})}
+    b = narrator.world_recent_budget(w)
+    assert b > narrator.MIN_RECENT_BUDGET, "локальное окно больше не должно падать на пол"
+    assert b + narrator.CONTEXT_OVERHEAD + 2000 + narrator.memory_extra_budget(w) <= 8192
+
+
+def test_prompt_tiers_drop_unused_subsystem_rules(fake_config):
+    """B4: правила о подсистемах, которых в мире нет, не едят контекст; и мгновенно
+    возвращаются, когда подсистема появляется или игрок про неё пишет."""
+    fake_config(prompt_tiers_enabled=False)
+    empty_player = {"hp": 50, "max_hp": 50, "mp": 10, "max_mp": 10, "gold": 0, "level": 1,
+                    "stats": {}, "inventory": [], "race": "человек", "class": "Воин",
+                    "profession": "Кузнец", "skills": {"меч": {"rank": "D"}}}
+    st = {"player": empty_player, "locations": {}, "npc": {}, "quests": {}, "flags": {}}
+    w = {"id": 1, "name": "t", "language": "ru", "genre": "фэнтези", "difficulty": "normal",
+         "perspective": "second", "theme": {"name": "T", "genre": "фэнтези"},
+         "setting": json.dumps(st), "gen_settings": json.dumps({"max_tokens": 2000})}
+    full = narrator.build_system_prompt(w, st, use_tools=True, action="")
+    R22 = "Не создавай предметы «из ниоткуда» без рецепта"   # уникальная строка правила 22
+    R26 = "ФРАКЦИИ → ПУТЬ ИГРОКА"                            # правило 26
+    assert R26 in full and R22 in full
+    # выключатель уважается: с выключенными ярусами ничего не отбрасывается
+    assert narrator.gated_rules(st, "") == set()
+
+    fake_config(prompt_tiers_enabled=True)
+    lean = narrator.build_system_prompt(w, st, use_tools=True, action="")
+    drop = narrator.gated_rules(st, "")
+    assert {"21", "22", "26", "31"} <= drop
+    assert R26 not in lean and R22 not in lean, "правила мёртвых подсистем не должны есть контекст"
+    assert len(lean) < len(full), "в мире без подсистем промпт обязан быть короче"
+    # словарь механик остаётся — модель знает, что директивы существуют
+    assert "крафт, станции, сбор" in lean
+    # отдельная чистая функция тоже считает экономию
+    lean2, saved = narrator.trim_prompt(full, drop)
+    assert saved > 0 and lean2 == lean
+    # игрок просит крафт → правило обязано вернуться
+    assert "22" not in narrator.gated_rules(st, "сковать меч у кузнеца")
+    assert R22 in narrator.build_system_prompt(w, st, use_tools=True, action="сковать меч"), \
+        "если игрок просит крафт — полное правило обязано вернуться в том же ходу"
+    # подсистема появилась в состоянии → правило возвращается
+    st2 = dict(st, shops={"s": {"name": "лавка"}}, factions={"g": {"name": "гильдия"}})
+    drops = narrator.gated_rules(st2, "осмотреться")
+    assert "21" not in drops and "26" not in drops
+    # выключатель уважается
+    fake_config(prompt_tiers_enabled=False)
+    assert narrator.gated_rules(st, "") == set()
+
+
+def test_build_messages_never_overflows_window(fake_config):
+    """A2: собранный промпт не должен вылезать за окно модели — иначе ответы молча
+    обрезаются (именно от этого защищали авто-детект n_ctx в сессии 33)."""
+    from backend.config import est_tokens
+    fake_config(context_tokens=8192, max_tokens=2000)
+    st = {"player": {"hp": 1, "inventory": []}, "locations": {"here": {"name": "Тут"}},
+          "npc": {}, "quests": {"q1": {"title": "Квест", "status": "active"}},
+          "flags": {}, "current_location": "here"}
+    w = {"id": 1, "name": "t", "language": "ru", "genre": "x", "difficulty": "normal",
+         "perspective": "second", "setting": json.dumps(st), "theme": {"name": "T", "genre": "x"},
+         "gen_settings": json.dumps({"context_tokens": 8192, "max_tokens": 2000})}
+    cards = [{"kind": "npc", "name": f"N{i}", "entity_key": f"n{i}", "summary": "с" * 200,
+              "relationship": "", "bio": "", "meta": "{}"} for i in range(6)]
+    cards.append({"kind": "location", "name": "Тут", "entity_key": "here",
+                  "summary": "м", "relationship": "", "bio": "", "meta": "{}"})
+    huge_lore = ["ло р" * 400] * 4
+    huge_rag = ["па мять" * 400] * 6
+    recent = [{"role": "player", "content": "x" * 500}, {"role": "narrator", "content": "y" * 500}] * 8
+    msgs, meta = narrator.build_messages(w, st, "идти", recent, [{"content": "св " * 300}] * 3,
+                                        huge_rag, cards, lore=huge_lore)
+    assert est_tokens(msgs[0]["content"]) <= 8192 - 2000, meta
+    assert meta["trimmed"], "усечение должно быть видно в метаданных хода"
+    assert not meta["overflow_tokens"]
+    # карточки СЦЕНЫ (локация + активный квест) не выкидываются никогда
+    assert "Тут" in msgs[0]["content"] and "Квест" in msgs[0]["content"]
 
 
 def test_world_recent_budget_floors_at_minimum(fake_config):
@@ -381,6 +480,8 @@ def test_summarize_compresses_old_events_and_folds(fake_config, monkeypatch):
     evs = [{"id": i, "seq": i, "role": r, "content": big, "folded": 0}
            for i, r in enumerate(["player", "narrator"] * 8)]
     monkeypatch.setattr(memory.db, "get_events", lambda wid, **kw: list(evs))
+    # сессия 34 (B5): сводка берёт окно несвёрнутых событий ограниченным запросом
+    monkeypatch.setattr(memory.db, "get_unfolded_events", lambda wid, limit=120, roles=None: list(evs))
     monkeypatch.setattr(memory.db, "get_world", lambda wid: {
         "gen_settings": json.dumps({"context_tokens": 4096, "max_tokens": 2000}),
         "provider_settings": "{}", "language": "ru"})
@@ -417,6 +518,8 @@ def test_summarize_does_not_fold_when_llm_fails(fake_config, monkeypatch):
     evs = [{"id": i, "seq": i, "role": r, "content": big, "folded": 0}
            for i, r in enumerate(["player", "narrator"] * 8)]
     monkeypatch.setattr(memory.db, "get_events", lambda wid, **kw: list(evs))
+    # сессия 34 (B5): сводка берёт окно несвёрнутых событий ограниченным запросом
+    monkeypatch.setattr(memory.db, "get_unfolded_events", lambda wid, limit=120, roles=None: list(evs))
     monkeypatch.setattr(memory.db, "get_world", lambda wid: {
         "gen_settings": json.dumps({"context_tokens": 4096, "max_tokens": 2000}),
         "provider_settings": "{}", "language": "ru"})
@@ -433,6 +536,9 @@ def test_summarize_skips_when_nothing_to_fold(fake_config, monkeypatch):
     monkeypatch.setattr(memory.db, "get_events",
                         lambda wid, **kw: [{"id": 1, "seq": 1, "role": "player",
                                             "content": "привет", "folded": 0}])
+    monkeypatch.setattr(memory.db, "get_unfolded_events",
+                        lambda wid, limit=120, roles=None: [{"id": 1, "seq": 1, "role": "player",
+                                                             "content": "привет", "folded": 0}])
     monkeypatch.setattr(memory.db, "get_world", lambda wid: {"gen_settings": "{}"})
     added = []
     monkeypatch.setattr(memory.db, "add_event",

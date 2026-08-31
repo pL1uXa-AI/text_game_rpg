@@ -17,7 +17,9 @@ from typing import Any, Optional
 
 import logging
 
-log = logging.getLogger("textgame")
+from .logsetup import get_logger
+
+log = get_logger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -176,6 +178,12 @@ def as_json(limit: int = 20) -> dict:
         # ── Трейсинг фоновых агентов: среднее/суммарное время, счётчики, последние вызовы ──
         "agents": _agents_report(limit),
     }
+    # ── Очередь фоновых агентов (сессия 34, B3): видно, не копится ли фон за ходом ──
+    try:
+        from . import bg as _bg
+        snapshot["bg_queue"] = _bg.stats()
+    except Exception as e:
+        log.debug("метрики: статистика фоновой очереди недоступна: %s", e)
     return snapshot
 
 
@@ -202,6 +210,16 @@ def _aggregate(samples: list[dict]) -> dict:
     providers = defaultdict(int)
     for s in samples:
         providers[str(s.get("provider") or "?")] += 1
+    # ── E3 (сессия 34): качество ответа как измеримые сигналы ──
+    # cut_by_limit — ответ упёрся в max_tokens (лечится настройкой «Max токенов»);
+    # cut_mid    — модель сама бросила мысль на полуслове (finish_reason=stop, но текст
+    #              не закончен). Раньше дописывание и дедуп были, а частоты — нет.
+    cuts = [s for s in samples if s.get("cut_by_limit")]
+    mids = [s for s in samples if s.get("cut_mid")]
+    n = len(samples)
+    trimmed = [s for s in samples if s.get("prompt_trimmed")]
+    scores = [s.get("rag_score_avg") for s in samples
+              if isinstance(s.get("rag_score_avg"), (int, float))]
     return {
         "llm_ms_avg": _avg(llm_ms),
         "llm_ms_max": round(max(llm_ms), 1) if llm_ms else 0,
@@ -210,8 +228,20 @@ def _aggregate(samples: list[dict]) -> dict:
         "memory_tokens_avg": _avg(mem),
         "repetition_avg": _avg(rep),
         "repetition_high_rate": round((sum(1 for x in rep if x and x >= 0.4) / len(rep)) if rep else 0, 3),
+        # доля ответов, обрезанных лимитом токенов / оборванных моделью (0..1)
+        "cut_by_limit_rate": round(len(cuts) / n, 3) if n else 0,
+        "cut_mid_rate": round(len(mids) / n, 3) if n else 0,
+        "cut_by_limit_n": len(cuts),
+        "cut_mid_n": len(mids),
+        # среднее число вспоминаемых фактов и их средняя оценка релевантности (E3)
+        "memory_k_avg": _avg([s.get("memory_k") for s in samples
+                              if s.get("memory_k") is not None]),
+        # средняя оценка релевантности вспомненных фактов (E3): видно, не мажет ли RAG мимо темы
+        "rag_score_avg": (round(sum(scores) / len(scores), 3) if scores else None),
+        # как часто промпт приходилось усекать под окно модели (A2)
+        "prompt_trimmed_rate": round(len(trimmed) / n, 3) if n else 0,
         "provider_dist": {k: v for k, v in providers.items()},
-        "n": len(samples),
+        "n": n,
     }
 
 

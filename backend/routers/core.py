@@ -14,11 +14,13 @@ import time
 
 from fastapi import HTTPException
 
-from .. import db, graph, llm, metrics, narrator, tts
+from .. import bg, db, graph, llm, metrics, narrator, tts
 from ..config import est_tokens, get_config, KEY_MASK
 from ..schemas import ProviderIn
 
-log = logging.getLogger("textgame")
+from ..logsetup import get_logger
+
+log = get_logger(__name__)
 
 FRONTEND_DIR = str(Path(narrator.__file__).resolve().parent.parent / "frontend")
 
@@ -147,23 +149,38 @@ async def _index_world_lore(world_id: int, providers: dict | None = None) -> Non
         log.warning("_index_world_lore (world %s): %s", world_id, e)
 
 
-def _summaries(world_id: int) -> list[dict]:
-    evs = db.get_events(world_id)
-    return [e for e in evs if e["role"] == "summary"][-3:]
+def _summaries(world_id: int, limit: int = 0) -> list[dict]:
+    """Сводки для промпта. limit=0 — все (по умолчанию срезалось `[-3:]`, из-за чего
+    масштабирование количества сводок от размера контекста в build_messages было мёртвым —
+    баг A3). Теперь количество задаёт build_messages/dynamic_memory_k, здесь только потолок."""
+    return db.get_summary_events(world_id, limit=limit or 0)
 
 
-def _memory_audit(rag_chunks: list[str], lore_chunks: list[str], note: str | None = None) -> list[dict]:
+def _memory_audit(rag_chunks: list[str], lore_chunks: list[str], note: str | None = None,
+                  rag_scores: list[dict] | None = None) -> list[dict]:
     """Компактный список подхваченных фрагментов памяти/лора для прозрачности RAG.
-    `note` — необязательная подсказка о деградации памяти (см. `_rag_degraded_note`)."""
+    `note` — необязательная подсказка о деградации памяти (см. `_rag_note`).
+    `rag_scores` (E3, сессия 34) — оценки релевантности от retrieve_memory в том же порядке:
+    плашка «🧠 Память» показывает НЕ только «что вспомнилось», но и «насколько сильно»
+    (косинус/гибрид/реранкер) — иначе нельзя заметить, что RAG мажет мимо темы хода.
+    """
     out: list[dict] = []
     if note:
         out.append({"kind": "⚠", "text": note})
     for kind, chunks in (("Память", rag_chunks), ("Лор", lore_chunks)):
-        for c in chunks or []:
+        for i, c in enumerate(chunks or []):
             text = (c or "").strip()
             if not text:
                 continue
-            out.append({"kind": kind, "text": text[:220] + ("…" if len(text) > 220 else "")})
+            item: dict = {"kind": kind, "text": text[:220] + ("…" if len(text) > 220 else "")}
+            if kind == "Память" and rag_scores and i < len(rag_scores):
+                s = rag_scores[i] or {}
+                sim = s.get("hybrid") if s.get("hybrid") is not None else s.get("similarity")
+                if sim is not None:
+                    item["score"] = round(float(sim), 3)
+                if s.get("rerank") is not None:
+                    item["rerank"] = s["rerank"]
+            out.append(item)
     return out[:20]
 
 
@@ -182,11 +199,16 @@ def _rag_note(world: dict, rag_chunks: list[str]) -> str | None:
     return None
 
 
-def _recent_block(world_id: int) -> list[dict]:
-    """Последние несвёрнутые события в пределах токен-бюджета (per-world контекст)."""
-    world = db.get_world(world_id)
-    budget = narrator.world_recent_budget(world) if world else get_config().recent_token_budget
-    evs = [e for e in db.get_events(world_id) if not e["folded"] and e["role"] in ("player", "narrator")]
+def _recent_block(world: dict | None, world_id: int,
+                  prompt_tokens: int | None = None) -> list[dict]:
+    """Последние несвёрнутые события в пределах токен-бюджета (per-world контекст).
+
+    B5: ограниченный запрос к SQLite вместо «весь лог мира в Python».
+    A2: бюджет считается с ИЗМЕРЕННЫМ размером системного промпта этого мира.
+    """
+    budget = narrator.world_recent_budget(world, prompt_tokens=prompt_tokens) if world \
+        else get_config().recent_token_budget
+    evs = db.get_unfolded_events(world_id, limit=max(40, int(budget / 40)))
     out: list[dict] = []
     used = 0
     for e in reversed(evs):
@@ -338,7 +360,19 @@ async def _finish_cut_reply(world: dict, setting: dict, persona: str | None,
 
 async def _process_action(world_id: int, text: str, stream_emit=None, regenerate: bool = False):
     """Ядро обработки действия. stream_emit(text) — опциональный колбэк для токенов.
-    regenerate=True: не создаёт новое событие игрока, а перегенерирует ответ на прошлый ход."""
+    regenerate=True: не создаёт новое событие игрока, а перегенерирует ответ на прошлый ход.
+
+    B3 (сессия 34): тело оборачивается в `bg.player_turn()` — пока идёт ход, фоновые
+    агенты (карточки/судья/мастер/боевой ИИ/события/видения) в очередь к модели не лезут.
+    Раньше их пять-шесть стартовало сразу после ответа и «съедали» следующий ход игрока:
+    локальная llama.cpp обслуживает запросы по одному."""
+    with bg.player_turn():
+        return await _process_action_inner(world_id, text, stream_emit=stream_emit,
+                                           regenerate=regenerate)
+
+
+async def _process_action_inner(world_id: int, text: str, stream_emit=None,
+                                regenerate: bool = False):
     world = db.get_world(world_id)
     if not world:
         raise HTTPException(404, "Мир не найден")
@@ -360,6 +394,9 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
                 log.warning("восстановление снепшота (world %s): %s", world_id, e)
     else:
         db.update_world(world_id, snapshot=copy.deepcopy(setting))
+
+    # Копия состояния ДО тика эффектов/директив — она уходит в turn_snapshots (перемотка, C1).
+    pre_turn_snapshot = copy.deepcopy(setting)
 
     # Статус-эффекты (яд и т.п.) тикают в начале каждого хода.
     # Это автоматика по умолчанию, но рассказчик-мастер может выключить её глобально
@@ -401,8 +438,7 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
     player_ev = None
     if regenerate:
         # ищем последнее действие игрока — под него индексируем новую версию ответа в памяти
-        prevs = db.get_events(world_id)
-        prev_player = next((e for e in reversed(prevs) if e["role"] == "player"), None)
+        prev_player = db.get_latest_by_role(world_id, "player")
         idx_seq = prev_player["seq"] if prev_player else db.latest_seq(world_id)
         # заменяем события прошлого хода (только если регенерируем именно последний ход)
         if _turn_seq.get(world_id) == idx_seq:
@@ -415,25 +451,59 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
         replaced_ids = []
         # счётчик действий игрока — для динамических событий мира (раз в N ходов)
         setting["_player_turns"] = setting.get("_player_turns", 0) + 1
+        # C1 (сессия 34): точка перемотки — состояние ПЕРЕД этим ходом (копия до тика
+        # эффектов и до директив — та же, что отдаётся при «↻ перегенерировать»). По ней
+        # «назад к ходу N» и загрузка сохранения возвращают мир без задвоенных эффектов.
+        try:
+            db.save_turn_snapshot(world_id, idx_seq, pre_turn_snapshot,
+                                  keep=get_config().turn_snapshot_keep)
+        except Exception as e:
+            log.warning("снапшот для перемотки (world %s, seq %s): %s", world_id, idx_seq, e,
+                        exc_info=True)
 
-    # Память + карточки
-    rag_chunks = await narrator.retrieve_memory(world_id, text, setting, providers=providers)
-    lore_chunks = await narrator.retrieve_lore(world_id, text, setting, providers=providers)
-    recent = _recent_block(world_id)
+    # Память + карточки.
+    # B1 (сессия 34): RAG-память и лор — ДВА независимых сетевых похода (эмбеддинг запроса →
+    # Chroma → реранкер). Раньше они ждали друг друга последовательно; теперь идут параллельно
+    # и суммарно стоят ходу один сетевой цикл, а не два. Ошибки каждого — изолированы
+    # (return_exceptions), ход не падает из-за недоступной памяти (закон 2: память помогает,
+    # но не блокирует игру), и каждая ошибка остаётся в логе (правило 14).
+    rag_scores: list[dict] = []
+    prompt_tokens_prev = int(setting.get("_ctx_prompt_tokens") or 0) or None
+    recent = _recent_block(world, world_id, prompt_tokens=prompt_tokens_prev)
     summaries = _summaries(world_id)
     entity_cards = narrator.select_relevant_entities(world_id, setting, text)
-    messages = narrator.build_messages(world, setting, action_ctx, recent, summaries, rag_chunks,
-                                      entity_cards, persona=persona, use_tools=use_tools,
-                                      lore=lore_chunks)
+    mem_res, lore_res = await asyncio.gather(
+        narrator.retrieve_memory(world_id, text, setting, providers=providers,
+                                 scores_out=rag_scores),
+        narrator.retrieve_lore(world_id, text, setting, providers=providers),
+        return_exceptions=True)
+    if isinstance(mem_res, BaseException):
+        log.warning("RAG-память не отработала (world %s): %s", world_id, mem_res)
+        rag_chunks = []
+    else:
+        rag_chunks = mem_res or []
+    if isinstance(lore_res, BaseException):
+        log.warning("лор-память не отработала (world %s): %s", world_id, lore_res)
+        lore_chunks = []
+    else:
+        lore_chunks = lore_res or []
+    messages, prompt_meta = narrator.build_messages(world, setting, action_ctx, recent,
+                                                    summaries, rag_chunks, entity_cards,
+                                                    persona=persona, use_tools=use_tools,
+                                                    lore=lore_chunks)
 
     params = _gen_params(world)
     full = ""
+    # E3 (сессия 34): служебные сведения об ответе модели (finish_reason/usage) — чтобы
+    # «обрезан ли ответ лимитом» стало измеримой метрикой, а не догадкой по тексту.
+    llm_finish: dict = {}
     _t0 = time.monotonic()
     if stream_emit:
         stopped = False
         safe = ""
         async for delta in llm.stream_chat(messages, provider=prov_main, tools=game_tools,
-                                           tool_calls_out=tool_calls_out, **params):
+                                           tool_calls_out=tool_calls_out,
+                                           finish_out=llm_finish, **params):
             full += delta
             if not stopped:
                 idx = narrator.find_engine_start(full)
@@ -445,11 +515,16 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
                     stopped = True
                 else:
                     await stream_emit(delta)
-        full = full  # noop
     else:
         full = await llm.complete(messages, provider=prov_main, tools=game_tools,
-                                tool_calls_out=tool_calls_out, **params)
+                                tool_calls_out=tool_calls_out, finish_out=llm_finish, **params)
     _llm_ms = (time.monotonic() - _t0) * 1000
+    # A2: запоминаем ИЗМЕРЕННЫЙ размер промпта за этот ход (реальным usage модели, иначе
+    # нашей оценкой) — следующий ход построит бюджет recent по фактическому оверхеду,
+    # а не по догадке CONTEXT_OVERHEAD=2600.
+    measured_prompt = int(llm_finish.get("prompt_tokens") or 0) or est_tokens(
+        "\n".join(str(m.get("content", "") or "") for m in messages))
+    setting["_ctx_prompt_tokens"] = measured_prompt
 
     # Директивы: приоритет у tool_calls (function calling), фолбэк на промпт-формат <<ENGINE>>
     clean, d_engine = narrator.split_engine(full)
@@ -538,10 +613,13 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
                                                     situation=clean)
             if roll_desc:
                 roll_extra = "\n\n" + roll_desc
-    except Exception:
+    except Exception as e:
         # Последний рубеж: «мусорные» директивы не должны ронять ход —
         # текст ответа уже сгенерирован, механика просто не применится.
-        pass
+        # Правило 14: раньше это был голый `pass`, и молча пропавшая механика
+        # (урон не нанесён, предмет не выдан) была неотличима от «механики не было».
+        log.exception("применение директив провалилось (world %s, seq %s) — ход записан "
+                      "без части механики: %s", world_id, idx_seq, e)
 
     final_text = (clean or full.strip()) + roll_extra
     # ── Защита от «деградации» ответа: ──
@@ -565,7 +643,8 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
     # Прозрачность RAG: какие фрагменты памяти/лора были подхвачены в этом ответе
     # (для UI «🧠 Память»). Пусто — ничего подхвачено не было. Сохраняем в meta события,
     # чтобы плашка «Память» оставалась у ответа и после перезагрузки страницы.
-    memory_used = _memory_audit(rag_chunks, lore_chunks, note=_rag_note(world, rag_chunks))
+    memory_used = _memory_audit(rag_chunks, lore_chunks, note=_rag_note(world, rag_chunks),
+                                rag_scores=rag_scores)
 
     # ── Атомарная запись хода: ответ + системные сообщения + состояние мира ──
     # Всё создание событий и обновление setting — одна транзакция, чтобы при сбое
@@ -629,36 +708,54 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
         except Exception:
             suggestions = []
 
-    # Память: индексация + свёртка + карточки сущностей в фоне (глобальный выключатель фоновых задач)
+    # ── Фоновые задачи (B3, сессия 34) ──
+    # Раньше каждая стартовала своим create_task() и все ОНИ лезли в единую очередь модели
+    # одновременно, конкурируя со СЛЕДУЮЩИМ ходом игрока. Теперь они идут через bg-очередь:
+    # ограниченный параллелизм (LLM_BG_CONCURRENCY), порядок по важности и старт только
+    # после того, как ответ игроку отдан (этот ход обёрнут в bg.player_turn()).
+    loop = asyncio.get_event_loop()
+    # Снимок состояния для фоновых агентов — ОДИН раз, в момент подачи задачи (как и раньше):
+    # deepcopy внутри лямбды выполнился бы позже, и агент увидел бы уже изменённое состояние.
+    agents_setting = copy.deepcopy(setting)
     if get_config().background_tasks_enabled:
-        asyncio.get_event_loop().create_task(_background_memory(world_id, idx_seq, text, final_text))
-        asyncio.get_event_loop().create_task(_background_cards(world_id, text, final_text))
+        loop.create_task(bg.submit("memory", lambda: _background_memory(world_id, idx_seq, text,
+                                                                        final_text),
+                                   priority=bg.PRIO_MEMORY, world_id=world_id, agent="memory"))
+        loop.create_task(bg.submit("cards", lambda: _background_cards(world_id, text, final_text),
+                                   priority=bg.PRIO_CARDS, world_id=world_id, agent="cards"))
     # Динамические события мира — отдельный флаг (dynamic_events_enabled), не зависят от фоновых задач
-    asyncio.get_event_loop().create_task(_maybe_dynamic_event(world_id))
+    loop.create_task(bg.submit("event", lambda: _maybe_dynamic_event(world_id),
+                               priority=bg.PRIO_EVENT, world_id=world_id, agent="event"))
     # Судья логики: фоновая проверка противоречий (не блокирует ответ; по интервалу ходов)
     if _maybe_logic_judge_enabled(world):
-        asyncio.get_event_loop().create_task(
-            _maybe_logic_judge(world_id, copy.deepcopy(setting), text, final_text))
+        loop.create_task(bg.submit(
+            "judge", lambda: _maybe_logic_judge(world_id, agents_setting, text, final_text),
+            priority=bg.PRIO_JUDGE, world_id=world_id, agent="judge"))
 
     # Автономный «мастер»: если игрок «застрял» (повторяет действие / без квестов) — фоново
     # генерирует квест/сюжетный поворот, выводит из тупика. Не блокирует ответ, по интервалу ходов.
     if get_config().autonomous_master_enabled:
-        asyncio.get_event_loop().create_task(
-            _maybe_autonomous_master(world_id, copy.deepcopy(setting), text, final_text))
+        loop.create_task(bg.submit(
+            "master",
+            lambda: _maybe_autonomous_master(world_id, agents_setting, text, final_text),
+            priority=bg.PRIO_MASTER, world_id=world_id, agent="master"))
 
     # Боевой ИИ врагов: пока в бою есть живые враги, фоново выбирает их тактический ход
     # (охрана/отступление/переговоры/ловушка). Не блокирует ответ, по интервалу ходов.
     if get_config().enemy_ai_enabled:
-        asyncio.get_event_loop().create_task(
-            _maybe_enemy_ai(world_id, copy.deepcopy(setting), text, final_text))
+        loop.create_task(bg.submit(
+            "enemy_ai",
+            lambda: _maybe_enemy_ai(world_id, agents_setting, text, final_text),
+            priority=bg.PRIO_ENEMY_AI, world_id=world_id, agent="enemy_ai"))
 
     # Сны/видения (сессия 32): если рассказчик вызвал trigger_vision и в очереди есть
     # видение — разыгрываем его отдельным LLM-проходом в фоне (память как сюжет).
     try:
         if isinstance(directives, dict) and "trigger_vision" in directives \
                 and (setting.get("pending_visions") or []):
-            asyncio.get_event_loop().create_task(
-                _maybe_trigger_vision(world_id, copy.deepcopy(setting)))
+            loop.create_task(bg.submit(
+                "vision", lambda: _maybe_trigger_vision(world_id, agents_setting),
+                priority=bg.PRIO_VISION, world_id=world_id, agent="vision"))
     except Exception as e:
         log.warning("запуск видения (world %s): %s", world_id, e, exc_info=True)
 
@@ -670,19 +767,44 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
     # Намеренно в try/except с логированием (не роняет ход, даже если метрика сломается):
     # сбор метрик — побочное, не критично для игры.
     try:
-        completion_tokens = est_tokens(final_text)  # видимый ответ (в tools-режиме проза живёт не в `full`)
-        prompt_tokens = est_tokens("\n".join(str(m.get("content", "") or "") for m in messages))
+        # видимый ответ (в tools-режиме проза живёт не в `full`, поэтому НЕ usage модели),
+        # а реальный расход модели кладём отдельными полями — это разные величины.
+        completion_tokens = est_tokens(final_text)
+        usage_completion = int(llm_finish.get("completion_tokens") or 0)
         memory_tokens = sum(len(c or "") for c in rag_chunks + lore_chunks) // 4
+        # E3 (сессия 34): «обрыв фразы» как отдельный измеримый сигнал.
+        # Два источника: finish_reason=length (модель упёрлась в лимит токенов — лечится
+        # настройкой Max tokens) и finish_reason=stop, но текст закончился на полуслове
+        # (модель бросила мысль — лечится промптом/моделью). Раньше дедуп и дописывание
+        # были, а статистики по частоте обрезов — нет.
+        fr = str(llm_finish.get("finish_reason") or "")
+        cut_by_limit = fr == "length"
+        cut_mid = (not cut_by_limit) and bool(final_text.strip()) \
+            and not _looks_finished(final_text)
         metrics.record(
             world_id=world_id,
             llm_ms=_llm_ms,
             completion_tokens=completion_tokens,
-            prompt_tokens=prompt_tokens,
+            prompt_tokens=measured_prompt,
             memory_tokens=memory_tokens,
             repetition=_repetition_score(final_text),
             provider=prov_main.get("id"),
             game_over=bool(setting.get("game_over")),
+            finish_reason=fr or None,
+            usage_completion_tokens=usage_completion or None,
+            usage_prompt_tokens=int(llm_finish.get("prompt_tokens") or 0) or None,
+            cut_by_limit=cut_by_limit,
+            cut_mid=cut_mid,
+            prompt_trimmed=", ".join(prompt_meta.get("trimmed") or []) or None,
+            memory_k=len(rag_chunks),
+            # средняя оценка релевантности вспомненного (E3) — по ней видно, что RAG не мажет мимо
+            rag_score_avg=(round(sum((s.get("hybrid") if s.get("hybrid") is not None
+                                      else s.get("similarity", 0)) or 0 for s in rag_scores)
+                                 / len(rag_scores), 3) if rag_scores else None),
+            bg_queue=bg.stats().get("queued"),
         )
+    except Exception as e:
+        log.warning("метрики хода (world %s): %s", world_id, e)
     except Exception as e:
         log.warning("метрики хода (world %s): %s", world_id, e)
 
@@ -697,6 +819,8 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
         "replaced_events": replaced_ids,
         # Прозрачность RAG: подхваченные фрагменты памяти/лора (уже сохранены в meta хода)
         "memory_used": memory_used,
+        # E3: был ли ответ обрезан (видимо в UI — «модель уперлась в лимит, подними Max tokens»)
+        "reply_cut": bool(str(llm_finish.get("finish_reason") or "") == "length"),
     }
 
 

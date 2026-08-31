@@ -37,7 +37,9 @@ import aiosqlite
 
 from .config import get_config
 
-log = logging.getLogger("textgame")
+from .logsetup import get_logger
+
+log = get_logger(__name__)
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
 
@@ -150,6 +152,8 @@ async def _maybe_commit() -> None:
 async def _commit_now() -> None:
     conn = await _open()
     await conn.commit()
+    if _tx_depth == 0:
+        _flush_pending_events()
 
 
 @contextmanager
@@ -185,6 +189,8 @@ async def _begin_now() -> None:
 async def _rollback_now() -> None:
     conn = await _open()
     await conn.rollback()
+    # откат = этих событий нет: рассылайть их нельзя
+    _pending_events.clear()
 
 
 async def _init_schema(conn: aiosqlite.Connection) -> None:
@@ -217,6 +223,11 @@ async def _init_schema(conn: aiosqlite.Connection) -> None:
             ts REAL
         );
         CREATE INDEX IF NOT EXISTS idx_events_world ON events(world_id, seq);
+        -- (сессия 34) окно недавней истории и счётчики выбираются по world_id + folded,
+        -- сводки/последние обмены — по world_id + role: индексы закрывают эти выборки,
+        -- иначе SQLite сканирует все события мира на каждый ход (B5).
+        CREATE INDEX IF NOT EXISTS idx_events_world_folded ON events(world_id, folded, seq);
+        CREATE INDEX IF NOT EXISTS idx_events_world_role ON events(world_id, role, seq);
         CREATE TABLE IF NOT EXISTS saves (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             world_id INTEGER NOT NULL,
@@ -318,6 +329,17 @@ async def _init_schema(conn: aiosqlite.Connection) -> None:
             PRIMARY KEY(world_id, source, target)
         );
         CREATE INDEX IF NOT EXISTS idx_graph_edges_world ON graph_edges(world_id);
+        -- Снапшоты состояния по ходам (сессия 34): точка перемотки «назад к ходу N» (C1).
+        -- worlds.snapshot хранит только ПОСЛЕДНИй ход (перегенерация); эта таблица — история
+        -- состояний перед каждым ходом, чтобы откат/загрузка сохранения были обратимыми.
+        CREATE TABLE IF NOT EXISTS turn_snapshots (
+            world_id INTEGER NOT NULL,
+            seq INTEGER NOT NULL,             -- ход (seq события игрока), ПЕРЕД которым снято состояние
+            setting TEXT NOT NULL,            -- JSON: полное состояние мира
+            created_at REAL,
+            PRIMARY KEY(world_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_turn_snap_world ON turn_snapshots(world_id, seq);
         """
     )
     await conn.commit()
@@ -462,6 +484,7 @@ async def _delete_world(world_id: int) -> None:
     await conn.execute("DELETE FROM worlds WHERE id = ?", (world_id,))
     await conn.execute("DELETE FROM events WHERE world_id = ?", (world_id,))
     await conn.execute("DELETE FROM saves WHERE world_id = ?", (world_id,))
+    await conn.execute("DELETE FROM turn_snapshots WHERE world_id = ?", (world_id,))
     await _maybe_commit()
 
 
@@ -471,6 +494,44 @@ def add_event(world_id: int, role: str, content: str, seq: int | None = None,
               meta: dict | None = None) -> dict:
     with _lock:
         return _run(lambda: _add_event(world_id, role, content, seq, meta))
+
+
+# ── Крючок «записано событие» (сессия 34, живые рассылки) ──────────────────────
+# Чистое уведомление слоя данных: никакого форматирования/бизнес-логики, слушатель
+# (backend/bus.py) навешивается из app.py при старте. Нужен, чтобы фоновые системки
+# доходили до вкладки мгновенно, а не через поллинг раз в 15 секунд.
+_event_listeners: list = []
+# Внутри db.transaction() события копятcя и рассылаются ТОЛЬКО после успешного COMMIT:
+# иначе при откате половины хода клиент получил бы «фantomные» сообщения, которых в БД нет.
+_pending_events: list[dict] = []
+
+
+def add_event_listener(fn) -> None:
+    """Поставить слушателя записанных событий (вызывается с dict события). Идемпотентно."""
+    if fn not in _event_listeners:
+        _event_listeners.append(fn)
+
+
+def _notify_event(row: dict) -> None:
+    if _tx_depth > 0:
+        _pending_events.append(row)
+        return
+    for fn in list(_event_listeners):
+        try:
+            fn(row)
+        except Exception as e:
+            # рассылка не должна ломать запись хода
+            log.warning("слушатель события %s не отработал (world %s): %s",
+                        getattr(fn, "__name__", fn), row.get("world_id"), e)
+
+
+def _flush_pending_events() -> None:
+    """Разослать накопленные за транзакцию события (после COMMIT)."""
+    if not _pending_events:
+        return
+    batch, _pending_events[:] = list(_pending_events), []
+    for ev in batch:
+        _notify_event(ev)
 
 
 async def _add_event(world_id: int, role: str, content: str, seq: int | None,
@@ -487,9 +548,11 @@ async def _add_event(world_id: int, role: str, content: str, seq: int | None,
         (world_id, seq, role, content, meta_json, time.time()),
     )
     await _maybe_commit()
-    return {"id": int(cur.lastrowid), "world_id": world_id, "seq": seq, "role": role,
-            "content": content, "folded": 0, "feedback": 0, "tts_status": 0, "tts_file": "",
-            "meta": meta or {}}
+    ev = {"id": int(cur.lastrowid), "world_id": world_id, "seq": seq, "role": role,
+          "content": content, "folded": 0, "feedback": 0, "tts_status": 0, "tts_file": "",
+          "meta": meta or {}}
+    _notify_event(ev)
+    return ev
 
 
 def delete_events_by_id(world_id: int, ids: list[int]) -> int:
@@ -575,16 +638,13 @@ async def _get_events_before(world_id: int, before_seq: int) -> list[dict]:
     return [_event_obj(r) for r in rows]
 
 
-def mark_folded(world_id: int, up_to_seq: int) -> None:
+def mark_folded(world_id: int, up_to_seq: int,
+                roles: tuple[str, ...] = ("player", "narrator")) -> int:
+    """Свернуть обмены с seq <= up_to_seq в сводку (folded=FOLD_SUMMARY).
+    По умолчанию трогает ТОЛЬКО player/narrator: раньше заодно помечались и сами
+    сводки/системные события, из-за чего их стало невозможно отличить/вернуть."""
     with _lock:
-        _run(lambda: _mark_folded(world_id, up_to_seq))
-
-
-async def _mark_folded(world_id: int, up_to_seq: int) -> None:
-    conn = await _open()
-    await conn.execute("UPDATE events SET folded = 1 WHERE world_id = ? AND seq <= ?",
-                       (world_id, up_to_seq))
-    await _maybe_commit()
+        return _run(lambda: _fold_state_range(world_id, FOLD_SUMMARY, 0, up_to_seq, roles))
 
 
 def latest_seq(world_id: int) -> int:
@@ -621,6 +681,277 @@ async def _set_feedback(event_id: int, value: int) -> None:
     conn = await _open()
     await conn.execute("UPDATE events SET feedback = ? WHERE id = ?", (value, event_id))
     await _maybe_commit()
+
+
+# ══════════════ свёртка событий: три состояния (сессия 34) ══════════════
+#
+# Раньше `folded` использовался ОДНИМ значением для двух разных смыслов, и загрузка
+# сохранения уничтожала краткосрочную память безвозвратно: `mark_folded(world, save.seq)`
+# сворачивал ПРОШЛОЕ (≤ точки), а цикл в роутере — БУДУЩЕЕ. Итог: в recent-окно не
+# попадало ничего, развернуть было нельзя (проверено вживую: мир 33 — 9 из 9 свёрнуты).
+#
+#   0 = FOLD_VISIBLE  — событие в недавнем окне;
+#   1 = FOLD_SUMMARY  — свёрнуто в сводку (summarize_and_compress), покрыто ролью summary;
+#   2 = FOLD_HIDDEN   — вынуто из таймлайна перемоткой/загрузкой, сводки о нём удалены.
+# В промпт recent не попадают ни 1, ни 2 (фильтр folded = 0).
+
+FOLD_VISIBLE = 0
+FOLD_SUMMARY = 1
+FOLD_HIDDEN = 2
+
+
+def fold_state_range(world_id: int, state: int, from_seq: int = 0,
+                     to_seq: int | None = None,
+                     roles: tuple[str, ...] | None = None) -> int:
+    """Поставить события мира в состояние `state` для seq ∈ [from_seq; to_seq].
+    roles ограничивает роли (напр. только player/narrator). Возвращает число изменённых."""
+    with _lock:
+        return _run(lambda: _fold_state_range(world_id, state, from_seq, to_seq, roles))
+
+
+async def _fold_state_range(world_id: int, state: int, from_seq: int, to_seq: int | None,
+                            roles: tuple[str, ...] | None) -> int:
+    conn = await _open()
+    q = "UPDATE events SET folded = ? WHERE world_id = ? AND seq >= ?"
+    args: list[Any] = [int(state), world_id, int(from_seq)]
+    if to_seq is not None:
+        q += " AND seq <= ?"
+        args.append(int(to_seq))
+    if roles:
+        q += " AND role IN (" + ",".join("?" * len(roles)) + ")"
+        args.extend(roles)
+    cur = await conn.execute(q, args)
+    await _maybe_commit()
+    return cur.rowcount
+
+
+def unfold_events(world_id: int, from_seq: int = 0,
+                  roles: tuple[str, ...] | None = None) -> int:
+    """Вернуть события в недавнее окно (folded=0) — обратимость свёртки/сокрытия."""
+    return fold_state_range(world_id, FOLD_VISIBLE, from_seq, None, roles)
+
+
+def delete_events_after(world_id: int, from_seq: int,
+                        roles: tuple[str, ...] | None = None) -> list[int]:
+    """Удалить события с seq > from_seq (перемотка таймлайна). Возвращает seq удалённых
+    обменов (player/narrator) — роутер по ним чистит векторы в ChromaDB, иначе память
+    помнит ходы, которых в таймлайне уже нет (баг A4)."""
+    with _lock:
+        return _run(lambda: _delete_events_after(world_id, from_seq, roles))
+
+
+async def _delete_events_after(world_id: int, from_seq: int,
+                               roles: tuple[str, ...] | None) -> list[int]:
+    conn = await _open()
+    q = "SELECT seq, role FROM events WHERE world_id = ? AND seq > ?"
+    args: list[Any] = [world_id, int(from_seq)]
+    role_sql = ""
+    if roles:
+        role_sql = " AND role IN (" + ",".join("?" * len(roles)) + ")"
+        args.extend(roles)
+    cur = await conn.execute(q + role_sql, args)
+    rows = await cur.fetchall()
+    if not rows:
+        return []
+    await conn.execute("DELETE FROM events WHERE world_id = ? AND seq > ?" + role_sql,
+                       [world_id, int(from_seq), *(roles or ())])
+    await _maybe_commit()
+    return [int(r["seq"]) for r in rows if r["role"] in ("player", "narrator")]
+
+
+# ══════════ снапшоты состояния по ходам (перемотка назад, C1) ══════════
+
+def save_turn_snapshot(world_id: int, seq: int, setting: dict, keep: int = 0) -> None:
+    """Запомнить состояние мира ПЕРЕД ходом `seq`, чтобы к нему можно было откатиться.
+    keep > 0 — держать только последние N снапшотов мира (таблица не растёт бесконечно)."""
+    with _lock:
+        _run(lambda: _save_turn_snapshot(world_id, seq, setting, keep))
+
+
+async def _save_turn_snapshot(world_id: int, seq: int, setting: dict, keep: int) -> None:
+    conn = await _open()
+    await conn.execute(
+        "INSERT OR REPLACE INTO turn_snapshots (world_id, seq, setting, created_at) VALUES (?,?,?,?)",
+        (world_id, int(seq), json.dumps(setting, ensure_ascii=False), time.time()))
+    if keep and keep > 0:
+        await conn.execute(
+            "DELETE FROM turn_snapshots WHERE world_id = ? AND seq NOT IN "
+            "(SELECT seq FROM turn_snapshots WHERE world_id = ? ORDER BY seq DESC LIMIT ?)",
+            (world_id, world_id, int(keep)))
+    await _maybe_commit()
+
+
+def get_turn_snapshot(world_id: int, seq: int) -> Optional[dict]:
+    """Снапшот состояния перед ходом `seq` (dict) или None."""
+    with _lock:
+        return _run(lambda: _get_turn_snapshot(world_id, seq))
+
+
+async def _get_turn_snapshot(world_id: int, seq: int) -> Optional[dict]:
+    conn = await _open()
+    cur = await conn.execute("SELECT setting FROM turn_snapshots WHERE world_id = ? AND seq = ?",
+                             (world_id, int(seq)))
+    row = await cur.fetchone()
+    if not row:
+        return None
+    try:
+        data = json.loads(row["setting"])
+    except Exception as e:
+        log.warning("turn_snapshot (world %s, seq %s) не разобран: %s", world_id, seq, e)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def list_turn_snapshots(world_id: int) -> list[dict]:
+    """Доступные точки перемотки: [{seq, ts}] по возрастанию."""
+    with _lock:
+        return _run(lambda: _list_turn_snapshots(world_id))
+
+
+async def _list_turn_snapshots(world_id: int) -> list[dict]:
+    conn = await _open()
+    cur = await conn.execute(
+        "SELECT seq, created_at FROM turn_snapshots WHERE world_id = ? ORDER BY seq", (world_id,))
+    return [{"seq": int(r["seq"]), "ts": r["created_at"]} for r in await cur.fetchall()]
+
+
+# ══════════ ограниченные выборки вместо «вытащить весь лог» (B5) ══════════
+
+def count_events(world_id: int, roles: tuple[str, ...] | None = None,
+                 unfolded_only: bool = False) -> int:
+    """Счётчик событий на стороне SQLite (раньше считали len(get_events(..., limit=4000)))."""
+    with _lock:
+        return _run(lambda: _count_events(world_id, roles, unfolded_only))
+
+
+async def _count_events(world_id: int, roles: tuple[str, ...] | None,
+                        unfolded_only: bool) -> int:
+    conn = await _open()
+    q = "SELECT COUNT(*) AS c FROM events WHERE world_id = ?"
+    args: list[Any] = [world_id]
+    if unfolded_only:
+        q += " AND folded = 0"
+    if roles:
+        q += " AND role IN (" + ",".join("?" * len(roles)) + ")"
+        args.extend(roles)
+    cur = await conn.execute(q, args)
+    row = await cur.fetchone()
+    return int(row["c"]) if row else 0
+
+
+def get_unfolded_events(world_id: int, limit: int = 120,
+                        roles: tuple[str, ...] = ("player", "narrator")) -> list[dict]:
+    """Последние `limit` несвёрнутых обменов в хронологическом порядке — окно недавней
+    истории. Ограничено в SQL (раньше тянули ВСЕ события мира и резали в Python)."""
+    with _lock:
+        return _run(lambda: _get_unfolded_events(world_id, limit, roles))
+
+
+async def _get_unfolded_events(world_id: int, limit: int,
+                               roles: tuple[str, ...]) -> list[dict]:
+    conn = await _open()
+    n = max(2, int(limit))
+    q = ("SELECT * FROM (SELECT * FROM events WHERE world_id = ? AND folded = 0"
+         " AND role IN (" + ",".join("?" * len(roles)) + ")"
+         " ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC")
+    cur = await conn.execute(q, [world_id, *roles, n])
+    return [_event_obj(r) for r in await cur.fetchall()]
+
+
+def get_turn_events(world_id: int, from_seq: int, to_seq: int | None = None,
+                    roles: tuple[str, ...] = ("player", "narrator"),
+                    unfolded_only: bool = True) -> list[dict]:
+    """События ролей в диапазоне seq (для архивариуса/хроники). to_seq=None — без верха."""
+    with _lock:
+        return _run(lambda: _get_turn_events(world_id, from_seq, to_seq, roles, unfolded_only))
+
+
+async def _get_turn_events(world_id: int, from_seq: int, to_seq: int | None,
+                           roles: tuple[str, ...], unfolded_only: bool) -> list[dict]:
+    conn = await _open()
+    q = "SELECT * FROM events WHERE world_id = ? AND seq >= ?"
+    args: list[Any] = [world_id, int(from_seq)]
+    if to_seq is not None:
+        q += " AND seq <= ?"
+        args.append(int(to_seq))
+    if roles:
+        q += " AND role IN (" + ",".join("?" * len(roles)) + ")"
+        args.extend(roles)
+    if unfolded_only:
+        q += " AND folded = 0"
+    q += " ORDER BY seq"
+    cur = await conn.execute(q, args)
+    return [_event_obj(r) for r in await cur.fetchall()]
+
+
+def get_latest_by_role(world_id: int, role: str, before_seq: int = 0) -> Optional[dict]:
+    """Последнее событие роли (опц. — раньше before_seq). Одна строка, а не весь лог."""
+    with _lock:
+        return _run(lambda: _get_latest_by_role(world_id, role, before_seq))
+
+
+async def _get_latest_by_role(world_id: int, role: str, before_seq: int) -> Optional[dict]:
+    conn = await _open()
+    q = "SELECT * FROM events WHERE world_id = ? AND role = ?"
+    args: list[Any] = [world_id, role]
+    if before_seq:
+        q += " AND seq < ?"
+        args.append(int(before_seq))
+    q += " ORDER BY seq DESC LIMIT 1"
+    cur = await conn.execute(q, args)
+    row = await cur.fetchone()
+    return _event_obj(row) if row else None
+
+
+def get_last_exchange(world_id: int) -> tuple[str, str]:
+    """Последняя пара (действие игрока, ответ рассказчика) — двумя крошечными запросами
+    вместо всего лога (нужно Провидению и автономному мастеру)."""
+    ev_n = get_latest_by_role(world_id, "narrator")
+    reply = ev_n["content"] if ev_n else ""
+    guard = int(ev_n["seq"]) if ev_n else 0
+    ev_p = get_latest_by_role(world_id, "player", before_seq=guard + 1)
+    return (ev_p["content"] if ev_p else ""), reply
+
+
+def get_summary_events(world_id: int, limit: int = 10) -> list[dict]:
+    """Последние `limit` сводок (роль summary) хронологически. limit=0 — все сводки."""
+    with _lock:
+        return _run(lambda: _get_summary_events(world_id, limit))
+
+
+async def _get_summary_events(world_id: int, limit: int) -> list[dict]:
+    conn = await _open()
+    if limit:
+        cur = await conn.execute(
+            "SELECT * FROM (SELECT * FROM events WHERE world_id = ? AND role = 'summary'"
+            " ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC", (world_id, int(limit)))
+    else:
+        cur = await conn.execute(
+            "SELECT * FROM events WHERE world_id = ? AND role = 'summary' ORDER BY seq",
+            (world_id,))
+    return [_event_obj(r) for r in await cur.fetchall()]
+
+
+def delete_summaries_after(world_id: int, from_seq: int) -> list[int]:
+    """Удалить сводки с seq > from_seq (перемотка: сводка о «будущем» недостоверна).
+    Возвращает seq удалённых — для чистки векторов в ChromaDB."""
+    with _lock:
+        return _run(lambda: _delete_summaries_after(world_id, from_seq))
+
+
+async def _delete_summaries_after(world_id: int, from_seq: int) -> list[int]:
+    conn = await _open()
+    cur = await conn.execute(
+        "SELECT seq FROM events WHERE world_id = ? AND role = 'summary' AND seq > ? ORDER BY seq",
+        (world_id, int(from_seq)))
+    rows = await cur.fetchall()
+    if not rows:
+        return []
+    await conn.execute(
+        "DELETE FROM events WHERE world_id = ? AND role = 'summary' AND seq > ?",
+        (world_id, int(from_seq)))
+    await _maybe_commit()
+    return [int(r["seq"]) for r in rows]
 
 
 # ─────────────────────────── озвучка (TTS) ───────────────────────────
@@ -937,7 +1268,9 @@ def export_data(world_id: int) -> tuple[Optional[dict], list[dict]]:
 # ─────────────────────────── дамп мира (переносимость) ───────────────────────────
 
 DUMP_FORMAT = "textgame.world.dump"
-DUMP_VERSION = 1
+# v2 (сессия 34): в дамп добавлены точки перемотки (turn_snapshots). Читатель терпит
+# дампы v1 — просто без истории состояний по ходам (перемотка будет недоступна).
+DUMP_VERSION = 2
 
 
 def backup_database(keep: int = 10) -> Optional[str]:
@@ -1018,6 +1351,7 @@ def world_dump(world_id: int) -> Optional[dict]:
     saves = _run(lambda: _dump_saves(world_id))
     nodes = _run(lambda: _dump_graph_nodes(world_id))
     edges = _run(lambda: _dump_graph_edges(world_id))
+    snaps = _run(lambda: _dump_turn_snapshots(world_id))
 
     narrator_name = ""
     if w.get("narrator_id"):
@@ -1051,9 +1385,10 @@ def world_dump(world_id: int) -> Optional[dict]:
         "entities": entities,
         "lore": lore_rows,
         "saves": saves,
+        "turn_snapshots": snaps,
         "graph": {"nodes": nodes, "edges": edges},
         "counts": {"events": len(events), "entities": len(entities), "lore": len(lore_rows),
-                   "saves": len(saves), "graph_nodes": len(nodes)},
+                   "saves": len(saves), "graph_nodes": len(nodes), "turn_snapshots": len(snaps)},
     }
 
 
@@ -1090,6 +1425,15 @@ async def _dump_graph_nodes(world_id: int):
 async def _dump_graph_edges(world_id: int):
     conn = await _open()
     cur = await conn.execute("SELECT * FROM graph_edges WHERE world_id = ? ORDER BY source, target", (world_id,))
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def _dump_turn_snapshots(world_id: int):
+    """Точки перемотки мира (сессия 34): setting остаётся строкой JSON — как в таблице."""
+    conn = await _open()
+    cur = await conn.execute(
+        "SELECT seq, setting, created_at FROM turn_snapshots WHERE world_id = ? ORDER BY seq",
+        (world_id,))
     return [dict(r) for r in await cur.fetchall()]
 
 
@@ -1206,9 +1550,15 @@ async def _restore_world(new_id: int, data: dict) -> None:
              ed.get("data") if isinstance(ed.get("data"), str) else json.dumps(ed.get("data") or {}, ensure_ascii=False),
              ed.get("created_at"), ed.get("updated_at")),
         )
+    for s in data.get("turn_snapshots") or []:
+        # точки перемотки (v2); setting — строка JSON как в таблице
+        if not isinstance(s, dict) or "seq" not in s or not isinstance(s.get("setting"), str):
+            continue
+        await conn.execute(
+            "INSERT OR REPLACE INTO turn_snapshots (world_id, seq, setting, created_at) VALUES (?,?,?,?)",
+            (new_id, int(s["seq"]), s["setting"], s.get("created_at")),
+        )
     await _maybe_commit()
-
-
 
 
 def seed_narrators(presets: list[dict]) -> None:

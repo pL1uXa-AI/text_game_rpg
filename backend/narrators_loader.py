@@ -20,7 +20,9 @@ import json
 import logging
 from pathlib import Path
 
-log = logging.getLogger("textgame")
+from .logsetup import get_logger
+
+log = get_logger(__name__)
 
 NARRATORS_ROOT = Path(__file__).resolve().parent.parent / "plots" / "narrators"
 

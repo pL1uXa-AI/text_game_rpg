@@ -13,10 +13,11 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from .. import chroma_client, db, graph, llm, narrator, tts
+from .. import bus, chroma_client, db, graph, llm, narrator, rewind, tts
 from ..config import get_config, PROVIDER_OPTIONS
 from ..ratelimit import make_guard
-from ..schemas import ActionIn, DivineIn, FeedbackIn, GenSettingsIn, ImportIn, PatchIn, ProvidersIn, SaveIn, WorldCreate
+from ..schemas import (ActionIn, DivineIn, FeedbackIn, GenSettingsIn, ImportIn, PatchIn,
+                       ProvidersIn, RewindIn, SaveIn, WorldCreate)
 from .core import (
     _apply_provider_override,
     _background_memory,
@@ -33,7 +34,9 @@ from .core import (
 
 router = APIRouter(tags=["Миры и действия"])
 
-log = logging.getLogger("textgame")
+from ..logsetup import get_logger
+
+log = get_logger(__name__)
 
 
 @router.get("/api/worlds")
@@ -280,10 +283,46 @@ async def history(world_id: int, before: int = 0, limit: int = 60):
 
 @router.get("/api/worlds/{world_id}/events")
 async def events_since(world_id: int, since: int = 0):
-    """Новые события после seq (для живого чата: фоновые события мира, сводки...)."""
+    """Новые события после seq — ЗАПАСНЫЙ путь живого чата (поллинг), если EventSource
+    недоступен (см. /events/stream)."""
     evs = db.get_events(world_id, since_seq=since)
     return [{"id": e["id"], "seq": e["seq"], "role": e["role"], "content": e["content"],
              "feedback": e["feedback"], "folded": e["folded"], "meta": e.get("meta") or {}} for e in evs]
+
+
+@router.get("/api/worlds/{world_id}/events/stream")
+async def events_stream(world_id: int, after: int = 0):
+    """🔌 Живая лента мира (сессия 34, D3): SSE-подписка на шину событий (backend/bus.py).
+
+    Фоновые системки — ⚔️ ход врага, 🤖 подсказка мастера, ⏰ истёкший таймер, ⚖️ искажение
+    реальности, 💾 автосохранение — приходят вкладке мгновенно, а не следующим поллингом
+    (раньше до 15 секунд). Перед подпиской догружаем всё, что произошло с `after`, чтобы
+    переподключение после обрыва не потеряло сообщения.
+    """
+    if not db.get_world(world_id):
+        raise HTTPException(404, "Мир не найден")
+    q = bus.subscribe(world_id)
+
+    async def gen():
+        try:
+            # 1) догоняем пропущенное (после обрыва/перезагрузки страницы)
+            for e in db.get_events(world_id, since_seq=after):
+                yield bus.sse_format({"type": "event", "event": {
+                    "id": e["id"], "seq": e["seq"], "role": e["role"], "content": e["content"],
+                    "feedback": e["feedback"], "folded": e["folded"], "meta": e.get("meta") or {}}})
+            yield bus.sse_format({"type": "ready", "world_id": world_id})
+            # 2) живая рассылка + heartbeat, чтобы промежуточный прокси не убил соединение
+            while True:
+                try:
+                    payload = await asyncio.wait_for(q.get(), timeout=25.0)
+                    yield bus.sse_format(payload)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+        finally:
+            bus.unsubscribe(world_id, q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ───────────────────────────── Провайдеры per-world ─────────────────────────────
@@ -804,6 +843,45 @@ def _slash_board(world_id: int):
 
 
 # ───────────────────────────── Сохранения ─────────────────────────────
+@router.get("/api/worlds/{world_id}/rewind/points")
+async def rewind_points(world_id: int):
+    """Доступные точки перемотки (сессия 34, C1): [{seq, ts, preview}].
+
+    preview — начало действия игрока на этом ходу, чтобы список в UI был понятен
+    («идти в таверну», «напасть на стражника»). Дамп state не отдаётся — только указатели.
+    """
+    if not db.get_world(world_id):
+        raise HTTPException(404, "Мир не найден")
+    pts = []
+    for s in db.list_turn_snapshots(world_id):
+        cur = db.get_latest_by_role(world_id, "player", before_seq=s["seq"] + 1)
+        text = (cur or {}).get("content") or ""
+        pts.append({"seq": s["seq"], "ts": s["ts"],
+                    "preview": text.replace("\n", " ").strip()[:70] or "—"})
+    return {"points": pts, "enabled": True}
+
+
+@router.post("/api/worlds/{world_id}/rewind")
+async def rewind_world(world_id: int, body: RewindIn):
+    """⏪ Вернуть мир к началу хода seq (сессия 34, C1 + фиксы A1/A4).
+
+    Состояние берётся из снапшота этого хода, более новые события убираются (delete) или
+    сокрыляются (hide), ставшие недостоверными сводки удаляются, а развёрнутая история
+    возвращается в недавнее окно. Векторы отменённых ходов вычищаются из ChromaDB —
+    рассказчик не будет помнить то, чего уже не было.
+    """
+    if body.mode not in ("delete", "hide"):
+        raise HTTPException(400, "mode: 'delete' или 'hide'")
+    try:
+        res = await rewind.rewind_to(world_id, body.seq, mode=body.mode, note="⏪ Перемотка")
+    except LookupError:
+        raise HTTPException(404, "Мир не найден")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    res["world"] = db.get_world(world_id)
+    return res
+
+
 @router.post("/api/worlds/{world_id}/saves")
 async def save_game(world_id: int, body: SaveIn):
     world = db.get_world(world_id)
@@ -822,25 +900,32 @@ async def saves(world_id: int):
 
 @router.post("/api/worlds/{world_id}/saves/{save_id}/load")
 async def load_save(world_id: int, save_id: int):
+    """Загрузить слот. Раньше это делалось `mark_folded()`’ом всего подряд (прошлое ≤ точки
+    и будущее > точки) — после загрузки в недавнюю историю не попадало НИЧЕГО, и
+    развернуть это было нельзя (баг A1, проверено вживую: 9 из 9 обменов свёрнуты).
+
+    Теперь загрузка — тот же честный механизм, что и перемотка: состояние из слота,
+    более новые события сокрыты (FOLD_HIDDEN — строки журнала не уничтожаются, историю
+    можно вернуть), ставшие недостоверными сводки сняты с выдачи, а их покрытие возвращено
+    в недавнее окно. Векторы ушедших ходов убираются из ChromaDB (A4).
+    """
     world = db.get_world(world_id)
     save = db.get_save(save_id)
     if not world or not save or save["world_id"] != world_id:
         raise HTTPException(404, "Сохранение/мир не найден")
     setting = json.loads(save["setting"])
-    db.update_world(world_id, setting=setting)
-    db.add_event(world_id, "system", f"💾 Загружено сохранение «{save['name']}» (xод {save['seq']}).")
-    # События после точки сохранения скрываем из «недавнего» (сворачиваем)
-    db.mark_folded(world_id, save["seq"])  # фиксируем историю ≤ seq как свёрнутую? нет — только будущее
-    evs = db.get_events(world_id)
-    for e in evs:
-        if e["seq"] > save["seq"] and e["role"] in ("player", "narrator"):
-            db.mark_folded(world_id, e["seq"])
+    target_seq = int(save["seq"] or 1) or 1
     try:
-        # из памяти убираем будущие обмены, оставляем сводки прошлых
-        await chroma_client.delete_by_where({"world_id": world_id, "seq": {"$gt": save["seq"]}, "kind": "exchange"})
-    except Exception:
-        pass
-    return {"ok": True, "world": db.get_world(world_id), "setting": setting}
+        res = await rewind.rewind_to(world_id, target_seq, setting=setting, mode="hide",
+                                     note=f"💾 Загружено сохранение «{save['name']}» (ход {target_seq})")
+    except ValueError as e:
+        # состояние слота применимо, но таймлайн не поддаётся честному откату —
+        # не делаем вид, что всё удалось: говорим, что именно не так
+        raise HTTPException(400, f"Загрузка сохранения не удалась: {e}")
+    # системное сообщение уже записал rewind_to (с пометкой о сохранении) — не дублируем
+    return {"ok": True, "world": db.get_world(world_id), "setting": res["setting"],
+            "event": res["event"], "unfolded": res["unfolded"],
+            "removed_events": res["removed_events"]}
 
 
 @router.delete("/api/worlds/{world_id}/saves/{save_id}")

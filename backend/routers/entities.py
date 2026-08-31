@@ -58,6 +58,7 @@ async def entity_delete(world_id: int, kind: str, entity_key: str):
     db.delete_entity(world_id, kind, entity_key)
     try:
         await chroma_client.delete_by_ids([f"ent_{world_id}_{kind}_{entity_key}".replace(' ', '_')])
-    except Exception:
-        pass
+    except Exception as e:
+        # карточка удалена из SQLite, но может остаться в векторной памяти — видно в логе
+        log.warning("чистка карточки из Chroma (world %s, %s/%s): %s", world_id, kind, entity_key, e)
     return {"ok": True}
