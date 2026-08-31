@@ -1,0 +1,18 @@
+# Нормализация переводов строк: в репозитории храним LF, рабочую копию на Windows
+# git приводит к CRLF сам (core.autocrlf=true). Кроме .bat — те обязаны быть CRLF,
+# иначе cmd.exe иногда спотыкается о многострочные блоки.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Бинарники/артефакты не диффим и не правим
+*.png binary
+*.jpg binary
+*.mp3 binary
+*.wav binary
+*.onnx binary
+*.zip binary
+
+# Сюжеты-миры и рассказчики — это JSON с расширением .js (см. PLOTS.md)
+plots/*.js text
+plots/**/*.js text

@@ -1,0 +1,60 @@
+name: CI
+
+# Минимальная защита от регрессий: тесты не должны падать после любого пуша.
+# Секретов в репозитории нет и быть не должно (.env игнорируется), поэтому CI
+# работает на .env.example и полностью герметичном pytest-наборе (conftest режет
+# сеть: LLM/Chroma/облако заглушены, temp БД, бэкап/журнал метрик выключены).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: "Install dependencies"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Конфиг читается из .env; без него валидны дефолты кода. Файл из примера — чтобы
+      # убедиться, что шаблон не расходится с config.py (пустые ключи = провайдер выкл.).
+      - name: "Prepare config"
+        run: cp .env.example .env
+
+      - name: "Import check (backend package assembles)"
+        run: python -X utf8 -c "import backend.app; print('app import OK')"
+
+      - name: "Pytest (isolated: temp DB, no network)"
+        run: python -X utf8 -m pytest
+
+      - name: "Mechanics regression (no server)"
+        run: python -X utf8 scripts/test_directives.py
+
+      - name: "Plot validation (plots/*.js по схеме PLOTS.md)"
+        run: python -X utf8 scripts/check_plot.py plots/system/*.js
+
+      - name: "Frontend checks (node --check + id-ссылки)"
+        run: python -X utf8 scripts/check_frontend.py
+
+      - name: "Secret scan (страховка от случайного слива ключей)"
+        run: |
+          # 1) живых ключей в дереве быть не должно
+          if grep -rInE "sk-[A-Za-z0-9]{20,}" --exclude-dir=.git . ; then
+            echo "::error::найдены строки, похожие на API-ключи"; exit 1
+          fi
+          # 2) в шаблоне все *_API_KEY обязаны быть пустыми
+          if grep -nE "^[A-Z_]*API_KEY=.+" .env.example ; then
+            echo "::error::в .env.example задан непустой API-ключ"; exit 1
+          fi
+          echo "секретов не найдено"

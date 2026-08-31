@@ -1,0 +1,2139 @@
+# -*- coding: utf-8 -*-
+"""
+narrator.py — движок игры: темы миров, сборка промптов рассказчика,
+механика (кубы d20/d100, урон, инвентарь, квесты, NPC, флаги),
+гибридная память (сводки + RAG через ChromaDB/облачные эмбеддинги).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import random
+import re
+from typing import Any, Optional
+
+from . import chroma_client, db, embeddings, llm
+from .config import est_tokens, get_config
+from .mechanics import (  # RPG-движок директив (вынесено из narrator.py)
+    RANK_ORDER, RANK_TEXT, DEFAULT_STATS, STAT_HINTS,
+    RACES, RACE_NAMES, CLASSES, CLASS_NAMES, PROFESSIONS, PROFESSION_NAMES,
+    PROF_ACTION_MAP,
+    rank_index, norm_rank, ensure_player_schema, effective_stats, recalc_derived,
+    apply_directives, normalize_directives, tick_effects, check_profession_advance,
+    normalize_setting_ranks, reputation_standing, faction_rep_value,
+    dynamic_adversary_scale, inventory_weight, carry_capacity,
+    total_sell_value, location_stations, can_craft, has_station,
+    tick_world_timers, tick_needs_mental, equipped_bonuses, equip_item, unequip_item,
+    board_add, board_text, location_effects_for, apply_location_effects,
+)
+
+log = logging.getLogger("textgame")
+
+from . import plots
+from .narrators_loader import (
+    NARRATOR_PRESETS,
+    reload as reload_narrators_impl,
+    ensure_fresh as ensure_narrators_fresh_impl,
+)
+from .narrator_data import GENRE_HINTS
+
+# Живой список тем взято из загрузчика сюжетов (plots/system + plots/user), а НЕ хардкод.
+# narrator.THEMES == plots.THEMES (тот же список): правки файлов сюжетов видны после reload().
+THEMES = plots.THEMES
+
+
+def get_theme(theme_id: str) -> Optional[dict]:
+    return plots.get_theme(theme_id)
+
+
+def get_plot(plot_id: str) -> Optional[dict]:
+    """Сырой сюжет по id (для применения стартового состояния при создании мира)."""
+    return plots.get_plot(plot_id)
+
+
+def reload_plots() -> dict:
+    """Перечитать сюжеты с диска (кнопка «Обновить сюжеты» в UI) без перезапуска."""
+    return plots.reload()
+
+
+def ensure_plots_fresh() -> None:
+    """Дешёвая проверка файлов сюжетов на изменения (вызывается при GET /api/themes)."""
+    plots.ensure_fresh()
+
+
+def reload_narrators() -> list[dict]:
+    """Перечитать пресеты рассказчиков с диска (файлы plots/narrators/*.js) без перезапуска."""
+    return reload_narrators_impl()
+
+
+def ensure_narrators_fresh() -> bool:
+    """Дешёвая проверка файлов рассказчиков на изменения (вызывается при GET /api/narrators).
+    Возвращает True, если файлы изменились (пресеты перечитаны) — тогда нужно пересидить в БД."""
+    return ensure_narrators_fresh_impl()
+
+
+# ── Свой (кастомный) сюжет: псевдо-тема из имени и текста сюжета ──
+def theme_from_custom(name: str, plot: str, genres: list[str] | None = None) -> dict:
+    """Собирает тему-обёртку для кастомного сюжета (не хранится в THEMES)."""
+    sel = [g.strip().lower() for g in (genres or []) if g and g.strip().lower() in GENRE_HINTS]
+    genre = ", ".join(sel) or "приключение"
+    return {
+        "id": "custom",
+        "name": name or "Свой сюжет",
+        "genre": genre,
+        "desc": plot[:300],
+        "style": "Пиши сочно и атмосферно, строго в русле заявленного сюжета: держи интригу, "
+                  "не противоречь фактам сюжета и логике мира, плавно раскрывай завязку.",
+        "starter": {"gold": 20, "inventory": []},
+        "opening": plot,
+    }
+
+
+def _world_theme(world: dict, setting: dict) -> dict:
+    """Тема мира с фолбэком на снапшот: если сюжет из файла позже удалён/отредактирован,
+    мир продолжает жить по данным, которые были на момент создания (правило: миры не зависят
+    от файлов сюжетов). Снапшот хранится в setting['_theme_snapshot'] (ставится при создании).
+    Для ОЧЕНЬ старых миров (созданы ещё при встроенных темах, без снапшота) синтезирует
+    минимальную тему из полей мира — чтобы рассказчик не оставался совсем без стиля/жанра."""
+    t = get_theme(world.get("theme") or "")
+    if t:
+        return t
+    snap = (setting or {}).get("_theme_snapshot")
+    if isinstance(snap, dict) and snap:
+        return snap
+    # Фолбэк для старых/внешних миров: темы нет в plots/ и нет снапшота
+    name = world.get("name") or "Мир"
+    genre = (world.get("genre") or "приключение")
+    hook = (world.get("custom_hook") or "").strip()
+    return {
+        "name": name, "genre": genre, "id": world.get("theme") or "legacy",
+        "desc": hook[:300] or name,
+        "style": f"Пиши живо и атмосферно в русле этого мира (жанр: {genre}); держи канон и логику мира, "
+                  "не противоречь фактам сюжета.",
+        "starter": {}, "opening": hook or "Мир пробуждается. Что ты делаешь?", "lore": [],
+    }
+
+
+def _pl_int(v, default=0):
+    """Безопасный int для полей стартового состояния сюжета."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _pl_float(v, default=0.0):
+    """Безопасный float для весов предметов стартового состояния сюжета."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def apply_plot_start(setting: dict, plot: dict) -> list[str]:
+    """Применяет starting_state сюжета (схема PLOTS.md) к состоянию мира при создании.
+    Локации/NPC/магазины/фракции/квесты/флаги/время/погода/золото/инвентарь игрока.
+    Роль игрока (раса/класс/статы/уровень) НЕ трогает — её генерирует generate_character,
+    т.к. сюжет не задаёт жёсткую личность (см. PLOTS.md п.5.1).
+    Шаблон полей совпадает с тем, как движок хранит их в setting (directives)."""
+    if not isinstance(plot, dict):
+        return []
+    ss = plot.get("starting_state") or {}
+    meta = plot.get("metadata") or {}
+    story = plot.get("story") or {}
+    if not isinstance(ss, dict) or not isinstance(story, dict):
+        return []
+    p = setting.setdefault("player", {})
+
+    # Золото и инвентарь игрока (канонический старт из сюжета)
+    if ss.get("gold") is not None:
+        _g = _pl_int(ss.get("gold"), None)
+        if _g is not None:
+            p["gold"] = _g
+    inv = ss.get("inventory")
+    if isinstance(inv, list) and inv:
+        clean = []
+        for it in inv:
+            if isinstance(it, str) and it.strip():
+                clean.append({"name": it.strip()[:60], "qty": 1, "desc": ""})
+            elif isinstance(it, dict) and str(it.get("name") or "").strip():
+                clean.append({"name": str(it["name"]).strip()[:60],
+                              "qty": max(1, _pl_int(it.get("qty"), 1)),
+                              "desc": str(it.get("desc") or "").strip()[:300],
+                              "weight": _pl_float(it.get("weight"))})
+        if clean:
+            p["inventory"] = clean
+
+    # Время и погода
+    if str(ss.get("start_time") or "").strip():
+        setting["time"] = str(ss["start_time"]).strip().lower()
+    if str(ss.get("start_weather") or "").strip():
+        setting["weather"] = str(ss["start_weather"]).strip().lower()
+
+    # Локации (граф карты) + текущая
+    locs = {}
+    for l in (ss.get("locations") or []):
+        if isinstance(l, dict) and str(l.get("id") or "").strip():
+            lid = str(l["id"]).strip()
+            _st = l.get("stations")
+            if isinstance(_st, str):
+                _stations = [x.strip() for x in _st.split(",") if x.strip()]
+            else:
+                _stations = [str(x) for x in (_st or []) if str(x).strip()]
+            _co = l.get("connections")
+            if isinstance(_co, str):
+                _conns = [x.strip() for x in _co.split(",") if x.strip()]
+            else:
+                _conns = [str(x) for x in (_co or []) if str(x).strip()]
+            locs[lid] = {"name": str(l.get("name") or lid)[:80],
+                         "desc": str(l.get("desc") or ""),
+                         "connections": _conns,
+                         "stations": _stations}
+    if locs:
+        sid = (meta.get("start_location_id") or "").strip()
+        cur = sid if sid in locs else next(iter(locs))
+        setting["locations"] = locs
+        setting["current_location"] = cur
+
+    # NPC
+    for n in (ss.get("npcs") or []):
+        if isinstance(n, dict) and str(n.get("id") or "").strip():
+            nid = str(n["id"]).strip()
+            entry = {"name": str(n.get("name") or nid)[:60], "mood": str(n.get("mood") or ""),
+                     "alive": bool(n.get("alive", True)), "desc": str(n.get("desc") or ""),
+                     "faction": str(n.get("faction") or "")}
+            sch = n.get("schedule")
+            if isinstance(sch, dict):
+                entry["schedule"] = {str(k): str(v) for k, v in sch.items() if str(v).strip()}
+            if n.get("money") is not None:
+                entry["money"] = max(0, _pl_int(n.get("money")))
+            setting.setdefault("npc", {})[nid] = entry
+
+    # Магазины (структура как у shop_add)
+    shops = setting.setdefault("shops", {})
+    for s in (ss.get("shops") or []):
+        if isinstance(s, dict) and str(s.get("id") or "").strip():
+            sid = str(s["id"]).strip()
+            items = []
+            for it in (s.get("items") or []):
+                if isinstance(it, dict) and str(it.get("name") or "").strip():
+                    items.append({"name": str(it["name"]).strip()[:60],
+                                  "price": _pl_int(it.get("price")),
+                                  "qty": max(1, _pl_int(it.get("qty"), 1)),
+                                  "value": _pl_int(it.get("value")),
+                                  "weight": _pl_float(it.get("weight")),
+                                  "desc": str(it.get("desc") or "")})
+            shops[sid] = {"id": sid, "name": str(s.get("name") or sid), "owner": str(s.get("owner") or ""),
+                          "faction": str(s.get("faction") or ""), "location": str(s.get("location") or ""),
+                          "items": items}
+
+    # Фракции (связи)
+    factions = setting.setdefault("factions", {})
+    for f in (plot.get("factions") or []):
+        if isinstance(f, dict) and str(f.get("id") or "").strip():
+            fid = str(f["id"]).strip()
+            entry = {"name": str(f.get("name") or fid), "desc": str(f.get("desc") or ""),
+                     "alignment": str(f.get("alignment") or "")}
+            rels = f.get("relations")
+            if isinstance(rels, dict):
+                entry["relations"] = {str(k): str(v) for k, v in rels.items()}
+            factions[fid] = entry
+
+    # Квесты (активные из цепочек)
+    for q in (story.get("quest_chains") or []):
+        if isinstance(q, dict) and str(q.get("id") or "").strip():
+            qid = str(q["id"]).strip()
+            entry = {"title": str(q.get("title") or qid), "desc": str(q.get("desc") or ""),
+                     "status": str(q.get("status") or "active")}
+            for k in ("steps", "branches", "next_quest_id"):
+                if q.get(k) is not None:
+                    entry[k] = q[k]
+            setting.setdefault("quests", {})[qid] = entry
+
+    # Флаги
+    flags = ss.get("flags")
+    if isinstance(flags, dict):
+        for k, v in flags.items():
+            setting.setdefault("flags", {})[str(k)] = bool(v) if isinstance(v, bool) else v
+    return []
+
+
+DIFF_LABELS = {"easy": "лёгкая", "normal": "средняя", "hardcore": "хардкор"}
+
+
+def diff_label(difficulty: str) -> str:
+    return DIFF_LABELS.get(difficulty, difficulty)
+
+
+# ── Жанры: мир может иметь несколько жанров (жанр в worlds.genre — строка через запятую) ──
+def split_genres(genre: str) -> list[str]:
+    """Разбивает строку жанров («а, б; в») на список нормализованных жанров."""
+    return [g.strip().lower() for g in re.split(r"[,;]", genre or "") if g.strip()]
+
+
+def genre_hint_text(genre: str) -> str:
+    """Жанровые правила для всех выбранных жанров мира (совмещённые)."""
+    hints = [GENRE_HINTS.get(g, "") for g in split_genres(genre)]
+    return " ".join(h for h in hints if h)
+
+
+# ── Размер контекста мира (per-world): чем больше — тем точнее память ──
+CONTEXT_OVERHEAD = 2600   # системный промпт + сводки + RAG-воспоминания + карточки + действие + запас
+MIN_RECENT_BUDGET = 400
+# База шкалы масштабирования памяти/лора: СТАНДАРТ 32k (как в .env CONTEXT_TOKENS=32768).
+# Не используем get_config().context_tokens, потому что админка может поставить глобальный
+# контекст 262144 — тогда формула «контекст/база» схлопывалась к 1.0 и память не росла.
+CONTEXT_BASE_TOKENS = 32768
+# Резерв токенов под RAG-память + лор + сводки + карточки (поверх recent).
+# Достаточен для МАКСИМАЛЬНОГО RAG/лора при 262k (RAG 24×~220=5280 + лор 6000 + сводки 10×120
+# + карточки ~1500 ≈ 14-15k), чтобы даже самый «жадный» мир влезал в контекст без переполнения.
+MEMORY_EXTRA_BUDGET = 16384
+
+
+def world_gen_settings(world: dict) -> dict:
+    """gen_settings мира как dict (переживают и JSON-строку, и dict)."""
+    try:
+        g = world.get("gen_settings") or "{}"
+        return g if isinstance(g, dict) else json.loads(g)
+    except Exception:
+        return {}
+
+
+def world_context_tokens(world: dict) -> int:
+    """Размер контекста мира (используется для бюджета памяти)."""
+    g = world_gen_settings(world)
+    ctx = int(g.get("context_tokens") or 0)
+    return ctx if ctx > 0 else get_config().context_tokens
+
+
+def world_recent_budget(world: dict) -> int:
+    """Сколько токенов мира уходит под недавнюю историю исходя из размера контекста.
+    total ≈ context_tokens = оверхед + недавняя история + max_tokens (ответ) + РЕЗЕРВ.
+    Резерв (MEMORY_EXTRA_BUDGET) оставляем под RAG-факты, лор, сводки и карточки сущностей,
+    которые идут ПОВЕРХ базы (иначе при большом контексте recent съедал всё и происходило
+    переполнение ~3k токенов)."""
+    g = world_gen_settings(world)
+    ctx = world_context_tokens(world)
+    mtok = int(g.get("max_tokens") or get_config().max_tokens)
+    return max(MIN_RECENT_BUDGET, ctx - CONTEXT_OVERHEAD - mtok - MEMORY_EXTRA_BUDGET)
+
+
+def dynamic_memory_k(world: dict, base_k: int, max_k: int) -> int:
+    """Масштабирует количество RAG-фактов/лор-чанков от размера контекста мира.
+    Базовая шкала — 32k (СТАНДАРТ, константа CONTEXT_BASE_TOKENS, НЕ cfg.context_tokens):
+    при контексте 32k возвращаем base_k, при 128k/256k — пропорционально больше
+    (но не больше max_k), чтобы окно памяти реально использовалось.
+    Per-world параметр (gen_settings.rag_memory_k / lore_rag_k) переопределяет базу;
+    0 = авто."""
+    g = world_gen_settings(world)
+    base = int(g.get("rag_memory_k") or 0) if g.get("rag_memory_k") is not None else 0
+    if base <= 0:
+        base = base_k
+    ctx = world_context_tokens(world)
+    base_ctx = max(8192, CONTEXT_BASE_TOKENS)
+    scale = max(1.0, ctx / base_ctx)
+    k = int(round(base * scale))
+    return max(1, min(int(max_k), max(k, base)))
+
+
+def dynamic_lore_budget(world: dict, base_budget: int, max_budget: int) -> int:
+    """Бюджет токенов лора тоже растёт с контекстом (не фиксированные 900 при 256k).
+    Per-world параметр gen_settings.lore_token_budget переопределяет базу; 0 = авто."""
+    g = world_gen_settings(world)
+    base = int(g.get("lore_token_budget") or 0) if g.get("lore_token_budget") is not None else 0
+    if base <= 0:
+        base = base_budget
+    ctx = world_context_tokens(world)
+    base_ctx = max(8192, CONTEXT_BASE_TOKENS)
+    scale = max(1.0, ctx / base_ctx)
+    b = int(round(base * scale))
+    return max(base, min(int(max_budget), b))
+
+
+# ══════════════════════════════════════════════════════════════
+# Начальное состояние мира
+# ══════════════════════════════════════════════════════════════
+def default_setting(theme: dict, difficulty: str = "normal") -> dict:
+    hp_map = {"easy": 120, "normal": 100, "hardcore": 80}
+    starter = theme.get("starter", {})
+    p = {
+        "name": "Путник",
+        "hp": hp_map.get(difficulty, 100),
+        "max_hp": hp_map.get(difficulty, 100),
+        "mp": 50, "max_mp": 50,
+        "level": 1, "xp": 0,
+        "gold": starter.get("gold", 20),
+        "race": "",              # раса — назначит рассказчик (или задай директивой)
+        "class": "",             # класс (например «Воин») и его эволюции/специализация
+        "class_rank": "F",       # ранг класса
+        "secondary_class": "",   # мультикласс (опц.)
+        "secondary_rank": "F",
+        "profession": "",        # профессия/ремесло (даёт бафф)
+        "stats": dict(DEFAULT_STATS),
+        "skills": {},             # навык → {rank, kind, desc, mp_cost}
+        "titles": [],
+        "reputation": {},
+        "effects": {},            # эффект → {turns, damage, heal, kind, stacks, mods, desc, tag}
+        "actions": {},            # накопление действий: {действие: счётчик} → смена профессии
+        "identity": "",           # краткое описание персонажа (кто он, происхождение), задаётся при/в начале
+        "inventory": list(starter.get("inventory", [])),
+    }
+    recalc_derived(p, difficulty)
+    # Стартовая локация: имя по теме (или настраиваемая start_location в теме — чтобы локация
+    # не называлась именем мира/сюжета, а была реальным местом действия).
+    start = theme.get("start_location")
+    if isinstance(start, dict):
+        start_loc = {"name": str(start.get("name") or theme["name"]),
+                     "desc": str(start.get("desc") or theme.get("desc", ""))}
+    elif isinstance(start, str) and start.strip():
+        start_loc = {"name": start.strip(), "desc": theme.get("desc", "")}
+    else:
+        start_loc = {"name": theme["name"], "desc": theme.get("desc", "")}
+    return {
+        "player": p,
+        "enemies": {},
+        "npc": {},
+        "factions": {},       # фракции: id → {name, desc, alignment, relations:{other: stance}}
+        "companions": {},
+        "locations": {"start": start_loc},
+        "current_location": "start",
+        "quests": {},
+        "flags": {},
+        "weather": "ясно",
+        "time": "вечер",
+        "game_over": False,
+        "_difficulty": difficulty,
+        "style_notes": [],
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# Влияние среды (время суток + погода) — универсальные геймплейные эффекты,
+# не привязаны к фэнтези: работают и в реал/техно/космос мирах.
+# ══════════════════════════════════════════════════════════════
+# Время суток: ключ — что слово в директиве time (ночь/день/вечер/утро и т.д.)
+_TIME_MODS = {
+    "ночь": ["−1 к зрительным проверкам и дальнему бою, +1 к скрытности"],
+    "глубокая ночь": ["−2 к зрительным проверкам, +2 к скрытности"],
+    "вечер": ["−1 к зрительным проверкам вдали"],
+    "сумерки": ["−1 к зрительным проверкам вдали"],
+    "рассвет": ["−1 к вниманию (полусон)"],
+    "утро": [],
+    "день": [],
+    "полдень": [],
+}
+# Погода: влияние на проверки/передвижение.
+_WEATHER_MODS = {
+    "дождь": ["−1 к зрительным/слуховым проверкам на расстоянии, мокрая земля (−1 к скорости)"],
+    "ливень": ["−2 к зрительным/слуховым, тяжело двигаться", "плохая видимость"],
+    "гроза": ["−2 к зрительным/слуховым, опасно на открытой местности", "могут ломаться мосты/переправы"],
+    "буря": ["−2 к проверкам, передвижение затруднено", "риск обрушения/затопления"],
+    "шторм": ["−3 ко внешним проверкам", "выход в море/открытое небо крайне опасен"],
+    "туман": ["−2 к видимости, легко заблудиться"],
+    "снегопад": ["−1 к видимости и скорости, следы заметны"],
+    "метель": ["−2 к видимости, передвижение затруднено", "риск сбиться с пути"],
+    "жара": ["−1 к выносливости при долгих усилиях"],
+    "мороз": ["−1 к выносливости и ловкости на холоде", "вода замерзает"],
+    "пыльная буря": ["−2 к видимости, трудно дышать"],
+    "смог": ["−1 к видимости на расстоянии"],
+    "радиация": ["опасно долго находиться без защиты"],
+    "солнечный шторм": ["−2 к электронике/связи"],
+    "кислотный дождь": ["повреждает открытую технику/броню"],
+}
+# Сезон (сессия 32): зима/лето/осень/весна дают универсальные моды (все жанры)
+_SEASON_MODS = {
+    "зим": ["−передвижение в пути", "холод: нужна тёплая одежда/огонь", "−видимость (снег/туман)"],
+    "весн": ["+скрытность (листва)", "+ресурсы (ягоды/добыча)", "грязь: −скорость по бездорожью"],
+    "лет": ["+жара: −выносливость в пути днём", "+долгий световой день", "−скрытность (открытые пространства)"],
+    "осен": ["+туманы и сырость", "−видимость в сумерках", "+ресурсы (урожай/грибы)"],
+}
+
+
+def environment_mods(time_of_day: str, weather: str, season: str = "") -> list[str]:
+    """Список геймплейных эффектов от времени суток, погоды и сезона (для состояния в промпте).
+    Ключи-подстроки сверяются от САМОЙ СПЕЦИФИЧНОЙ записи к общей (по убыванию длины),
+    чтобы «глубокая ночь» не получала эффекты «ночь», «пыльная буря» — «бури» и т.п."""
+    out: list[str] = []
+    td = str(time_of_day or "").strip().lower()
+    for t in sorted(_TIME_MODS, key=len, reverse=True):
+        if t in td:
+            out.extend(_TIME_MODS[t])
+            break
+    w = str(weather or "").strip().lower()
+    if "ясно" not in w and "ясная" not in w:
+        for tag in sorted(_WEATHER_MODS, key=len, reverse=True):
+            if tag in w:
+                out.extend(_WEATHER_MODS[tag])
+                break
+    # Сезон (сессия 32): зима/лето/осень/весна дают универсальные моды (все жанры)
+    s = str(season or "").strip().lower()
+    for tag in sorted(_SEASON_MODS, key=len, reverse=True):
+        if tag in s:
+            out.extend(_SEASON_MODS[tag])
+            break
+    return out
+
+def npc_schedule_text(setting: dict, npc_id: str, npc: dict) -> str:
+    """Активная запись расписания NPC под текущее время: "расписание: …" или "" (нет)."""
+    sch = npc.get("schedule")
+    if not isinstance(sch, dict) or not sch:
+        return ""
+    if not npc.get("alive", True):
+        return ""  # мёртвый не по расписанию
+    td = str(setting.get("time", "") or "").strip().lower()
+    for t, act in sch.items():
+        k = str(t).strip().lower()
+        if k in td or td in k:
+            return f" (расписание: {act})"
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════
+# Форматирование состояния мира (компактно, для промпта)
+# ══════════════════════════════════════════════════════════════
+def _safe_ifint(v, default=0):
+    """Безопасный int для отображательных полей (цена/ценность)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _w0(v) -> str:
+    try:
+        return f"{float(v):g}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def format_state(setting: dict) -> str:
+    p = setting["player"]
+    inv = ", ".join(f"{i['name']} ×{i.get('qty', 1)}" for i in p.get("inventory", [])) or "пусто"
+    loc = setting.get("locations", {}).get(setting.get("current_location", "start"), {})
+
+    lines = [
+        "=== ТЕКУЩЕЕ СОСТОЯНИЕ МИРА ===",
+        f"Игрок: {p.get('name','Путник')} | HP {p.get('hp',0)}/{p.get('max_hp',0)} | MP {p.get('mp',0)}/{p.get('max_mp',0)}",
+        f"Уровень {p.get('level',1)} (XP {p.get('xp',0)}) | Золото: {p.get('gold',0)}",
+    ]
+    # Динамическая сложность: показываем рассказчику множители силы врагов под текущий
+    # уровень, чтобы он задавал БАЗОВУЮ силу (движок сам усилит HP/урон) и описывал врагов
+    # соответствующе (сильный сюжетно должен быть и в тексте, а не только в цифрах).
+    dsc = dynamic_adversary_scale(p, setting.get("_difficulty", "normal"))
+    lines.append(
+        f"⚖️ Сложность: {diff_label(setting.get('_difficulty','normal'))} | уровень игрока {p.get('level',1)} → "
+        f"враги HP×{dsc['hp']}, dmg×{dsc['dmg']}, события ×{dsc['event']}. "
+        "Задавай базовые HP/урон врагов (движок сам отмасштабирует); "
+        "сильные враги должны подкрепляться описанием/сюжетом.")
+    ident = (p.get("identity") or "").strip()
+    if ident:
+        lines.insert(1, f"Персонаж (кто ты): {ident[:800]}")
+    race = (p.get("race") or "").strip()
+    cls = (p.get("class") or "").strip()
+    prof = (p.get("profession") or "").strip()
+    sec = (p.get("secondary_class") or "").strip()
+    role_parts = []
+    if race:
+        role_parts.append(f"раса: {race}")
+    if cls:
+        role_parts.append(f"класс: {cls} (ранг {p.get('class_rank','F')})")
+    if sec:
+        role_parts.append(f"мультикласс: {sec} (ранг {p.get('secondary_rank','F')})")
+    if prof:
+        role_parts.append(f"профессия: {prof}")
+    if role_parts:
+        lines.append("Роль: " + "; ".join(role_parts))
+    st = p.get("stats", {})
+    eff = effective_stats(p)
+    has_mods = any(eff.get(k, 0) != int(st.get(k, 0) or 0) for k in (st or {}))
+    prefix = "Характеристики (с учётом эффектов/экипировки): " if has_mods else "Характеристики: "
+    lines.append(prefix + ", ".join(f"{k} {eff.get(k, v)}" for k, v in st.items()))
+    skills = p.get("skills") or {}
+    if skills:
+        parts = []
+        for k, sk in list(skills.items())[:14]:
+            if isinstance(sk, dict):
+                r = str(sk.get("rank", "F"))
+                parts.append(f"{k} ({r}" + (f", {sk.get('kind')}" if sk.get("kind") else "") + ")")
+            else:
+                parts.append(f"{k} ур.{sk}")
+        lines.append("Навыки: " + "; ".join(parts))
+    abilities = p.get("abilities") or {}
+    if abilities:
+        ap = []
+        for nm, ab in list(abilities.items())[:10]:
+            if isinstance(ab, dict):
+                school = f"[{ab.get('school')}]" if ab.get("school") else ""
+                cost = f" (энергия {ab.get('cost')})" if ab.get("cost") else ""
+                ap.append(f"{nm}{school}{cost}")
+            else:
+                ap.append(str(nm))
+        lines.append("Способности: " + "; ".join(ap))
+    progress = p.get("progress") or {}
+    if progress:
+        lines.append("Статистика пути: " + "; ".join(f"{k} {v}" for k, v in list(progress.items())[:12]))
+    achievements = p.get("achievements") or []
+    if achievements:
+        lines.append("🏆 Достижения: " + "; ".join((a.get("name") if isinstance(a, dict) else str(a)) for a in achievements[:10]))
+    titles = p.get("titles") or []
+    if titles:
+        lines.append("Титулы: " + ", ".join(str(t) for t in titles[:8]))
+    factions = setting.get("factions") or {}
+    rep = p.get("reputation") or {}
+    if rep or factions:
+        rep_parts = [f"{k} — {reputation_standing(v)} ({v:+d})" for k, v in list(rep.items())[:8]] if rep \
+            else ([str(x) for x in list(factions)][:8] if factions else [])
+        lines.append("Репутация/фракции: " + "; ".join(rep_parts))
+        fl = []
+        for rid, f in list(factions.items())[:10]:
+            nm = f.get("name", rid)
+            rels = f.get("relations") or {}
+            rel_s = "; ".join(f"{o}:{s}" for o, s in list(rels.items())[:4]) if rels else "без связей"
+            st = reputation_standing(faction_rep_value(p, rid))
+            fl.append(f"{nm} [{st}, связи: {rel_s}]")
+        if fl:
+            lines.append("Фракции (роль для рассказчика): " + "; ".join(fl))
+    effects = p.get("effects") or {}
+    if effects:
+        parts = []
+        for name, ef in list(effects.items())[:8]:
+            label = str(name).strip()
+            if re.fullmatch(r"[A-Za-z0-9_\-]+", label):
+                label = (label.replace("_", " ").strip().title() or label)[:60]
+            t = ef.get("turns", -1)
+            dur = "постоянно" if t in (-1, None) else f"{int(t)} ход."
+            dmg = int(ef.get("damage", 0) or 0)
+            heal = int(ef.get("heal", 0) or 0)
+            tick_txt = f", −{dmg} HP/ход" if dmg else (f", +{heal} HP/ход" if heal else "")
+            stk = int(ef.get("stacks", 1) or 1)
+            if stk > 1:
+                tick_txt += f", стаков {stk}"
+            mods = ef.get("mods") or {}
+            if mods and isinstance(mods, dict):
+                tick_txt += ", моды: " + ", ".join(f"{k}{v:+}" for k, v in mods.items())
+            kind = (ef.get("kind") or "").strip()
+            dsc = str(ef.get("desc") or "").strip()
+            desc_txt = f" — {dsc[:70]}" if dsc else ""
+            base = f"{label}{desc_txt}"
+            parts.append(f"{base} ({kind}, {dur}{tick_txt})" if kind else f"{base} ({dur}{tick_txt})")
+        lines.append("Эффекты: " + "; ".join(parts))
+    acts = p.get("actions") or {}
+    if acts:
+        prog = []
+        for act, c in list(acts.items())[:10]:
+            prof = PROF_ACTION_MAP.get(str(act).strip().lower())
+            if prof:
+                pname, thr = prof
+                prog.append(f"{act} {c}/{thr} → {pname}" if c < thr else f"{act} {c}/{thr} (порог взят → {pname})")
+            else:
+                prog.append(f"{act} {c}")
+        lines.append("Действия (прогресс профессий): " + "; ".join(prog))
+    lines.append("Инвентарь: " + inv)
+    # ═══ Сессия 32: экипировка (слоты) ═══
+    equipped = p.get("equipped") or {}
+    if equipped:
+        eq_parts = []
+        for slot, item_name in equipped.items():
+            it = next((x for x in p.get("inventory", []) if x.get("name") == item_name), None)
+            bn = ""
+            if isinstance(it, dict):
+                b = it.get("bonus")
+                if isinstance(b, dict):
+                    bn = " (" + ", ".join(f"{k}{v:+}" for k, v in b.items()) + ")"
+            eq_parts.append(f"{slot}: {item_name}{bn}")
+        lines.append("🛡 Экипировано: " + "; ".join(eq_parts))
+    # ═══ Сессия 32: потребности и рассудок ═══
+    needs = p.get("needs") or {}
+    mental = p.get("mental") or {}
+    if needs:
+        lines.append("Потребности: " + "; ".join(f"{k} {float(v.get('value', 0)):.0f}/{float(v.get('max', 100)):.0f}" for k, v in needs.items() if isinstance(v, dict)))
+    if mental:
+        lines.append("Рассадок/мораль: " + "; ".join(f"{k} {float(v.get('value', 0)):.0f}/{float(v.get('max', 100)):.0f}" for k, v in mental.items() if isinstance(v, dict)))
+    # ═══ Сессия 32: звания во фракциях ═══
+    fra = p.get("faction_ranks") or {}
+    if fra:
+        lines.append("🏅 Звания: " + "; ".join(f"{k}: {v}" for k, v in fra.items()))
+    # ═══ Сессия 32: таймеры мира (дедлайны) ═══
+    timers = setting.get("timers") or {}
+    if isinstance(timers, dict) and timers:
+        t_parts = []
+        for name, t in list(timers.items())[:8]:
+            if not isinstance(t, dict):
+                continue
+            tl = t.get("turns_left")
+            dur = "без срока" if tl in (-1, None, "∞") else f"{int(tl)} ход."
+            t_parts.append(f"{name} ({dur})" + (f" — {t.get('desc')}" if t.get("desc") else ""))
+        lines.append("⏳ Таймеры мира: " + "; ".join(t_parts))
+    # ═══ Сессия 32: доска объявлений ═══
+    _board = board_text(setting, limit=5)
+    if _board:
+        lines.append("📜 Доска объявлений:\n  " + "\n  ".join(_board.splitlines()[:5]))
+    # ═══ Сессия 32: очередь видений (сыграют при отдыхе/сне/trigger_vision) ═══
+    _pv = setting.get("pending_visions") or []
+    if isinstance(_pv, list) and _pv:
+        _pv_txt = "; ".join(
+            (str(v.get("hint") or v.get("text") or "")[:80] if isinstance(v, dict) else str(v)[:80])
+            for v in _pv[:3])
+        lines.append(f"🌙 Очередь видений ({len(_pv)}): {_pv_txt}")
+    # Система веса: показываем загрузку рюкзака, если есть предметы с весом
+    _invw = inventory_weight(p)
+    _cap = carry_capacity(p)
+    if _invw:
+        _pct = f" ({(100*_invw/_cap):.0f}%" + (" — ПЕРЕГРУЗ, не бери больше!" if _invw > _cap else ")")
+        lines.append(f"🎒 Загрузка: {_invw:.0f}/{_cap} кг{_pct}")
+    _sell = total_sell_value(p)
+    if _sell:
+        lines.append(f"💰 Продажу/сделки: всё лишнее в инвентаре оценивается ≈ {_sell} 🪙 (можно продать в магазине).")
+    _stations = location_stations(setting)
+    if _stations:
+        lines.append("🔧 Станции здесь (для крафта): " + ", ".join(_stations))
+    lines.append(f"Локация: {loc.get('name','?')} — {loc.get('desc','')[:200]}")
+    # ═══ Сессия 32: локации-зоны с постоянными эффектами (радиация/туман/проклятие) ═══
+    zone_fx = location_effects_for(setting, setting.get("current_location", "start"))
+    if zone_fx:
+        z_parts = []
+        for fx in zone_fx:
+            if isinstance(fx, dict) and fx.get("name"):
+                dmg = int(fx.get("damage", 0) or 0)
+                z_parts.append(f"{fx['name']}" + (f" (−{dmg} HP/ход)" if dmg else "") + (f" — {fx.get('desc')}" if fx.get("desc") else ""))
+        lines.append("🌫 Влияние места (зоны): " + "; ".join(z_parts[:6]))
+    lines.append(f"Погода: {setting.get('weather','ясно')} | Время суток: {setting.get('time','')}")
+    _date = setting.get("date") or {}
+    if isinstance(_date, dict) and _date:
+        _dp = ", ".join(f"{k}: {v}" for k, v in _date.items() if v)
+        lines.append(f"📅 Дата/сезон: {_dp}")
+    # Влияние среды (время суток + погода + сезон) — геймплейные эффекты.
+    env_effects = environment_mods(setting.get("time", ""), setting.get("weather", ""),
+                                   season=(setting.get("date") or {}).get("season", "") if isinstance(setting.get("date"), dict) else "")
+    if env_effects:
+        lines.append("Влияние среды (учитывай в проверках/поведении): " + "; ".join(env_effects))
+    npc = setting.get("npc", {})
+    if npc:
+        npc_lines = []
+        for k, v in list(npc.items())[:10]:
+            alive = "жив" if v.get('alive', True) else "мёртв"
+            extra = npc_schedule_text(setting, k, v)
+            frac = ""
+            if v.get('faction'):
+                fr = str(v['faction'])
+                if fr in (rep or {}) or fr in (factions or {}):
+                    frac = f", {fr} ({reputation_standing(faction_rep_value(p, fr))})"
+                else:
+                    frac = f", {fr}"
+            _coin = f", {v['money']} 🪙" if v.get("money") else ""
+            npc_lines.append(f"{k}={v.get('name',k)}({alive}{_coin}, {v.get('mood','')}{frac}){extra}")
+        lines.append("NPC: " + "; ".join(npc_lines))
+    enemies = setting.get("enemies", {})
+    if enemies:
+        _ai_phrase = {"attack": "преследует/рвётся в бой", "guard": "в обороне/держит дистанцию",
+                      "retreat": "готовится отступить", "negotiate": "пытается переговорить/сдаться",
+                      "trap": "готовит ловушку/засаду"}
+        en_line = []
+        for k, v in list(enemies.items())[:8]:
+            base = f"{k}={v.get('name',k)} HP {v.get('hp',0)}/{v.get('max_hp',v.get('hp',0))}"
+            if v.get("money"):
+                base += f" (🪙{v.get('money')})"
+            ai = str(v.get("ai") or "").strip().lower()
+            if ai in _ai_phrase:
+                base += f" (намерение: {_ai_phrase[ai]})"
+            en_line.append(base)
+        lines.append("Враги: " + "; ".join(en_line))
+    companions = setting.get("companions", {})
+    if companions:
+        comp_lines = []
+        for cid, cp in list(companions.items())[:8]:
+            sk = "; ".join(f"{s}({v.get('rank','F')})" for s, v in list((cp.get('skills') or {}).items())[:5]) or "—"
+            comp_lines.append(f"{cp.get('name', cid)} (Lv{cp.get('level',1)}, HP {cp.get('hp',0)}/{cp.get('max_hp',cp.get('hp',0))}, верность {cp.get('loyalty',0)}, навыки: {sk})")
+        lines.append("Компаньоны: " + "; ".join(comp_lines))
+    quests = setting.get("quests", {})
+    if quests:
+        q_lines = []
+        for k, v in list(quests.items())[:10]:
+            st = v.get("status", "active")
+            prog = v.get("progress")
+            prog_s = f" | шаг: {prog}" if prog else ""
+            q_lines.append(f"[{st}] {v.get('title',k)}{prog_s}: {v.get('desc','')[:120]}")
+        lines.append("Квесты:\n  " + "\n  ".join(q_lines))
+    shops = setting.get("shops", {})
+    if shops:
+        shop_lines = []
+        for sid, sh in list(shops.items())[:6]:
+            items = "; ".join(
+                f"{i.get('name')}(п{_safe_ifint(i.get('price'))}🪙/прод.{_safe_ifint(i.get('value'))} ×{i.get('qty')}"
+                + (f"·{_w0(i.get('weight'))}кг" if i.get("weight") else "")
+                + ")"
+                for i in (sh.get('items') or [])[:10]) or "пусто"
+            frac = f", фракция: {sh.get('faction')}" if sh.get("faction") else ""
+            shop_lines.append(f"{sh.get('name', sid)}{frac} [{items}]")
+        lines.append("Магазины: " + " | ".join(shop_lines))
+    crafts = setting.get("crafts", {})
+    if crafts:
+        c_lines = []
+        for rid, rc in list(crafts.items())[:8]:
+            res = rc.get("result") or {}
+            ing = ", ".join(f"{i.get('name')} ×{i.get('qty')}" for i in (rc.get('ingredients') or [])) or "без вложений"
+            _req = []
+            if rc.get("station"):
+                _req.append("станция " + ",".join(rc["station"]))
+            if rc.get("profession"):
+                _req.append("профессия " + str(rc.get("profession")))
+            _req_s = ("; " + ", ".join(_req)) if _req else ""
+            _miss, _status = can_craft(setting, rc)
+            _rc = "✓" if _status == "ok" else "✗"
+            c_lines.append(f"{rc.get('name', rid)} → {res.get('name','?')}×{res.get('qty',1)} [{ing}]{_req_s} {_rc}")
+        lines.append("Рецепты крафта: " + " | ".join(c_lines))
+    flags = setting.get("flags", {})
+    if flags:
+        lines.append("Флаги: " + "; ".join(f"{k}={v}" for k, v in list(flags.items())[:12]))
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════
+# Системный промпт рассказчика
+# ══════════════════════════════════════════════════════════════
+def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
+                        use_tools: bool = False) -> str:
+    theme = _world_theme(world, setting)
+    style = theme.get("style", "")
+    world_genre = world.get("genre") or theme.get("genre", "")
+    genre_hint = genre_hint_text(world_genre)
+    genre_label = " и ".join(f"«{g}»" for g in split_genres(world_genre)) or "«приключение»"
+    diff = world.get("difficulty", "normal")
+    diff_note = {
+        "easy": "Лёгкая сложность: враги слабее, подсказки уместны, смерти почти нет.",
+        "normal": "Средняя сложность: баланс риска и наград.",
+        "hardcore": "Хардкор: враги сильнее, смерть реальна, подсказки редки.",
+    }.get(diff, "")
+    lang = world.get("language", "ru")
+    lang_note = "Отвечай полностью на русском языке, пиши по-русски." if lang == "ru" else \
+        "Respond entirely in English, write in English."
+    persp = world.get("perspective", "second")
+    persp_note = {
+        "second": "Обращайся к игроку на «ты» (второе лицо).",
+        "first": "Пиши от первого лица игрока («я иду...»).",
+        "third": "Опиши игрока в третьем лице («он/она»).",
+    }.get(persp, "")
+
+    # Динамический лимит объёма ответа: от максимального числа токенов мира (меняется настройками мир/глобально)
+    g = world_gen_settings(world)
+    max_tok = int(g.get("max_tokens") or get_config().max_tokens)
+    max_chars = int(round(max_tok * 3.2))
+    char_note = (f" Не превышай объём ответа: максимум примерно {max_chars} символов (~{max_tok} токенов). "
+                 "Оборачивай мысль законченной фразой в рамках лимита, не обрывай на полуслове; если лимит тесен — пиши компактнее, но сохраняя живость.")
+
+    persona_line = (persona or "").strip() or \
+        "Ты — Рассказчик (Game Master) живой текстовой RPG."
+
+    if use_tools:
+        roll_rule = "7. Если в действии игрока есть риск — вызови инструмент game_engine с roll (см. ниже), чтобы бросить куб."
+        mech_rule = ("10. Каждый ход пиши текст рассказа нормально. Механические изменения (урон, золото, предметы, "
+                     "квесты, NPC, флаги, перемещение, статус-эффекты) передавай ОТДЕЛЬНО и ТОЛЬКО вызовом инструмента "
+                     "game_engine в конце ответа (аргументы — JSON с директивами). Если действие имеет механические "
+                     "последствия (деньги, предметы, HP/MP, перемещение, квест, урон) — вызови game_engine ОБЯЗАТЕЛЬНО, "
+                     "это не опция. Если игрок взял/нашёл/подобрал/получил предмет — обязательно добавь его через add_item. "
+                     "Никогда не пиши механики в текст.")
+        fmt_head = ("## Механика — инструмент game_engine\nНапиши текст рассказа и затем вызови game_engine с JSON-аргументами "
+                    "(все ключи ниже опциональны; их можно комбинировать):\n"
+                    "game_engine({{\"player\": {{\"gold\": -2, \"hp\": -5}}, \"add_item\": [{{\"name\": \"эль\", \"qty\": 1}}], "
+                    "\"roll\": {{\"expr\": \"d20\", \"mod\": 2, \"dc\": 15, \"label\": \"взлом замка\"}}}})\n"
+                    "Доступные ключи (комбинируются; список не исчерпывающий — полный набор в описании инструмента): player (hp/mp/gold/xp/stats/actions/level [явное повышение уровня по сюжету]), race_change, class, class_rank, class_evolve, "
+                    "secondary_class, secondary_rank, profession, skill_add, skill_rank, skill_remove, title, reputation, "
+                    "effect_add, effect_remove, add_item, remove_item, enemy_add, enemy_apply, enemy_remove, quest, quest_done (id или {{id, next}} — цепочка), quest_advance, quest_choose, "
+                    "npc_set (name/mood/alive/faction/schedule [расписание по времени суток]), npc_kill, faction_add/faction_update/faction_remove (фракции и их связи), location_add, location_update, move, flag, time, weather, roll, game_over (true/false). "
+                    "Экономика: shop_add, shop_remove, shop_update, trade_buy, trade_sell. Крафт: gather, craft_learn, craft_remove, craft. "
+                    "Компаньоны: companion_add, companion_remove, companion_update, companion_apply. "
+                    "Способности: ability_add, ability_remove, ability_update, ability_use. "
+                    "Статистика: progress_add, achievement_add. "
+                    "Сессия 32: timer_add {{name, turns, desc}}/timer_remove (таймеры-дедлайны мира), "
+                    "equip {{item}}/unequip {{item}} (экипировка по слотам: предмету нужен slot), "
+                    "needs {{голод: {{value: -10}}|{{value: 90}}...}} (потребности/рассудок), board_add {{title, text}} (доска объявлений), "
+                    "faction_rank {{faction, rank}} (звания во фракциях), date {{day, month, season}} (календарь/сезоны), "
+                    "vision_add {{text, hint}} (видение в очередь — сыграет при отдыхе/сне), trigger_vision (разыграть видение). "
+                    "В roll можно добавить stakes {{success, fail}} — что на кону при успехе/провале.")
+        fmt_tail = ("## Условия\n- Используй инструмент game_engine ТОЛЬКО когда действие меняет механическое состояние "
+                    "(урон, предметы, золото, квесты, флаги, перемещение, бросок).\n"
+                    "- Для простых описаний инструмент не нужен.\n"
+                    "- Если игрок платит или получает золото, берёт/теряет предметы, получает урон или лечение, переходит "
+                    "в другую локацию, начинает/завершает квест, накладывает эффект, бросает куб — вызови game_engine с "
+                    "соответствующими ключами в этом же ответе. Пропуск механики ломает мир.\n"
+                    "- Если вызвал roll — в тексте НЕ пиши результат броска сам и НЕ описывай механику. После вызова "
+                    "инструмента результат вернётся и ты опишешь его отдельным ходом.\n"
+                    "- НИКОГДА не вставляй в видимый текст служебные слова/инструкции для себя: \"roll\", \"проверка \", \"Результат броска вернётся\", \"tool_calls\", \"game_engine\", планы действий и подсказки. Пиши только чистый художественный текст сцены.")
+    else:
+        roll_rule = "7. Если в действии игрока есть риск — используй блок <<ENGINE>> с roll (см. ниже), чтобы бросить куб."
+        mech_rule = "10. Механические изменения (урон, золото, предметы, квесты, NPC, флаги, перемещение, статус-эффекты) передавай ТОЛЬКО через блок <<ENGINE>> в самом конце ответа. Если игрок взял/нашёл/подобрал предмет — это обязательное предметное изменение, добавь его в <<ENGINE>> через \"add_item\"."
+        fmt_head = "## Формат блока <<ENGINE>> (строго в конце ответа, одной строкой):"
+        fmt_tail = "## Условия\n- Используй <<ENGINE>> ТОЛЬКО когда действие меняет механическое состояние (урон, предметы, золото, квесты, флаги, перемещение, бросок).\n- Для простых описаний блок не нужен.\n- Если бросил roll — в тексте НЕ пиши результат броска сам и НЕ описывай механику; после блока engine результат вернётся и ты опишешь его отдельным ходом.\n- НИКОГДА не вставляй в видимый текст слова <<ENGINE>>, \"roll\", \"проверка\", \"Результат броска вернётся\" и подсказки — только чистый художественный текст сцены."
+
+    canon_note = (theme.get("canon_note") or "").strip()
+    # правило 26 — фракции; лор уходит в 27–29
+    faction_rule = (
+        "26. ФРАКЦИИ → ПУТЬ ИГРОКА. У фракций есть репутация игрока (число) и ступень [Изгой/Заклятый враг/Враг/Недоверие/Нейтрально/Доверие/Друг/Союзник] — она показана в состоянии. Фракция определяется по полю faction у NPC и магазинов; связи между фракциями (relations: союз/враг) влияют на репутацию «по симпатии». Никогда не вводи персонажа фракции вне его поведения по ступени:"
+        " • Союзник/Друг — полностью доверяют: дают уникальные квесты, скидки, секреты, защищают."
+        " • Доверие/Недоверие — настороженно: торгуют, но к тайнам не допускают, просят доказательств."
+        " • Враг/Заклятый враг — враждебны: откажут в помощи, могут выдать властям, отказать в доступе или атаковать."
+        " • Изгой — никто не помогает: закрыты лавки и убежища этой фракции."
+        " Ступень меняется директивами reputation: давай за реальные события (услуга, предательство, конфликт). Предлагай фракционные квесты и реакцию НЕ просто цифрой: NPC по-разному разговаривают, дают/отказывают в доступе, вводят в сюжетные линейки фракции."
+        " СЕССИЯ 32: у игрока могут быть ЗВАНИЯ во фракциях (поле «Звания»): репутация — это доверие, звание — должность/ступень внутри фракции. Давай/меняй звания директивами faction_rank и используй их в доступе и квестах фракции."
+        " СНЫ/ВИДЕНИЯ: если в состоянии есть «Очередь видений» (pending_visions) или игрок отдыхает/спит/медитирует — разыграй видение/сон отдельным проходом (см. функцию trigger_vision): оберни в сон/галлюцинацию/перехваченный сигнал фрагменты памяти или намёки сюжета. Это сюжетный приём, а не дамп фактов."
+    )
+    lore_rules = (
+        faction_rule +
+        "27. ЛОР МИРА (блок [ЛОР МИРА] ниже) — источник фактов о вселенной: имена, география, "
+        "история, фракции, системы и их правила. Следуй ему строго: не меняй устоявшиеся факты, "
+        "не путай термины, не придумывай противоречащего. Если лор не покрывает ситуацию — "
+        "домысливай аккуратно, в духе мира, и не ломай установленный канон.\n"
+        "28. Блок лора может быть сжатым и обрываться (там большая библиотека, а в промпт попадает "
+        "релевантное): используй его как основу, детали добавляй в том же стиле.\n"
+    )
+    if canon_note:
+        lore_rules += f"29. {canon_note}\n"
+    # Сессия 32: правило 30 — таймеры/дедлайны (движок тикает, исход — рассказчик)
+    lore_rules += (
+        "30. ТАЙМЕРЫ МИРА: в состоянии могут быть «Таймеры» (дедлайны: бомба, осада, прибытие, "
+        "срок). Движок сам тикает их в начале каждого хода и сообщит «⏰ Таймер истёк» — это ЗНАЧИТ, "
+        "что время вышло. Что именно произошло (взрыв, осада началась, курьер пришёл) — решаешь ты "
+        "директивами и текстом; не игнорируй истёкший таймер. Новые таймеры заводи директивами "
+        "timer_add (turns = сколько ходов осталось).\n"
+        "31. ПОТРЕБНОСТИ/РАССУДОК: у игрока есть шкалы потребностей (голод/жажда/усталость) и "
+        "рассудка (рассудок/стресс/мораль) — они показаны в состоянии и тикают сами. Если шкала "
+        "на критическом уровне — это важный сюжетный сигнал: игрок нуждается в еде/воде/отдыхе/разрядке. "
+        "Последствия (эффекты, штрафы, сюжетные повороты) применяй директивами (effect_add/player/stats), "
+        "не позволяй себе игнорировать нужды, но и не души ими — это ресурс драмы, а не налог.\n"
+        "32. ЛОКАЦИИ-ЗОНЫ: если у текущей локации есть «Влияние места» (эффекты зоны: радиация, "
+        "ядовитый туман, проклятие, невесомость) — оно уже действует на игрока (движок наложил). "
+        "Учитывай в описаниях и проверках; способ защититься/снять — на твоё усмотрение.\n"
+    )
+    if canon_note:
+        pass  # правило 29 уже добавлено выше
+    prompt = f"""{persona_line}
+
+Ты ведёшь игру в жанре: {genre_label}.
+Тема мира: {world['name']}. {theme.get('desc', '')}
+Стиль повествования: {style}
+Жанровые правила: {genre_hint}
+{diff_note}
+{persp_note}
+{lang_note}
+
+## Правила рассказчика
+1. Отвечай на ЛЮБОЕ действие игрока естественным продолжением мира: что происходит, что он видит/слышит/чувствует, последствия.
+2. Мир живой: NPC имеют характер и память, погода и время меняются, события не ждут игрока.
+3. НЕ нарушай уже установленные факты: мёртвый NPC не говорит, сломанный замок не чинится сам. Следи за флагами и состоянием — они даны ниже. Перед упоминанием NPC перепроверь секцию NPC/Враги: не пиши о мёртвых как о живых, не воскрешай убитых, не открывай то, что уже сломано или заперто навсегда. Если ты всё же описываешь противоречие — оставь это в духе «искажения реальности», не подавая как норму.
+4. Не решай за игрока: не совершай его поступки, не говори за него. Если действие двусмысленно — коротко уточни.
+5. Веди сюжет интересно: подкидывай события, загадки, развития. Не зацикливайся на одном месте.
+6. Описания — 1–4 абзаца, живые, но без воды. Никогда не повторяйся дословно.{char_note}
+{roll_rule}
+8. Кубы: d20 (проверка навыка) и d100 (удача/процент). Критический успех 20/100+, критический провал 1. Успех 10+ (d20).
+9. В бою используй директивы урона: игроку и врагам (enemy_apply / player hp). Враги атакуют, когда уместно.
+9а. БОЙ — механика боя/урона/врагов и эффекты предметов применяет ОТДЕЛЬНЫЙ проход-аудит по ТВОЕМУ тексту (не ты). Пиши живой художественный текст: как бьешь/что бьет, результат словами. НЕ выводи окна Системы с цифрами (HP/атака/защита) блоками и НЕ пиши механику в текст. Опиши эффект ножа/предмета прозой (например, золотой след, пересчитанный удар) — аудит переведет это в механики player.hp/gold/effect_add.
+{mech_rule}
+11. Перемещай игрока (директива move) ТОЛЬКО когда он в своём действии сам явно идёт/переходит/следует/входит куда-либо. Осмотр, разговор, чтение, ожидание, использование предмета — это НЕ перемещение, и move в таком случае НЕ используй.
+12. Не выдумывай новые локации (location_add) и не меняй состояние, если этого не требует действие игрока: игрок сам решает, куда идти.
+13. НЕ вызывай roll без реального риска: обыденные действия (осмотреться, прочитать записку, поесть, поговорить) проверок не требуют. Бросай куб только при противодействии, опасности или ставке.
+14. Статы игрока — числа (10 = средний человек): сила (физические действия, урон в ближнем бою), ловкость (скрытность, точность, уклонение), выносливость (HP, стойкость к урону/усталости), интеллект (знания, логика, заклинания, MP), мудрость (восприятие, чутьё, воля), харизма (убеждение, торг, общение), удача (шанс, случайность). Профильный стат даёт бонус к проверке (roll.mod). Это ОРИЕНТИР, а не жёсткий закон: статы меняются не только накоплением, но и по сюжету — тренировки, обучение, духи/артефакты, проклятия, ритуалы, дар Системы. Меняй их директивами stats (аддитивно) или player.level (явное повышение уровня за значимое достижение — ритуал, испытание, дар; не только формулой XP). Производные HP/MP пересчитаются сами — не считай их вручную. При уместных проверках добавляй бонус к roll.mod за профильный стат/навык.
+15. Раса/класс/профессия — часть идентичности. Вшитые: расы — человек/эльф/дварф/орк/зверолюд/полудемон/драконид/нежить (дают бонусы статов и пассивку); классы — Воин/Лучник/Маг/Вор/Жрец/Бард (стартовый навык выдаётся сам при смене класса); профессии — Кузнец/Алхимик/Травник/Охотник/Шахтёр/Повар/Портной/Моряк/Книжник (дают постоянный бафф). Можно вводить и СВОИ творческие: для расы укажи bonus/passive, для класса — своё имя и (опц.) skill, для профессии — buff. Ранги классов и навыков: F < E < D < C < B < A < S < SS < SSS < Z < ZZ < ZZZ < G (F низший, G высший). Ранг повышай за испытания/квесты (class_rank/skill_rank). Эволюция/мультикласс: class_evolve/secondary_class.
+16. Эффекты (отравлен/благословлён и т.п.) действуют сами: в начале каждого хода их урон/лечение применяется автоматически (× стаки), длительность уменьшается, по истечении снимаются (всё видно в «Эффекты»). Постоянные эффекты — без turns (или -1), временные — с turns. НЕ дублируй периодический урон эффекта через player.hp. Накладывай/снимай только директивами effect_add/effect_remove.
+17. Флаги — фиксированные факты-истины мира: «дверь_открыта=true» = дверь открыта, «ловушка_сработала=true» = ловушка уже сработала. Давай понятные имена, меняй только при реальных событиях. Для игрока флаги показываются человеческим языком (да/нет), поэтому не храни в них промежуточные заметки.
+18. Если у игрока ещё нет расы или класса — назначь их в ближайшем ответе (вшитые или творческие с полями). Если игрок использует навык — проверь, есть ли он у него и хватает ли MP (mp_cost); не давай использовать навыки из ниоткуда.
+18в. ПРЕДМЕТЫ И ИНВЕНТАРЬ: если игрок находит/берёт/подбирает/получает предмет (палку, шест, зелье, артефакт) — ОБЯЗАТЕЛЬНО добавь его в инвентарь директивой add_item В ЭТОМ ЖЕ ответе. НИКОГДА не упоминай, не доставай и не используй предметы, которых НЕТ в «Инвентарь» состояния (гранаты, оружие, бомбы и т.п.) — это грубое противоречие. Если игрок использует/выбрасывает предмет — сними его через remove_item. Перечисление того, что у игрока есть, в твоём тексте должно совпадать с инвентарём из состояния.
+18а. УНИВЕРСАЛЬНЫЕ СПОСОБНОСТИ — единая абстракция для всех жанров (магия / техно-устройства / псионика / навыки Системы). Выдавай их директивой ability_add {{name, school, cost, source, desc}}: school — направление, cost — трата энергии (MP), source — откуда (свиток/дар/чип/ритуал). Использование — ability_use {{name, cost}} (списывает энергию), правка/снятие — ability_update/ability_remove. Это дополнение к обычным навыкам.
+19. ПРОФЕССИИ, КЛАССЫ, ТИТУЛЫ — твоё живое творчество как рассказчика (дух литрпг: FFF-уровни, Система в «Ключах Пангеи»). Ты сам решаешь, когда и как появляются новые расы/классы/профессии/навыки/титулы, и сам их изобретаешь. Выдавай их в значимые сюжетные моменты (освоение ремесла, клятва, ритуал, испытание, открытие, чужой дар, «пробуждение Системы») через директивы: profession {{name, buff}}, class {{name, skill}}, race_change {{name, bonus, passive}}, title, skill_add. НЕ привязан к фиксированному списку и НЕ к счётчику. Повторяющиеся занятия игрока (player.actions) — лишь неформальная история мастерства, на которую ты опираешься в описаниях и поводах, но это НЕ автоматический триггер и НЕ обязательный порог: профессия меняется, когда это логично по сюжету, а не когда «накопилось N». Уникальная профессия/класс могут быть одноразовыми, двуименными, сплавом нескольких ремёсел — твори, но не ломай уже установленные факты. РЕПУТАЦИЯ — тоже смысловые отношения, а не сухие цифры: меняй её (reputation) со знаком по реальным событиям (дружба, предательство, услуга, конфликт), и используй в диалогах/реакциях NPC. УРОВЕНЬ и СТАТЫ — не только авто-прокачка по XP, но и твоё сюжетное решение (дай уровень за важную победу/ритуал через player.level, дай статы за обучение/дар через stats). Классы/расы/профессии/навыки могут быть СКРЫТЫМИ: выдавай их за особые цепочки действий, ритуалы, испытания, артефакты — не афишируй условия заранее. ВСЕГДА называй в системном сообщении условие получения (например «🎖 Изучен навык…», «🎭 Класс: — → …») — из него сформируется карточка знаний, чтобы потом не противоречить.
+20. Имена эффектов — человекочитаемые, на языке мира (например «Сковывающий холод», а не chill_resonance). В effect_add всегда пиши поле desc — короткое описание действия эффекта (показывается игроку и в системных сообщениях).
+20а. СТАТИСТИКА и ДОСТИЖЕНИЯ: код сам учитывает убийства, выполненные квесты и впервые открытые локации (player.progress). В значимые сюжетные моменты добавляй и свои счётчики (progress_add {{победы: 1}}) и — главное — выдавай достижения (achievement_add {{name, desc}}) за важные вехи пути, чтобы игрок отслеживал свой прогресс (/stats).
+21. Экономика и торговля: у предмета может быть цена `price` (покупка), ценность `value` (продажа), вес `weight` (кг) и — в магазине — запас `qty`. Торгуй директивами trade_buy/trade_sell (shop и item). Цены автоматически корректируются репутацией фракции магазина (высокая - дешевле покупать, выгоднее продавать); золото/запасы движок списывает и начисляет сам. ДАВАЙ предметам/товарам разумный вес `weight` (0.1-0.5 мелочь, 2-5 оружие/руда): рюкзак ограничен «🎒 Загрузка: N/Банк» из состояния, при перегрузе покупка/сбор/крафт автоматически отклоняются («🎒 Перегруз») — так и опиши поведение персонажа.
+22. Крафт: собирай ресурсы `gather`, учи рецепты `craft_learn` (ингредиенты + результат {{name, qty, value, weight, desc}}), создавай через `craft` (укажи recipe и qty). Ингредиенты спишутся сами; нехватка материала → отказ. Рецепт может требовать СТАНЦИЮ (`station`: место-мастерская — кузница, верстак, лаборатория, кухня…): задай её в рецепте и добавь `stations` в локацию (`location_add/update` с полем stations) либо флаг `station:<имя>=true`, где находится мастерство. Может требовать и ПРОФЕССИЮ (`profession` в рецепте) — это базовая логика, профессию/доступ к станции ты меняешь сам директивами. Не создавай предметы «из ниоткуда» без рецепта и материалов. У врагов и NPC может быть КОШЕЛЁК (`money` в enemy_add/npc_set — виден «🪙»): при победе (enemy_apply до 0 HP) или npc_kill монеты автоматически переходят игроку. Давай умеренные суммы (1-10 за моба, больше за главарей/сундуки).
+23. Компаньоны — спутники NPC с собственным запасом HP, уровнем, навыками и верностью (loyalty). Добавляй их директивой companion_add, урон/лечение — companion_apply, обновление — companion_update, уход — companion_remove. Используй навыки спутников в бою спутниковых навыков: они делят поле боя с игроком, но имеют свои HP.
+24. ВРЕМЯ СУТОК и ПОГОДА влияют на геймплей (см. «Влияние среды» в состоянии): ночь/туман снижают видимость, гроза/буря опасны на открытой местности и могут ломать переправы, мороз/жара влияют на выносливость и т.д. Учитывай это в описаниях и в бросаемых кубах (roll.mod). Меняй время/погоду директивой time/weather по ходу игры (часы/дни идут).
+25. У NPC может быть РАСПИСАНИЕ (поле schedule у npc_set): что NPC делает в разное время суток, напр. {{"ночь": "таверна закрыта"}}. В состоянии мира рядом с NPC будет «(расписание: …)» под текущее время — учитывай его: ночью таверна закрыта, рынок работает днём, страж у ворот ночью спит и т.п. Не открывай закрытые по расписанию места и не заставляй NPC действовать вопреки расписанию, если игрок не изменил ситуацию.
+
+{lore_rules}
+{fmt_head}
+<<ENGINE>>{{"roll": {{"expr": "d20", "mod": 2, "dc": 15, "label": "взлом замка"}}}}
+<<ENGINE>>{{"player": {{"hp": -5, "mp": -3, "gold": 10, "xp": 50}}}}
+<<ENGINE>>{{"add_item": [{{"name": "Зелье", "qty": 1, "desc": "Восстанавливает 20 HP"}}], "remove_item": [{{"name": "Зелье", "qty": 1}}]}}
+<<ENGINE>>{{"enemy_apply": {{"id": "goblin", "hp": -4}}, "enemy_add": {{"id": "wolf", "name": "Волк", "hp": 25}}}}
+<<ENGINE>>{{"enemy_remove": "goblin"}}   — убрать уже имеющегося врага (побеждён/убежал)
+<<ENGINE>>{{"quest": {{"id": "find_book", "title": "Найти гримуар", "desc": "…", "status": "active"}}, "quest_done": "find_book"}}
+<<ENGINE>>{{"quest": {{"id": "find_book", "progress": "подняться в башню"}}}}   — обновить этап/прогресс существующего квеста (опциональное поле progress для ветвления сюжета)
+<<ENGINE>>{{"quest_advance": {{"id": "find_book"}}}}   — перейти на следующий шаг многоступенчатого квеста (если заданы steps)
+<<ENGINE>>{{"quest_choose": {{"id": "find_book", "branch": "уговорить"}}}}   — зафиксировать выбранную игроком ветку
+<<ENGINE>>{{"quest_done": {{"id": "find_book", "next": {{"id": "next_quest", "title": "…"}}}}}}   — выполнить квест и сразу начать следующий (цепочка действие 1→2→3)
+<<ENGINE>>{{"npc_set": {{"id": "barman", "name": "Трактирщик", "mood": "радушен", "alive": true}}}}
+<<ENGINE>>{{"npc_set": {{"id": "tavern", "name": "Таверна «У камина»", "faction": "", "schedule": {{"ночь": "закрыта, хозяин спит", "день": "открыта, подают эль"}}}}}}   — расписание NPC по времени суток
+<<ENGINE>>{{"location_add": {{"id": "cellar", "name": "Подвал", "desc": "Тёмный, пахнет плесенью"}}, "move": "cellar"}}
+<<ENGINE>>{{"flag": {{"name": "door_open", "value": true}}, "time": "ночь", "weather": "гроза"}}
+<<ENGINE>>{{"game_over": true}}   — завершить игру (смерть игрока/финал сюжета)
+Можно комбинировать: <<ENGINE>>{{"player": {{"hp": -3}}, "flag": {{"name": "trapped", "value": true}}}}
+
+<<ENGINE>>{{"class": "Воин", "profession": "Кузнец", "skill": {{"name": "взлом", "value": 1}}}}
+<<ENGINE>>{{"class": {{"name": "Лёд-жрец", "skill": {{"name": "Ледяной шип", "rank": "D", "kind": "магический", "mp_cost": 6}}}}}}
+<<ENGINE>>{{"player": {{"stats": {{"сила": 1}}}}, "title": "Ветеран", "reputation": {{"гильдия воров": 2}}}}
+<<ENGINE>>{{"player": {{"actions": {{"кузнечное дело": 1, "алхимия": 1}}}}}}
+<<ENGINE>>{{"race_change": "эльф"}}   или   <<ENGINE>>{{"race_change": {{"name": "полу-элементаль", "bonus": {{"интеллект": 2}}, "passive": {{"name": "Воздушная сущность", "desc": "невесомость, +20% к уклонению"}}}}}}
+<<ENGINE>>{{"class_rank": "C", "class_evolve": "Рыцарь", "secondary_class": "Вор"}}
+<<ENGINE>>{{"profession": "Алхимик"}}   или   <<ENGINE>>{{"profession": {{"name": "Кузнец", "buff": {{"сила": 2}}}}}}
+<<ENGINE>>{{"skill_add": {{"name": "Огненный шар", "rank": "B", "kind": "магический", "mp_cost": 5}}, "skill_rank": {{"name": "Огненный шар", "rank": "A"}}}}
+<<ENGINE>>{{"effect_add": {{"name": "отравлен", "turns": 3, "damage": 2, "kind": "состояние", "stacks": 2, "desc": "яд в крови"}}, "effect_remove": {{"name": "отравлен"}}}}
+<<ENGINE>>{{"add_item": [{{"name": "Зелье лечения", "qty": 1, "value": 15, "desc": "Восстанавливает 20 HP"}}]}}
+<<ENGINE>>{{"shop_add": {{"id": "bazaar", "name": "Гильдейская лавка", "owner": "Трактирщик", "faction": "гильдия воров", "items": [{{"name": "Зелье лечения", "price": 25, "qty": 5}}, {{"name": "Верёвка", "price": 8, "qty": 3}}]}}}}
+<<ENGINE>>{{"trade_buy": {{"shop": "bazaar", "item": "Зелье лечения", "qty": 2}}}}   — купить (спишет золото, цена зависит от репутации)
+<<ENGINE>>{{"trade_sell": {{"shop": "bazaar", "item": "Старый кинжал", "qty": 1}}}}   — продать (начислит золото по value предмета)
+<<ENGINE>>{{"faction_add": {{"id": "guild", "name": "Гильдия воров", "desc": "тёмные воры и контрабандисты", "relations": {{"guard": "враг", "merch": "союз"}}}}}}   — описать фракцию и её связи; ступени репутации — в правилах 26.
+<<ENGINE>>{{"gather": {{"item": "Железная руда", "qty": 2}}}}   — собрать ресурс
+<<ENGINE>>{{"craft_learn": {{"id": "sword", "name": "Ковать меч", "ingredients": [{{"name": "Железная руда", "qty": 2}}, {{"name": "Уголь", "qty": 1}}], "result": {{"name": "Железный меч", "qty": 1}}}}}}
+<<ENGINE>>{{"craft": {{"recipe": "sword", "qty": 1}}}}   — создать предмет по рецепту (ингредиенты спишутся сами)
+<<ENGINE>>{{"companion_add": {{"id": "wolf_friend", "name": "Серый", "hp": 30, "level": 1, "skills": {{"Укус": {{"rank": "C", "kind": "физический"}}}}, "loyalty": 10}}}}
+<<ENGINE>>{{"companion_apply": {{"id": "wolf_friend", "hp": -8}}}}   — урон/лечение спутника
+<<ENGINE>>{{"companion_update": {{"id": "wolf_friend", "loyalty": 5}}}}
+<<ENGINE>>{{"companion_remove": {{"id": "wolf_friend"}}}}
+
+{fmt_tail}
+
+{format_state(setting)}"""
+
+    if use_tools:
+        # в tools-режиме убираем объёмные примеры с маркером <<ENGINE>> (путают модель;
+        # правильная форма — вызов инструмента game_engine)
+        prompt = "\n".join(l for l in prompt.splitlines() if "<<ENGINE>>" not in l)
+    return prompt
+
+
+def format_memory(events: list[dict]) -> str:
+    """Последние не-свёрнутые события: «Игрок: ...» / «Рассказчик: ...»."""
+    out = []
+    for e in events:
+        if e["role"] == "player":
+            out.append(f"Игрок: {e['content']}")
+        elif e["role"] == "narrator":
+            out.append(f"Рассказчик: {e['content'][:600]}")
+    return "\n".join(out)
+
+
+# ══════════════════════════════════════════════════════════════
+# Карточки сущностей (персональная память о персонажах/местах)
+# ══════════════════════════════════════════════════════════════
+
+
+def feedback_style_note(world_id: int) -> str:
+    """По последним оценкам (feedback) возвращает короткий стилевой намёк или ''."""
+    evs = [e for e in db.get_events(world_id) if e.get("feedback")]
+    if not evs:
+        return ""
+    recent = evs[-6:]
+    likes = sum(1 for e in recent if e["feedback"] == 1)
+    dislikes = sum(1 for e in recent if e["feedback"] == -1)
+    if likes == 0 and dislikes == 0:
+        return ""
+    if dislikes > likes:
+        return "[Обратная связь игрока] Игроку недавно НЕ понравились твои ответы. Измени стиль: " \
+               "короче и конкретнее, меньше общих слов и повторов, продвигай действие вперёд."
+    if likes > 0:
+        return "[Обратная связь игрока] Последние ответы игроку понравились — продолжай в том же духе " \
+               "(живость и стиль как сейчас), но не повторяйся дословно."
+    return ""
+
+
+def build_messages(world: dict, setting: dict, action: str,
+                   recent_events: list[dict], summaries: list[dict],
+                   rag_chunks: list[str], entity_cards: list[dict] | None = None,
+                   persona: str | None = None, use_tools: bool = False,
+                   lore: list[str] | None = None) -> list[dict]:
+    sys_prompt = build_system_prompt(world, setting, persona=persona, use_tools=use_tools)
+    fb_note = feedback_style_note(world["id"])
+    if fb_note:
+        sys_prompt += "\n\n" + fb_note
+
+    mem_blocks = []
+    if lore:
+        mem_blocks.append("[ЛОР МИРА — факты вселенной (из библиотеки мира, актуально)]\n"
+                          + "\n\n".join(lore))
+    if summaries:
+        # Сводок в промпт — больше при большом контексте (жалоба: «всегда 9 фактов»):
+        # окно 262к позволяет показывать историю, а не последние 3 сводки.
+        from .narrator import dynamic_memory_k
+        max_summaries = dynamic_memory_k(world, 3, 10)
+        smry_text = "\n\n".join(f"Сводка {i + 1}: {s['content']}"
+                                for i, s in enumerate(summaries[-max_summaries:]))
+        mem_blocks.append(f"[ПРОШЛЫЕ СОБЫТИЯ (сводки)]\n{smry_text}")
+    if rag_chunks:
+        mem_blocks.append("[ВОСПОМИНАНИЯ (из долгосрочной памяти)]\n"
+                          + "\n---\n".join(f"• {c[:400]}" for c in rag_chunks))
+    if entity_cards:
+        mem_blocks.append("[КАРТОЧКИ СУЩНОСТЕЙ — кто/что рядом и важно]\n"
+                          + format_entity_cards(entity_cards))
+
+    parts = [sys_prompt]
+    if mem_blocks:
+        parts.append("\n\n".join(mem_blocks))
+    recent = format_memory(recent_events)
+    if recent:
+        parts.append(f"[НЕДАВНЯЯ ИСТОРИЯ]\n{recent}")
+    parts.append(f"[ДЕЙСТВИЕ ИГРОКА]\n{action}")
+
+    return [{"role": "system", "content": "\n\n".join(parts)}]
+
+
+# ══════════════════════════════════════════════════════════════
+# Директивы <<ENGINE>>: парсинг + применение
+# ══════════════════════════════════════════════════════════════
+ENGINE_RE = re.compile(r"<{2}ENGINE>{2}[ \t]*(\{.*\})?", re.DOTALL)
+# Модель в tools-режиме иногда «выпевает» вызов как текст вместо настоящего tool_call:
+#   game_engine({"roll": ...})  /  game_engine { ... }  /  game_engine(...)
+GAME_ENGINE_TEXT_RE = re.compile(r"game_engine\s*\(?\s*(\{.*\})\s*\)?", re.DOTALL | re.IGNORECASE)
+
+
+# начало «служебной» части ответа: сюда уже не нужны прожимальные токены игроку
+_ENGINE_START = re.compile(r"(<<ENGINE>>|game_engine\s*\()", re.IGNORECASE)
+
+
+def find_engine_start(reply: str) -> int:
+    """Индекс, где начинается служебный блок механики (<<ENGINE>> или game_engine(...)),
+    либо -1, если его нет. Используется в стриминге, чтобы не показывать механику игроку."""
+    m = _ENGINE_START.search(reply)
+    return m.start() if m else -1
+
+
+def split_engine(reply: str) -> tuple[str, Optional[dict]]:
+    """Вырезает механику из ответа и возвращает (чистый текст, директивы JSON или None).
+    Поддерживает три формата:
+      1) <<ENGINE>>{...}            (локальный prompt-формат)
+      2) game_engine({...}) текстом (model в tools-режиме «выпевает» вызов вместо tool_call)
+      3) один голый JSON-блок {...} в конце ответа (литрпг/аудит)"""
+    text = reply.strip()
+    if not text:
+        return text, None
+
+    # 1) <<ENGINE>>{...}
+    m = re.search(r"<<ENGINE>>", text, re.DOTALL)
+    if m:
+        clean = text[:m.start()].strip()
+        rest = text[m.end():].strip()
+        try:
+            return clean, json.loads(rest)
+        except Exception:
+            return clean, _fallback_parse(rest)
+
+    # 2) game_engine({...}) текстом — вырезаем блок, JSON кладём в директивы
+    gm = GAME_ENGINE_TEXT_RE.search(text)
+    if gm:
+        clean = (text[:gm.start()] + text[gm.end():]).strip()
+        try:
+            return clean, json.loads(gm.group(1))
+        except Exception:
+            return clean, _fallback_parse(gm.group(1))
+
+    # 3) один голый {...} (всегда в самом конце) — например <<ENGINE>> сам не пришёл,
+    #    а модель вернула чистый JSON блоком. Не трогаем текст, где `{}` внутри предложения.
+    tm = re.search(r"\{.*\}", text, re.DOTALL)
+    if tm and tm.end() >= len(text) - 3 and tm.start() >= len(text) // 2:
+        try:
+            d = json.loads(tm.group(0))
+            if isinstance(d, dict):
+                return text[:tm.start()].strip(), d
+        except Exception:
+            pass
+    return text, None
+
+
+def _fallback_parse(text: str) -> Optional[dict]:
+    """Ленивый парсер вида key:value; key:{...} — запасной вариант."""
+    out: dict[str, Any] = {}
+    for m in re.finditer(r'(\w+)\s*[:=]\s*("(?:[^"\\]|\\.)*"|[-\d\.]+|true|false|null|\{.*?\}|\[.*?\])', text):
+        k, v = m.group(1), m.group(2)
+        try:
+            v = json.loads(v)
+        except Exception:
+            v = v.strip('"')
+        if k not in out:
+            out[k] = v
+    return out or None
+
+
+def parse_tool_args(args):
+    """Нормализует JSON-аргументы инструмента game_engine.
+    1) вложенные JSON-строки парсятся; 2) «голые» дельты игрока (gold/hp/...) оборачиваются в player;
+    3) add_item/remove_item из строки/dict приводятся к [{name, qty}]."""
+    def walk(x):
+        if isinstance(x, str):
+            s = x.strip()
+            if s.startswith(("{", "[")):
+                try:
+                    return walk(json.loads(s))
+                except Exception:
+                    return x
+            return x
+        if isinstance(x, dict):
+            return {k: walk(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [walk(v) for v in x]
+        return x
+    if isinstance(args, str):
+        try:
+            d = json.loads(args)
+        except Exception:
+            return {}
+    else:
+        d = args
+    d = walk(d) if isinstance(d, dict) else {}
+    bare = {"gold", "hp", "mp", "xp", "stats", "actions"}
+    if any(k in d for k in bare) and "player" not in d:
+        d["player"] = {k: d.pop(k) for k in list(d) if k in bare}
+    for k in ("add_item", "remove_item"):
+        if k in d:
+            v = d[k]
+            if isinstance(v, str):
+                d[k] = [{"name": v, "qty": 1}]
+            elif isinstance(v, dict):
+                item = dict(v)
+                if "item" in item:
+                    item["name"] = item.pop("item")
+                if "count" in item:
+                    item["qty"] = item.pop("count")
+                d[k] = [item]
+    return d
+
+
+_MECH_WORDS = (
+    "покуп", "плат", "отдам", "прода", "золот", "монет", "деньг", "купл", "цен",
+    "удар", "атак", "бьёт", "бью", "стреля", "нанеси", "урон", "леч", "вылеч", "зель", "эликсир",
+    "напад", "напада", "аттак", "убить", "ранить", "бой", "деру", "дуэль", "схват", "хват",
+    "нож", "оружие", "меч", "кинжал", "пистол", "удари", "атаку", "замах", "выпад",
+    "возьм", "беру", "подбер", "забрать", "карман", "кошелёк", "краду", "вору", "стащ", "сумк","мешок",
+    "откро", "сундук", "дверь", "дверц", "люк", "замок", "взлом",
+    "иду", "пойду", "направляюсь", "вхожу", "входим", "следу", "перехожу", "входит", "идти",
+    "скрыт", "пряч", "проверк", "пыта", "убежда", "торг", "бартер", "обмен",
+    "квест", "задани", "нанимаю", "эффект", "отрав", "благослов", "восстанов",
+    "отдых", "сплю", "выпь", "ем", "съе", "куша", "хил", "мана", "выносливость",
+)
+
+
+def mech_trigger(text: str) -> bool:
+    """Эвристика: стоит ли запускать аудит-проход директив (действие явно тянет механику)."""
+    t = (text or "").lower()
+    return any(w in t for w in _MECH_WORDS)
+
+
+# Ключи директив, которые реально меняют механическое состояние (исключая чистые метаданные).
+# Если действие тянет механику (mech_trigger), а в вернувшихся директивах нет НИ ОДНОГО такого ключа —
+# запускаем аудит, чтобы добрать пропущенную механику (в т.ч. когда модель выдала только roll).
+_EFFECT_KEYS = frozenset({
+    "player", "race_change", "class", "class_rank", "class_evolve", "secondary_class",
+    "secondary_rank", "profession", "skill_add", "skill_rank", "skill_remove", "title",
+    "reputation", "effect_add", "effect_remove", "add_item", "remove_item", "enemy_add",
+    "enemy_apply", "enemy_remove", "quest", "quest_done", "quest_advance", "quest_choose",
+    "npc_set", "npc_kill", "location_add", "location_update", "move", "flag", "time",
+    "weather", "game_over", "shop_add", "shop_remove", "shop_update", "trade_buy",
+    "trade_sell", "gather", "craft_learn", "craft_remove", "craft", "companion_add",
+    "companion_remove", "companion_update", "companion_apply", "ability_add", "ability_remove",
+    "ability_update", "ability_use", "progress_add", "achievement_add",
+})
+
+
+def has_effectful_directives(d: dict) -> bool:
+    """Есть ли в директивах хоть одно реальное механическое последствие (кроме самого roll)."""
+    if not isinstance(d, dict):
+        return False
+    return any(k in _EFFECT_KEYS for k in d)
+
+
+def audit_messages(setting: dict, text: str, reply: str = "") -> list[dict]:
+    """Компактный промпт для аудит-прохода: без полного контекста — только базовое состояние
+    (чтобы модель считала ДЕЛЬТЫ, а не абсолюты) + критичные факты (живые/мёртвые NPC, флаги) +
+    последний обмен игрок/рассказчик. Помимо механики, судья проверяет, что директивы не
+    противоречат установленным фактам (см. «Аудит логики.txt», Стратегия А/п.1)."""
+    p = setting.get("player") or {}
+    inv = ", ".join(i.get("name", "") for i in (p.get("inventory") or [])[:8]) or "пусто"
+    cur = (
+        f"Текущее состояние игрока: золото {p.get('gold', 0)}, HP {p.get('hp', 0)}/{p.get('max_hp', 0)}, "
+        f"MP {p.get('mp', 0)}/{p.get('max_mp', 0)}, уровень {p.get('level', 1)}, "
+        f"класс «{p.get('class') or 'нет'}», професс. «{p.get('profession') or 'нет'}», инвентарь: {inv}."
+    )
+    # Критичные факты-истины мира: жив/мёртв NPC, флаги. Судья должен учитывать их при механиках.
+    npc = setting.get("npc") or {}
+    npc_facts = []
+    for k, v in list(npc.items())[:12]:
+        name = (v.get("name") or k) if isinstance(v, dict) else k
+        alive = v.get("alive", True) if isinstance(v, dict) else True
+        npc_facts.append(f"{name} — {'мёртв' if not alive else 'жив'}")
+    flags = setting.get("flags") or {}
+    flag_line = "; ".join(f"{k}={v}" for k, v in list(flags.items())[:12]) if flags else "нет"
+    facts_line = []
+    if npc_facts:
+        facts_line.append("NPC: " + "; ".join(npc_facts))
+    facts_line.append("Флаги-истины: " + flag_line)
+    # Уже существующие враги и их HP (чтобы аудит применял дельты к верным целям)
+    enemies = setting.get("enemies") or {}
+    enemy_line = ""
+    if enemies:
+        es = [f"{v.get('name', k)}({v.get('hp',0)}/{v.get('max_hp',0)} HP)" for k, v in list(enemies.items())[:8]]
+        enemy_line = "\nВраги в бою: " + "; ".join(es)
+    critical = "\n".join(facts_line) + enemy_line
+    user = f"{text}"
+    if reply:
+        user += f"\n\nОтвет рассказчика (что случилось в сюжете): {reply[:900]}"
+    return [
+        {"role": "system", "content": (
+            "Ты — движок RPG. По действию игрока и ответу рассказчика определи механические изменения. "
+            "Верни ТОЛЬКО валидный JSON с директивами (как для game_engine). Все числа — ДЕЛЬТЫ относительно текущего состояния "
+            "(например gold: -3 значит минус 3). Если механики нет — верни {}. "
+            "Ключи: player ({gold, hp, mp, xp, stats, actions, level}), race_change, class, class_rank, class_evolve, secondary_class, secondary_rank, profession, "
+            "skill_add, skill_rank, skill_remove, title, reputation, effect_add (name — человекочитаемо, desc — описание), effect_remove, "
+            "add_item, remove_item, enemy_add, enemy_apply, enemy_remove, quest, quest_done, quest_advance, quest_choose, npc_set, npc_kill, "
+            "location_add, location_update, move, flag, time, weather, game_over, "
+            "shop_add, shop_remove, shop_update, trade_buy, trade_sell, gather, craft_learn, craft_remove, craft, "
+            "companion_add, companion_remove, companion_update, companion_apply, "
+            "ability_add, ability_remove, ability_update, ability_use, progress_add, achievement_add, "
+            "roll ({expr, mod, dc, label}). "
+            "БОЙ: если рядом с игроком появляется противник, которого ещё нет во «Враги в бою» — заведи его enemy_add {{id, name, hp, dmg}} "
+            "(и может enemy_apply с уроном за этот ход). Задавай врагу БАЗОВУЮ HP/урон как если бы он был \"нормальный для этой локации\" с точки зрения сеттинга — "
+            "движок автоматически отмасштабирует его силу под уровень игрока (см. ⚖️ Сложность в состоянии). Урон игрока по врагу — enemy_apply (ДЕЛЬТА, минус), урон по игроку — "
+            "player {{hp: -N}}. Не удаляй врага (enemy_remove), пока его не добили\nили не убили в тексте. "
+            "Если предмет/эффект игрока должен дать механическое последствие (урон, золото, бафф) по описанию — "
+            "включи его (player {{gold/hp}}, effect_add). "
+            "Учитывай КРИТИЧНЫЕ ФАКТЫ ниже: не выдавай директивы, противоречащие им "
+            "(например не оживляй мёртвого NPC, не открывай уже сломанную дверь)."
+        )},
+        {"role": "user", "content": f"{cur}\n{critical}\n\nДействие игрока: {user}\nВерни JSON директив."},
+    ]
+
+
+# Судья логики (LLM-as-a-Judge, фоновая проверка противоречий)
+# Стратегия Б из «Аудит логики.txt»: запускается асинхронно после хода, не блокирует ответ;
+# найденную ошибку модели НЕ переписывает, а оформляет системным сообщением-«искажением
+# реальности» (сюжетный поворот) — ошибка ИИ становится фичей мира (мистика/безумие/иллюзия).
+# ══════════════════════════════════════════════════════════════
+def judge_messages(setting: dict, action: str, reply: str, lang: str = "ru") -> list[dict]:
+    """Компактный промпт судьи: критичные факты мира + биография/роль персонажа + последний обмен.
+    Помимо фактов-противоречий (вердикт+twist) судья сверяет БИОГРАФИЮ с расой/классом/профессией/
+    навыками и, если есть грубое несоответствие, предлагает корректировку. Возвращает сообщения LLM."""
+    lang_instr = ("На русском языке." if lang == "ru" else "In English.")
+    p = setting.get("player") or {}
+
+    # Критичные факты для сверки: жив/мёртв NPC, флаги-истины, текущая локация, ключевые цифры
+    npc = setting.get("npc") or {}
+    npc_facts = []
+    for k, v in list(npc.items())[:14]:
+        name = (v.get("name") or k) if isinstance(v, dict) else k
+        alive = v.get("alive", True) if isinstance(v, dict) else True
+        location = v.get("location") if isinstance(v, dict) else None
+        npc_facts.append(f"{name} — {'мёртв' if not alive else 'жив'}" +
+                         (f" (в локации: {location})" if location else ""))
+    npc_line = "; ".join(npc_facts) if npc_facts else "нет"
+
+    flags = setting.get("flags") or {}
+    flag_line = "; ".join(f"{k}={v}" for k, v in list(flags.items())[:14]) if flags else "нет"
+
+    loc = (setting.get("locations") or {}).get(setting.get("current_location", "start"), {})
+    # Портрет персонажа (биография + роль) — судья сверяет их согласованность
+    skills = p.get("skills") or {}
+    skills_line = "; ".join(f"{n} ({sk.get('rank','F') if isinstance(sk,dict) else sk})"
+                             for n, sk in list(skills.items())[:10]) if skills else "нет"
+    inv = p.get("inventory") or []
+    inv_line = "; ".join(str(it.get("name") if isinstance(it, dict) else it) for it in inv[:20]) if inv else "пусто"
+    bio = (p.get("identity") or "").strip()[:1400]
+    facts = (
+        f"ПЕРСОНАЖ: {p.get('name','Путник')} | HP {p.get('hp',0)}/{p.get('max_hp',0)} | Золото {p.get('gold',0)}"
+        f" | Локация: {loc.get('name','?')}\n"
+        f"РОЛЬ: раса «{p.get('race') or '—'}», класс «{p.get('class') or '—'}», "
+        f"профессия «{p.get('profession') or '—'}», уровень {p.get('level',1)}\n"
+        f"НАВЫКИ: {skills_line}\n"
+        f"ИНВЕНТАРЬ: {inv_line}\n"
+        f"БИОГРАФИЯ: {bio or '—'}\n"
+        f"ЖИВЫЕ/МЁРТВЫЕ NPC: {npc_line}\n"
+        f"ФЛАГИ-ИСТИНЫ: {flag_line}"
+    )
+    system = (
+        "Ты — строгий, но аккуратный судья логики текстовой RPG. Твои ДВЕ задачи (возврат — ОДИН валидный JSON):\n"
+        "ЗАДАЧА 1 — противоречия фактам: сверь последний ответ рассказчика с фактами мира (кто жив/мёртв, "
+        "флаги-истины, локация, ИНВЕНТАРЬ). Лови только ГРУБЫЕ противоречия: мёртвый NPC говорит, сломанная "
+        "дверь открыта, персонаж в двух местах, персонаж достаёт/использует предмет, которого у него НЕТ в "
+        "ИНВЕНТАРЕ (гранату, оружие, снадобье и т.п.). Не будь педантичным и не «души» креативность: "
+        "необычные, но непротиворечивые повороты — норма; но нельзя позволять герою доставать из воздуха "
+        "предметы (гранаты/реактор/бомбу), которых в ИНВЕНТАРЕ нет — это грубое противоречие.\n"
+        "ЗАДАЧА 2 — согласованность персонажа: сверь БИОГРАФИЮ с РОЛЬЮ (раса/класс/профессия/уровень) и НАВЫКАМИ. "
+        "Если роль/навыки явно противоречат биографии и миру (напр. в современном мире у персонажа фэнтезийная раса, "
+        "или по биографии персонаж новичок, а уровень 99 / навыки ветерана) — предложи корректировку РОЛИ/навыков в "
+        "духе биографии и мира. Если всё согласовано — corrections пустой.\n"
+        "ВЕРНИ ТОЛЬКО валидный JSON, без пояснений:\n"
+        "{\"verdict\": \"ok\", \"corrections\": {}} если противоречий фактам нет,\n"
+        "{\"verdict\": \"issue\", \"issue\": \"<короткое описание противоречия>\", "
+        "\"twist\": \"<1-2 предложения на языке мира, оборачивающие ошибку в атмосферный сюжетный поворот, "
+        "не отрицая случившееся грубо>\", \"corrections\": {...}}\n"
+        "corrections — опционально авто-правка согласованности: {\"race\": \"...\", \"class\": \"...\", \"profession\": \"...\", \"level\": <целое>, \"skills\": [...]} "
+        "(skills — массив объектов {name, rank} плюс опциональные kind, desc, mp_cost; пустые/ненужные поля опускай; если нечего править — {}). "
+        f"{lang_instr}"
+    )
+    user = f"ДАННЫЕ МИРА И ПЕРСОНАЖА:\n{facts}\n\nДЕЙСТВИЕ ИГРОКА: {action}\n\nОТВЕТ РАССКАЗЧИКА: {reply[:1400]}\n\nВынеси вердикт и, при необходимости, correction."
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _apply_judge_corrections(setting: dict, corr: dict) -> list[str]:
+    """Применяет корректировку согласованности от судьи к состоянию игрока (раса/класс/профессия/уровень/навыки).
+    Возвращает читаемые системные сообщения о внесённых изменениях."""
+    msgs: list[str] = []
+    if not isinstance(corr, dict) or not corr:
+        return msgs
+    p = setting.get("player") or {}
+    ensure_player_schema(p)
+    race = str(corr.get("race") or "").strip()
+    if race and (p.get("race") or "").strip() != race:
+        msgs += apply_directives(setting, {"race_change": race})
+    cls = str(corr.get("class") or "").strip()
+    if cls and (p.get("class") or "").strip() != cls:
+        msgs += apply_directives(setting, {"class": cls})
+    prof = str(corr.get("profession") or "").strip()
+    if prof and (p.get("profession") or "").strip() != prof:
+        msgs += apply_directives(setting, {"profession": prof})
+    try:
+        lv = int(corr.get("level") or 0)
+        if 1 <= lv <= 99 and lv != (p.get("level") or 1):
+            p["level"] = lv
+            # восстановить HP/MP при смене уровня, как при обычной прокачке
+            p["hp"] = p.get("max_hp", 100)
+            p["mp"] = p.get("max_mp", 50)
+            msgs.append(f"Уровень: {p.get('level',1)}")
+    except Exception:
+        pass
+    sk = corr.get("skills")
+    if isinstance(sk, list) and sk:
+        for s in sk:
+            if isinstance(s, dict) and str(s.get("name") or "").strip():
+                sn = str(s["name"]).strip()[:60]
+                p.setdefault("skills", {})[sn] = {"rank": norm_rank(s.get("rank") or "F"),
+                                                    "kind": str(s.get("kind") or "спец")[:60],
+                                                    "desc": str(s.get("desc") or ""),
+                                                    "mp_cost": int(s.get("mp_cost", 0) or 0)}
+                msgs.append(f"Навык: {sn}")
+    recalc_derived(p)
+    return msgs
+
+
+# ══════════════════════════════════════════════════════════════
+# Провидение (Божественный арбитр) — ручное воззвание игрока.
+# Игрок считает, что рассказчик ошибся (не выдал предмет, не списал урон/золото и т.п.), и
+# «воззывает к божеству». Та же модель, но ОТДЕЛЬНЫЙ строгий промпт: она проверяет, была ли
+# ошибка на самом деле, и если да — придумывает сюжетное объяснение («искажение реальности»)
+# и возвращает корректирующие директивы, которые применяются штатным движком.
+# Это мета-уровень: не заменяет рассказчика, а чинит мир поверх, превращая отладку в игровую
+# механику. Кулдаун ограничивается в роутере (worlds.py), чтобы не было «попросить у богов золото».
+# ══════════════════════════════════════════════════════════════
+def divine_messages(world: dict, setting: dict, complaint: str,
+                    action: str = "", reply: str = "", lang: str = "ru") -> list[dict]:
+    """Строгий промпт Провидения: текущее состояние мира + жалоба игрока + последний обмен
+    (действие рассказа троковые и ответ) , чтобы судья понял, о какой ошибке речь.
+    Возвращает сообщения LLM; ответ — JSON {"declined":bool, "twist":str, "directives":{...}}."""
+    lang_instr = ("На русском языке." if lang == "ru" else "In English.")
+    facts = format_state(setting)
+    exchange = ""
+    if action or reply:
+        exchange = "Последний обмен (на что игрок указывает):\n"
+        if action:
+            exchange += f"[Игрок] {action[:600]}\n"
+        if reply:
+            exchange += f"[Рассказчик] {reply[:1000]} \n"
+    system = (
+        "Ты — Абсолютный Арбитр Реальности этого игрового мира. Игрок воззвал к тебе, подозревая "
+        "разрыв в ткани мироздания (ошибку Рассказчика: не выдали предмет, не списали потраченный "
+        "ресурс, применили урон/последствия, которых не было, и т.п.).\n"
+        "Твоя задача — НЕ ругать и НЕ наказывать. Впиши исправление в сюжет, если ошибка реальна.\n"
+        "1. Сверь жалобу с состоянием мира (ИНВЕНТАРЬ, HP/MP/золото, квесты, флаги) и последним обменом. "
+        "Действительно ли есть противоречие? Будь строг и ПОСЛЕДОВАТЕЛЕН: не потакай игроку ради жалости, "
+        "различай реальную ошибку Рассказчика и простое недовольство игрока."
+        "2. Если ошибка РЕАЛЬНА (не выдали предмет, не списали ресурс, HP/золото не в балансе, или есть "
+        "настоящее противоречие установленных фактов: расхождение курсов/титулов/идентичности/положения персонажа) — "
+        "ТЫ КОРРЕКТОР МИРА: ИСПРАВЬ его, а не оставляй как есть. Придумай мистическое/техногенное/логичное объяснение "
+        "(временная петля, глюк Системы, вмешательство высших сил, двойная реальность) и ОБЯЗАТЕЛЬНО верни исправляющие "
+        "директивы (add_item/remove_item, player hp/mp/gold, effect_add/remove, quest, flag, title и т.п. — как в game_engine), "
+        "чтобы после твоего ответа мир стал СОГЛАСОВАННЫМ. При противоречии курса/титула/статуса — приведи их в порядок "
+        "директивой title (например «Студентка третьего курса…» вместо «первокурсница») или установи flag, фиксирующий "
+        "верный факт; если в инвентаре/золоте явный разрыв — добавь/спиши предметы. Объяснение — ТОЛЬКО в twist, а реальная "
+        "правка — в directives. Не подстраивайся под каприз, но РЕАЛЬНОЕ противоречие обязано быть устранено."
+        "3. Отказ (decline: true) применяй ТОЛЬКО если жалоба — каприз без фактической ошибки (просто «дай золото/предмет, "
+        "потому что хочу») или если состояние уже корректно и игрок ошибается. Не списывай подлинное противоречие на «так задумано»: "
+        "если есть расхождение — это повод ИСПРАВИТЬ, а не оправдать."
+        "4. Будь краток: twist — 1–2 предложения. Отвечай ЯЗЫКОМ МИРА (персонаж слышит «голос из пустоты»).\n"
+        "ВЕРНИ ТОЛЬКО валидный JSON без пояснений:\n"
+        "{\"decline\": false, \"twist\": \"<сюжетное объяснение>\", \"directives\": {..директивы..}}\n"
+        "или {\"decline\": true, \"twist\": \"<голос, что игрок ошибся>\", \"directives\": {}}.\n"
+        "directives — такой же формат, как game_engine: player {hp/mp/gold}, add_item/remove_item [{{name,qty,desc}}], "
+        "quest/quest_done, flag, effect_add/effect_remove, move и т.п. Все числа как у рассказчика (дельты). "
+        f"{lang_instr}"
+    )
+    user = (f"СОСТОЯНИЕ МИРА:\n{facts}\n\n" +
+            exchange +
+            f"ЖАЛОБА ИГРОКА: {complaint}\n\nВынеси решение (decline / correction) в JSON.")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+async def divine_intervene(world_id: int, world: dict, setting: dict, complaint: str,
+                           action: str = "", reply: str = "", lang: str = "ru",
+                           provider: dict | None = None) -> dict | None:
+    """Провидение: проверяет жалобу, правит мир директивами (если ошибка реальна) и возвращает:
+    {"decline": bool, "twist": str, "directives": dict, "sys_msgs": list[str], "state": setting}
+    Возвращает None при сбое модели (2 неудачных парсинга) — вызывающий покажет ошибку.
+    Меняет setting на месте (применяет корректирующие директивы)."""
+    if not (complaint or "").strip():
+        return None
+    msgs = divine_messages(world, setting, complaint, action=action, reply=reply, lang=lang)
+
+    def _parse(text: str) -> dict | None:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return None
+        try:
+            d = json.loads(m.group(0))
+        except Exception:
+            return None
+        return d if isinstance(d, dict) else None
+
+    data, text = None, None
+    try:
+        data = await llm_json_tool(
+            msgs, "divine_verdict",
+            "Решение Провидения по жалобе игрока: decline (отклонить) или correction (исправить мир).",
+            {
+                "decline": {"type": "boolean", "description": "true если ошибки игрока нет и мир корректен"},
+                "twist": {"type": "string", "description": "Системное сообщение-поворот на языке мира (1-2 предложения)"},
+                "directives": {"type": "object", "description": "Корректирующие директивы движка (если decline=false)"},
+            },
+            ["decline"], provider=provider, temperature=0.3, max_tokens=600, max_attempts=2)
+    except Exception as e:
+        log.warning("Провидение: вызов LLM (world %s): %s", world_id, e)
+        return None
+    if data is None:
+        log.warning("Провидение: невалидный JSON дважды (world %s)", world_id)
+        return None
+
+    decline = bool(data.get("decline"))
+    twist = _cut_words(str(data.get("twist") or "").strip(), 420)
+    if not twist:
+        twist = ("Ты слышишь далёкий голос: \u201cХм... В этом мире всё как должно быть, путник.\u201d"
+                 if decline else "Ты слышишь далёкий голос: \u201cПространство колеблется.\u201d")
+    sys_msgs: list[str] = []
+    directives = None
+    if not decline:
+        raw = data.get("directives")
+        directives = normalize_directives(raw) if isinstance(raw, dict) else None
+        if directives:
+            try:
+                sys_msgs = apply_directives(setting, directives)
+            except Exception as e:
+                log.warning("Провидение: применение директив (world %s): %s", world_id, e)
+                sys_msgs = []
+    return {"decline": decline, "twist": twist, "directives": directives,
+            "sys_msgs": sys_msgs, "state": setting}
+
+
+async def logic_judge(world_id: int, setting: dict, action: str, reply: str,
+                      lang: str = "ru", provider: dict | None = None) -> dict | None:
+    """Фоновая проверка логики хода. Возвращает dict с полями:
+    - twist: текст системного сообщения-«искажения» (или None, если противоречий фактам нет),
+    - corrections: авто-правка согласованности {race/class/profession/level/skills} (или None),
+    либо None, если судья не ответил/не нашёл ничего. При невалидном JSON — один повтор с
+    пониженной температурой, затем фолбэк-пропуск с логированием (не тихий)."""
+    if not (action or "").strip() or not (reply or "").strip():
+        return None
+    msgs = judge_messages(setting, action, reply, lang=lang)
+
+    def _parse(text: str) -> dict | None:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+
+    def _to_result(data: dict) -> dict | None:
+        result: dict = {"twist": None, "corrections": None}
+        corr = data.get("corrections")
+        if isinstance(corr, dict) and corr and any(corr.get(k) for k in ("race", "class", "profession", "level", "skills")):
+            result["corrections"] = corr
+        if str(data.get("verdict") or "").strip().lower() == "issue":
+            twist = _cut_words(str(data.get("twist") or "").strip(), 400)
+            if twist:
+                issue = _cut_words(str(data.get("issue") or "").strip(), 180)
+                body = twist + (f" (\u201c{issue}\u201d)" if issue else "")
+                result["twist"] = f"🌫 Реальность искажается. {body}"
+        if result["twist"] is None and result["corrections"] is None:
+            return None
+        return result
+
+    data = None
+    try:
+        data = await llm_json_tool(
+            msgs, "logic_judge_verdict",
+            "Сверка хода с фактами мира: verdict issue (противоречие) или ok; при issue — twist и issue-описание, при рассинхроне роли — corrections.",
+            {
+                "verdict": {"type": "string", "description": "ok | issue"},
+                "twist": {"type": "string", "description": "Системное сообщение-искажение реальности (если issue)"},
+                "issue": {"type": "string", "description": "Кратко что за противоречие"},
+                "corrections": {"type": "object", "description": "Авто-правка роли: race/class/profession/level/skills"},
+            },
+            ["verdict"], provider=provider, temperature=0.2, max_tokens=420, max_attempts=2,
+            temperature_retry=0.05)
+    except Exception as e:
+        log.warning("судья логики: вызов LLM (world %s): %s", world_id, e)
+        return None
+    if data is None:
+        log.warning("судья логики: невалидный JSON дважды (world %s)", world_id)
+        return None
+    return _to_result(data)
+
+
+# Инструмент (function calling) для механики — вместо маркера <<ENGINE>>
+# Используется для облачных openai_compat провайдеров; у локальных (llamacpp/ollama)
+# остаётся промпт-формат <<ENGINE>> (слабые модели калечат tool_calls).
+# ══════════════════════════════════════════════════════════════
+GAME_ENGINE_TOOL = [{"type": "function", "function": {
+    "name": "game_engine",
+    "description": (
+        "Изменяет механическое состояние мира по заключительной части ответа рассказчика: "
+        "player (hp/mp/gold/xp/stats/actions/level), race_change, class, class_rank, class_evolve, "
+        "secondary_class, secondary_rank, profession, skill_add/skill_rank/skill_remove, title, "
+        "reputation, effect_add (name — человекочитаемо, desc — описание)/effect_remove, add_item/remove_item, enemy_add/enemy_apply/enemy_remove, "
+        "quest/quest_done (можно {id, next} — авто-цепочка), quest_advance (ступень), quest_choose (ветка), npc_set/npc_kill, location_add/location_update/move, flag, time, weather, "
+        "timer_add/timer_remove (таймеры-дедлайны мира: {name, turns, desc}), equip/unequip (экипировка по слотам: у предмета должен быть slot), "
+        "needs (потребности/рассудок: {голод: {value: -10}}), board_add (доска объявлений {title, text}), faction_rank (звание во фракции {faction, rank}), "
+        "date (календарь {day, month, season}), vision_add (видение в очередь {text, hint}), trigger_vision (разыграть видение), "
+        "shop_add/shop_remove/shop_update, trade_buy/trade_sell, gather, craft_learn/craft_remove/craft, "
+        "companion_add/companion_remove/companion_update/companion_apply, "
+        "ability_add/ability_remove/ability_update/ability_use (универсальные способности — заклинания/техно/псионика), "
+        "progress_add ({убийства/квесты/локации…}), achievement_add {name, desc}, "
+        "roll (expr/mod/dc/label — бросок куба), game_over. "
+        "Когда игрок взял/нашёл/подобрал/получил предмет — обязательно используй add_item; когда использовал/выбросил — remove_item. "
+        "Аргументы — валидный JSON с любым набором этих ключей."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
+}}]
+
+
+def use_tools_for_provider(prov: dict) -> bool:
+    """Включаем tool-calling только для надёжных OpenAI-совместимых провайдеров."""
+    return bool(prov) and prov.get("enabled", True) and prov.get("id") == "openai_compat"
+
+
+async def llm_json_tool(messages: list[dict], tool_name: str, tool_desc: str,
+                        properties: dict, required: list[str],
+                        provider: dict | None = None,
+                        temperature: float = 0.4, max_tokens: int = 900,
+                        max_attempts: int = 2,
+                        temperature_retry: float | None = None) -> dict | None:
+    """Надёжный JSON-вызов LLM через function calling (tools): модель ОБЯЗАНА вернуть валидный
+    JSON-аргумент инструмента, а не текст. Для reasoner-моделей (deepseek-v4-flash и т.п.) это
+    радикально надёжнее, чем «верни JSON текстом» (иначе битый/пустой JSON, обрывы).
+
+    На повторе температура может понижаться (temperature_retry) — для судьи/провидения,
+    где второй проход должен быть «холоднее» и стабильнее.
+    Возвращает dict аргументов (распарсенный) или None после max_attempts неудач.
+    Если провайдер не поддерживает tools (не openai_compat) — фолбэк на обычный вызов с
+    ретраем и поиском {...} в тексте."""
+    from . import llm
+    tool = [{"type": "function", "function": {
+        "name": tool_name,
+        "description": tool_desc,
+        "parameters": {"type": "object", "properties": properties,
+                        "required": required, "additionalProperties": False},
+    }}]
+    for attempt in range(max_attempts):
+        temp = temperature if attempt == 0 else (temperature_retry if temperature_retry is not None else temperature)
+        try:
+            if use_tools_for_provider(provider):
+                tc_out: list[dict] = []
+                await llm.complete(messages, temperature=temp, max_tokens=max_tokens,
+                                   provider=provider, tools=tool, tool_choice="required",
+                                   tool_calls_out=tc_out)
+                if tc_out:
+                    args = (tc_out[0].get("arguments") or "").strip()
+                    if args:
+                        data = json.loads(args)
+                        if isinstance(data, dict) and data:
+                            return data
+                # пустой tool_call — повторим
+            else:
+                # фолбэк без tools: просим JSON текстом, ищем {...}
+                out = (await llm.complete(messages, temperature=temp,
+                                          max_tokens=max_tokens, provider=provider) or "").strip()
+                m = re.search(r"\{.*\}", out, re.DOTALL)
+                if m:
+                    try:
+                        data = json.loads(m.group(0))
+                        if isinstance(data, dict) and data:
+                            return data
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning("llm_json_tool(%s) попытка %d/%d: %s", tool_name, attempt + 1, max_attempts, e)
+    return None
+
+
+# ══════════════════════════════════════════════════════════════
+# Кубы
+# ══════════════════════════════════════════════════════════════
+def roll_expr(expr: str, mod: int = 0) -> dict:
+    """Бросает куб вида '2d6+1', 'd20', 'd100'. Возвращает {rolls, total}."""
+    m = re.match(r"(\d*)d(\d+)([+-]\d+)?", expr.strip().lower())
+    if not m:
+        # непонятное выражение — дефолтный d20 без бонуса
+        return {"rolls": [], "total": random.randint(1, 20) + mod}
+    count = int(m.group(1) or "1")
+    sides = int(m.group(2))
+    bonus = int(m.group(3) or "0") if m.group(3) else 0
+    rolls = [random.randint(1, sides) for _ in range(count)]
+    return {"rolls": rolls, "total": sum(rolls) + bonus + mod}
+
+
+def roll_outcome(total: int, dc: int, expr: str) -> str:
+    if total >= dc + 10:
+        return "критический успех"
+    if total >= dc:
+        return "успех"
+    if total == 1 or (expr.startswith("d20") and total <= dc - 10):
+        return "критический провал"
+    return "провал"
+
+
+# ══════════════════════════════════════════════════════════════
+async def narrate_roll(world_id: int, label: str, expr: str, mod: int, dc: int,
+                       total: int, outcome: str, lang: str = "ru",
+                       persona: str | None = None, provider: dict | None = None,
+                       action: str = "", situation: str = "") -> str:
+    """Второй проход: рассказчик описывает результат броска."""
+    lang_instr = ("на русском языке" if lang == "ru" else "in English")
+    mod_str = f" с модификатором {mod}" if mod else ""
+    # Контекст сцены: что игрок сделал и какой текст уже написан ДО броска.
+    # Без этого LLM выдумывает отдельную сцену (напр. «словесный спор» вместо ножевой атаки).
+    ctx = f"\nДействие игрока: {str(action)[:200]}" if action else ""
+    ctx += f"\nТекст сцены, развернувшейся перед броском: {str(situation)[:1200]}" if situation else ""
+    user_msg = (f"Проверка «{label}»: бросок {expr}{mod_str}, сложность {dc}. "
+                f"Итог: {total} — {outcome}\n\n"
+                f"Опиши, ЧТО ПРОИЗОШЛО в той же сцене — продолжай именно её (выше ты уже начал её описывать). "
+                f"Не меняй действие (не превращай атаку/бросок в словесный спор или другую ситуацию), не "
+                f"вводи новую сцену сбоку. Речь про ТУ ЖЕ дуэль/действие игрока.{ctx}")
+    persona_line = (persona or "").strip()
+    sys_text = (f"{persona_line} " if persona_line else "") + \
+        f"Ты — рассказчик RPG. Опиши результат броска {lang_instr}, 1–2 абзаца, " \
+        "живо, без пересказа правил. Не упоминай числа (кроме общей оценки). Продолжай ровно ту сцену, " \
+        "которая развернулась перед броском (это РЕЗУЛЬТАТ этого же действия), а не новую."
+    messages = [
+        {"role": "system", "content": sys_text},
+        {"role": "user", "content": user_msg},
+    ]
+    try:
+        return (await llm.complete(messages, temperature=0.9, max_tokens=350,
+                                   provider=provider)).strip()
+    except Exception:
+        return ""
+
+def dynamic_event_messages(world: dict, setting: dict) -> list[dict]:
+    """Компактный промпт: одно случайное событие мира в JSON (текст + директивы)."""
+    cur = format_state(setting)
+    return [
+        {"role": "system", "content": (
+            "Ты — мастер случайных событий текстовой RPG. По текущему состоянию мира придумай ОДНО короткое "
+            "событие (2–4 предложения на языке мира): нападение, смена погоды, появление NPC, находка, "
+            "слухи, происшествие в локации — естественное продолжение сеттинга и положения игрока. "
+            "НЕ решай за игрока, не двигай его и не заканчивай его историю. "
+            "Верни ТОЛЬКО валидный JSON без пояснений и без <<ENGINE>>:"
+            " {\"event\": \"текст события\", \"directives\": {\"weather\": \"...\", ...}}"
+            " Директивы — опциональные механические изменения: weather, time, enemy_add {id,name,hp,dmg}, "
+            "npc_set {id,name,mood}, add_item [{name,qty}], flag {name,value}, player {{gold: -5, hp: -3}}, "
+            "quest, effect_add. Если изменений не нужно — \"directives\": {}."
+        )},
+        {"role": "user", "content": "Текущее состояние:" + chr(10) + chr(10) + cur + chr(10) + chr(10) + "Сгенерируй одно событие."},
+    ]
+
+
+async def generate_dynamic_event(world: dict, setting: dict,
+                                 provider: dict | None = None) -> tuple[str, dict] | None:
+    """LLM генерирует случайное событие мира. Возвращает (текст события, директивы) или None."""
+    try:
+        data = await llm_json_tool(
+            dynamic_event_messages(world, setting), "dynamic_event",
+            "Одно короткое случайное событие мира: текст + опциональные механические директивы.",
+            {
+                "event": {"type": "string", "description": "Текст события на языке мира (2-4 предложения)"},
+                "directives": {"type": "object", "description": "Опциональные директивы: weather, time, enemy_add, npc_set, add_item, flag, player, quest, effect_add"},
+            },
+            ["event"], provider=provider, temperature=0.9, max_tokens=350, max_attempts=2)
+        if not data:
+            return None
+        ev = str(data.get("event") or "🌍 В мире что-то произошло…").strip()[:700]
+        raw_dir = data.get("directives")
+        if isinstance(raw_dir, list):
+            raw_dir = raw_dir[0] if raw_dir else {}
+        directives = normalize_directives(raw_dir) if isinstance(raw_dir, dict) else {}
+        return ev, directives
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+# Автономный «мастер» (сессия 25): выводит игрока из тупика.
+# ══════════════════════════════════════════════════════════════
+_STOPWORDS_RU = {"и", "в", "во", "на", "с", "за", "к", "от", "по", "о", "об", "у", "из",
+                 "я", "он", "она", "оно", "мы", "вы", "они", "это", "тот", "что", "как",
+                 "бы", "не", "а", "но", "его", "её", "их", "меня", "тебя", "мне", "тебе",
+                 "себя", "чтобы", "или", "ну"}
+
+
+def _norm_words(text: str) -> list[str]:
+    """Нормализация действия игрока в список значимых слов (нижний регистр, без знаков)."""
+    return [w for w in re.findall(r"[а-яa-zё]{3,}", (text or "").lower()) if w not in _STOPWORDS_RU]
+
+
+def _action_similar(a: str, b: str, threshold: float = 0.72) -> bool:
+    """Похожи ли два действия (доля общих значимых слов)."""
+    wa, wb = set(_norm_words(a)), set(_norm_words(b))
+    if not wa or not wb:
+        return False
+    inter = len(wa & wb)
+    return inter / max(len(wa), len(wb)) >= threshold
+
+
+def master_stuck_reason(actions: list[str], active_quests: int, turns: int) -> str | None:
+    """Детерминированный признак «застревания» игрока. Возвращает причину или None.
+    - repetition: в последних ходах игрок повторяет почти одно и то же действие;
+    - drifting: сыграно много ходов без единого активного квеста (бродит без направления).
+    Случайное/нормальное разнообразие НЕ даёт причину (чтобы «мастер» не вмешивался почём зря)."""
+    acts = [(a or "").strip() for a in (actions or []) if (a or "").strip()]
+    recent = acts[-6:]
+    if len(recent) >= 3:
+        reps = 0
+        for i in range(len(recent)):
+            for j in range(i + 1, len(recent)):
+                if _action_similar(recent[i], recent[j]):
+                    reps += 1
+        if reps >= 2:
+            return "repetition"
+    if turns >= 15 and active_quests <= 0 and len(acts) >= 3:
+        return "drifting"
+    return None
+
+
+def master_messages(setting: dict, reason: str, recent_text: str, lang: str = "ru") -> list[dict]:
+    """Промпт автономного мастера: один сюжетный шаг, выводящий игрока из тупика."""
+    cur = format_state(setting)
+    lang_instr = "На русском языке." if lang == "ru" else "In English."
+    reason_desc = {
+        "repetition": "игрок уже несколько ходов повторяет одно и то же действие (топчется на месте) — нужен свежий зацеп или сюжетный поворот",
+        "drifting": "игрок долго бродит без направления и без активных квестов — нужна новая цель/квест",
+    }.get(reason, reason)
+    return [
+        {"role": "system", "content": (
+            lang_instr + chr(10) +
+            "Ты — автономный мастер (сюжетный режиссёр) текстовой RPG. Игрок «застрял»: " + reason_desc + ". "
+            "Придумай ОДИН следующий шаг, который выводит его из тупика и даёт интересную цель: "
+            "новый квест (через директиву quest), сюжетный поворот/зацеп, слух или NPC-подсказку, "
+            "смену фокуса. НЕ решай за игрока, НЕ двигай его тело и НЕ заканчивай его историю. "
+            "Впиши поворот в сеттинг, не ломая уже установленные факты и лор. "
+            "Верни ОДИН валидный JSON без пояснений и без <<ENGINE>>, вида: "
+            "mode: quest или narrative, title: название квеста, text: короткое системное сообщение "
+            "на языке мира (2-4 предложения), directives: опциональные изменения "
+            "(например quest, npc_set, add_item, flag)"
+        )},
+        {"role": "user", "content": recent_text + chr(10) + chr(10) + cur + chr(10) + chr(10) + "Сгенерируй шаг (JSON)."},
+    ]
+
+
+async def generate_master_nudge(setting: dict, reason: str, recent_text: str, lang: str = "ru",
+                                provider: dict | None = None) -> tuple[str, dict] | None:
+    """LLM-проход автономного мастера. Возвращает (сообщение, директивы) или None при сбое."""
+    try:
+        data = await llm_json_tool(
+            master_messages(setting, reason, recent_text, lang), "master_step",
+            "Один сюжетный шаг, выводящий игрока из тупика: текст + опциональные директивы.",
+            {
+                "text": {"type": "string", "description": "Системное сообщение на языке мира (2-4 предложения)"},
+                "directives": {"type": "object", "description": "Опциональные директивы: quest, npc_set, add_item, flag"},
+            },
+            ["text"], provider=provider, temperature=0.9, max_tokens=300, max_attempts=2)
+        if not data:
+            return None
+        txt = str(data.get("text") or "").strip()[:700]
+        if not txt:
+            return None
+        raw_d = data.get("directives")
+        if isinstance(raw_d, list):
+            raw_d = raw_d[0] if raw_d else {}
+        directives = normalize_directives(raw_d) if isinstance(raw_d, dict) else {}
+        return txt, directives
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+# Боевой ИИ врагов (сессия 26): тактические решения для живых врагов.
+# ══════════════════════════════════════════════════════════════
+_ENEMY_AI_MODES = {
+    "attack": "продолжает преследовать/рваться в бой (рассказчик ведёт урон в своём ходе)",
+    "guard": "занимает оборону/держит дистанцию, выжидает момент",
+    "retreat": "отступает/сбегает — движок уберёт врага (enemy_remove)",
+    "negotiate": "пытается переговорить/сдаться/выторговать условия (флаг или NPC-сделка)",
+    "trap": "устраивает ловушку / ловит из засады (флаг подсветится при следующем действии)",
+}
+
+
+def _living_enemies(setting: dict) -> list[tuple[str, dict]]:
+    """Живые враги: [(id, enemy)] с hp>0, отсортированы по убыванию опасности (dmg)."""
+    out = []
+    for k, v in (setting.get("enemies") or {}).items():
+        if isinstance(v, dict) and int(v.get("hp", 0) or 0) > 0:
+            out.append((k, v))
+    # sorted советский: по убыванию урона, сравниваем int
+    out.sort(key=lambda kv: -int(kv[1].get("dmg", 0) or 0))
+    return out
+
+
+def enemy_ai_messages(setting: dict, recent_text: str, lang: str = "ru") -> list[dict]:
+    """Промпт боевого ИИ врагов: по живым врагам и ситуации выбери тактический ход (ОДНО решение)."""
+    enemies = _living_enemies(setting)
+    en_lines = "; ".join(
+        f"{v.get('name', k)} HP {v.get('hp',0)}/{v.get('max_hp',v.get('hp',0))} урон {v.get('dmg',0)}"
+        +(f" (намерение: {v.get('ai')})" if v.get("ai") else "")
+        for k, v in enemies)
+    if not en_lines:
+        en_lines = "—"
+    p = setting.get("player") or {}
+    st = effective_stats(p)
+    cur = format_state(setting)
+    lang_instr = "На русском языке." if lang == "ru" else "In English."
+    modes_desc = "; ".join(f"{k} — {v}" for k, v in _ENEMY_AI_MODES.items())
+    return [
+        {"role": "system", "content": (
+            lang_instr + "\nТы — боевой ИИ противника в текстовой RPG. В бою есть живые враги: " + en_lines + ". "
+            "Игрок: HP " + str(p.get('hp',0)) + "/" + str(p.get('max_hp',0)) + ", уровень " + str(p.get('level',1))
+            + ", статы " + ", ".join(f"{k} {v}" for k, v in st.items()) + ". "
+            "В решительном ДЕЙСТВИИ врагов (их ответном ходе) выбери ОДНО разумное тактическое решение "
+            "с учётом стиля игрока (агрессивен/осторожен/силён/ранен) и соотношения сил. Доступные режимы: "
+            + modes_desc + ". "
+            "Верни ОДИН валидный JSON без пояснений и без <<ENGINE>>: "
+            "{enemy: id, mode: один из режимов, note: короткое описание хода врага (2-3 предложения на языке мира), "
+            "directives: опциональные не-уроновые директивы (enemy_remove для отступления, flag, npc_set, quest, add_item)}"
+        )},
+        {"role": "user", "content": recent_text + chr(10) + chr(10) + cur + chr(10) + chr(10) + "Ход врагов (JSON):"},
+    ]
+
+
+async def generate_enemy_ai(setting: dict, recent_text: str, lang: str = "ru",
+                            provider: dict | None = None) -> tuple[str, str, str, dict] | None:
+    """LLM-проход боевого ИИ врагов. Возвращает (enemy_id, текстовое описание, mode, directives)
+    или None при сбое/невалидном ответе."""
+    try:
+        data = await llm_json_tool(
+            enemy_ai_messages(setting, recent_text, lang), "enemy_ai_move",
+            "Тактический ход врагов в бою: выбор режима + описание + не-уроновые директивы.",
+            {
+                "enemy": {"type": "string", "description": "id врага"},
+                "mode": {"type": "string", "description": "attack | guard | retreat | negotiate | trap"},
+                "note": {"type": "string", "description": "Короткое описание хода врага на языке мира (2-3 предложения)"},
+                "directives": {"type": "object", "description": "Опциональные не-уроновые директивы: enemy_remove, flag, npc_set, quest, add_item"},
+            },
+            ["enemy", "mode", "note"], provider=provider, temperature=0.85, max_tokens=260, max_attempts=2)
+        if not data:
+            return None
+        eid = str(data.get("enemy") or "").strip()
+        if not eid:
+            return None
+        mode = str(data.get("mode") or "attack").strip().lower()
+        if mode not in _ENEMY_AI_MODES:
+            mode = "attack"
+        txt = str(data.get("note") or data.get("text") or "").strip()[:700]
+        if not txt:
+            return None
+        raw_d = data.get("directives")
+        if isinstance(raw_d, list):
+            raw_d = raw_d[0] if raw_d else {}
+        directives = normalize_directives(raw_d) if isinstance(raw_d, dict) else {}
+        return eid, txt, mode, directives
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+# Сны/видения (сессия 32): память как сюжетный приём.
+# Рассказчик получает старые RAG-факты и оборачивает их в сон/галлюцинацию/сигнал.
+# ══════════════════════════════════════════════════════════════
+def vision_messages(setting: dict, vision: dict, lang: str = "ru", memories: list[str] | None = None) -> list[dict]:
+    """Промпт видения: текст-заготовка мастера + текущее состояние + факты памяти (RAG)."""
+    p = setting.get("player") or {}
+    cur = format_state(setting)
+    hint = (vision or {}).get("hint", "") if isinstance(vision, dict) else ""
+    mem = "\n".join(f"— {m[:200]}" for m in (memories or [])[:6]) or "(память пуста)"
+    lang_instr = "На русском языке." if lang == "ru" else "In English."
+    return [
+        {"role": "system", "content": (
+            lang_instr + "\nТы — Рассказчик. Игрок впадает в видение/сон/галлюцинацию/перехваченный сигнал "
+            "(память как сюжет: прошлое возвращается). Опиши его как живое сновидение: 2–4 абзаца, "
+            "атмосферно, с намёками на прошлое и будущее. Это НЕ дамп фактов — это художественный образ, "
+            "в котором звучат эхо прошлых событий (из фактов памяти ниже). Не решай за игрока, не давай "
+            "готовых ответов, оставляй тайну. Текст пиши прозой, без механики и без <<ENGINE>>."
+        )},
+        {"role": "user", "content": (
+            ("Подсказка мастера: " + str(hint)[:300] + "\n" if hint else "") +
+            "Состояние мира:\n" + cur + "\n\nФакты памяти (эхо прошлого):\n" + mem +
+            "\n\nВидение (пиши прозой):"
+        )},
+    ]
+
+
+async def generate_vision(setting: dict, vision: dict, lang: str = "ru",
+                          provider: dict | None = None,
+                          memories: list[str] | None = None) -> str | None:
+    """LLM-проход видения (отдельный вызов, не блокирует ход). Возвращает текст видения."""
+    try:
+        msgs = vision_messages(setting, vision, lang, memories=memories)
+        txt = await llm.complete(msgs, provider=provider, temperature=0.9, max_tokens=600)
+        txt = (txt or "").strip()
+        # вырезаем возможные <<ENGINE>>-хвосты
+        idx = find_engine_start(txt)
+        if idx >= 0:
+            txt = txt[:idx]
+        return txt[:1600] or None
+    except Exception:
+        return None
+
+
+_DAMAGE_KEYS = ("player", "enemy_apply", "enemy_add", "companion_apply", "effect_add")
+
+
+def _strip_damage(directives: dict) -> dict:
+    """Боевой ИИ руководит тактикой и НЕ должен наносить урон игроку/врагам напрямую
+    (это делает рассказчик в своём ходе, иначе урон задвоится). Убирает из директив
+    любые уроновые/призывающие врагов эффекты, оставляя безопасные (flag/npc/quest/add_item)."""
+    out = {}
+    for k, v in (directives or {}).items():
+        k = str(k)
+        if k in _DAMAGE_KEYS:
+            continue  # пропускаем всё, что может бить/лечить игрока или менять состав врагов
+        out[k] = v
+    return out
+
+
+def _apply_enemy_ai(setting: dict, eid: str, mode: str, directives: dict) -> list[str]:
+    """Применяет решение боевого ИИ (только тактическое/не-уроновые эффекты; урон игроку
+    ведёт рассказчик в своём ходе, чтобы не задвоился). Возвращает сообщения хода."""
+    msgs: list[str] = []
+    e = (setting.get("enemies") or {}).get(eid)
+    if not e:
+        return msgs
+    if mode == "retreat":
+        setting["enemies"].pop(eid, None)
+        msgs.append(f"🏃 {e.get('name', eid)} отступает с поля боя.")
+        return msgs
+    # как только враг попал в огонь — снимаем намерение (оно передано рассказчику через state)
+    e["ai"] = mode
+    if directives:
+        try:
+            msgs += apply_directives(setting, _strip_damage(directives))
+        except Exception:
+            pass
+    return msgs
+
+
+def event_chance(turns_since: int, every_turns: int, level: int = 1) -> float:
+    """Шанс случайного события: растёт с каждым ходом и с уровнем игрока (динамическая
+    сложность — чем выше уровень, тем чаще события), но НИКОГДА не гарантирован
+    (потолок 0.5 — гарантии нет даже у порога).
+    Базовый уровень 1 даёт прежнее поведение (для обратной совместимости)."""
+    if turns_since <= 0 or every_turns <= 0:
+        return 0.0
+    lvl = max(1, int(level or 1))
+    freq = 1.0 + (lvl - 1) * 0.05  # частота: +5% за каждый уровень сверх 1
+    return min(0.5, turns_since / (every_turns / freq))
+
+
+def suggestions_messages(setting: dict, action: str, reply: str) -> list[dict]:
+    """Промпт для ИИ-вариантов действий (зависят от ситуации, «бытовые»)."""
+    cur = format_state(setting)
+    last = f"Действие игрока: {action[:200]}" + chr(10) + f"Ответ рассказчика: {reply[:500]}"
+    return [
+        {"role": "system", "content": (
+            "Ты — соавтор игрока в текстовой RPG. По последнему обмену и текущему состоянию мира предложи "
+            "3–4 коротких варианта действий (по 3–9 слов), уместных прямо сейчас: бытовые и поведенческие "
+            "(развести костёр, проверить следы, расспросить старуху о севере), исследовательские, социальные, "
+            "немного рискованные. Пиши от первого лица («я…»), 3–9 слов, без точки в конце. НЕ предлагай "
+            "технические команды (открыть инвентарь, посмотреть карту) и НЕ "
+            "дублируй прямые механики (атаковать, купить). Это живой текст действия от лица игрока, в стиле мира. "
+            "Верни ТОЛЬКО JSON-массив строк, без пояснений."
+        )},
+        {"role": "user", "content": cur + chr(10) + chr(10) + last + chr(10) + chr(10) + "Варианты (JSON):"},
+    ]
+
+
+async def generate_suggestions(setting: dict, action: str, reply: str,
+                               provider: dict | None = None) -> list[str]:
+    """3–4 ситуационных варианта действий для кнопок; при сбое — пустой список.
+    Генерация через tools (function calling): модель обязана вернуть JSON-массив строк.
+    Для reasoner-моделей (deepseek-v4-flash и т.п.) это надёжнее, чем «верни JSON текстом»
+    (иначе битый/пустой массив — фронт держал старые заглушки сюжета)."""
+    try:
+        data = await llm_json_tool(
+            suggestions_messages(setting, action, reply), "suggest_actions",
+            "3-4 коротких варианта действий для игрока (от первого лица, 3-9 слов, без точки).",
+            {"suggestions": {"type": "array", "items": {"type": "string"},
+                              "description": "3-4 варианта действий"}},
+            ["suggestions"], provider=provider, temperature=0.9, max_tokens=600, max_attempts=2)
+        if not data:
+            return []
+        items: list[str] = []
+        def add(t: str) -> None:
+            t = re.sub(r"^[\d\s.\-–—•*\"'«»]+", "", str(t)).strip().strip('"').strip("—–•").strip()
+            if t and t not in items:
+                items.append(t[:90])
+        raw = data.get("suggestions") or data.get("actions") or []
+        if isinstance(raw, list):
+            for x in raw:
+                add(x)
+        return items[:5]
+    except Exception:
+        return []
+
+
+# Создание мира: вступительная сцена
+# ══════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════
+# Декомпозиция (сессия 30): память / лор / генерация персонажа
+# вынесены в отдельные модули. Ниже — РЕЭКСПОРТ: все внешние вызовы
+# narrator.retrieve_memory(...), narrator.apply_character(...) и т.п.
+# продолжают работать без изменений (тонкий фасад поверх новых модулей).
+# ══════════════════════════════════════════════════════════════
+from . import character_generator, lore_retriever, memory as memory_mod  # noqa: E402
+
+# ── память (RAG, сводки, карточки) ──
+memory_query_text = memory_mod.memory_query_text
+cosine_threshold = memory_mod.cosine_threshold
+# исторические приватные имена (совместимость с прежним narrator.py)
+_memory_query_text = memory_mod.memory_query_text
+_cosine_threshold = memory_mod.cosine_threshold
+retrieve_memory = memory_mod.retrieve_memory
+index_exchange = memory_mod.index_exchange
+index_summary = memory_mod.index_summary
+summarize_and_compress = memory_mod.summarize_and_compress
+_make_summary = memory_mod._make_summary
+_world_main_provider = memory_mod.world_main_provider
+compact_entity = memory_mod.compact_entity
+format_entity_cards = memory_mod.format_entity_cards
+select_relevant_entities = memory_mod.select_relevant_entities
+ensure_knowledge_cards = memory_mod.ensure_knowledge_cards
+update_entity_cards = memory_mod.update_entity_cards
+index_entities = memory_mod.index_entities
+
+# ── лор мира (библия вселенной) ──
+seed_lore_from_theme = lore_retriever.seed_lore_from_theme
+seed_lore_from_custom = lore_retriever.seed_lore_from_custom
+_chunk_lore = lore_retriever._chunk_lore
+index_lore_entry = lore_retriever.index_lore_entry
+index_all_lore = lore_retriever.index_all_lore
+retrieve_lore = lore_retriever.retrieve_lore
+
+# ── генерация персонажа и открытия ──
+generate_identity = character_generator.generate_identity
+generate_character = character_generator.generate_character
+apply_character = character_generator.apply_character
+generate_opening = character_generator.generate_opening
+_is_modern_world = character_generator._is_modern_world
+_cut_words = character_generator._cut_words

@@ -1,0 +1,19 @@
+# Опциональные движки — ставить только если нужный режим включён в .env / админке.
+# Проще всего одной командой:  scripts\setup_tts.bat   (ставит sherpa-onnx + edge-tts
+# и скачивает русский голос Piper). Локальные эмбеддинги ставятся отдельно, см. ниже.
+
+# ── Озвучка (TTS) ─────────────────────────────────────────────────────
+# edge — ⭐ стандарт проекта: облачный Microsoft Edge TTS, лучшие русские голоса,
+#        нужен интернет, качает данные по HTTPS.
+edge-tts==7.2.8
+# piper / kokoro — локальный нейро-TTS через sherpa-onnx (работает офлайн; модели
+#        скачиваются кнопкой «⬇ Скачать голос» в настройки мира или setup_tts.bat).
+#        Ставится ВМЕСТЕ с onnxruntime, поэтому в .bat, а не здесь:
+#          python -m pip install sherpa-onnx onnxruntime
+#        (проверенные версии в окружении разработки: sherpa_onnx 1.13.6, onnxruntime 1.28.0)
+
+# ── Локальные эмбеддинги (EMBEDDING_PROVIDER=local) ───────────────────
+# Полностью офлайн-память RAG без ключей: FastEmbed
+# (paraphrase-multilingual-MiniLM-L12-v2, 384-dim, кэш data/fastembed).
+# Тянет onnxruntime и ~200 МБ весов. Коллекция Chroma при этом — text_game_memory_local.
+#   python -m pip install fastembed==0.8.0

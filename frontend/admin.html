@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Админка — Text Game RPG</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  .admin-wrap { max-width: 760px; margin: 0 auto; padding: 20px 24px 40px; }
+  .admin-hero { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .admin-hero h1 { font-size: 22px; margin: 0; }
+  .admin-panel { background: var(--bg2); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-top: 16px; }
+  .admin-panel h2 { margin: 0 0 6px; font-size: 15px; }
+  .admin-panel > p { margin: 0 0 12px; font-size: 12.5px; }
+  .admin-panel label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); margin-bottom: 10px; }
+  .admin-panel label.check { flex-direction: row; align-items: center; color: var(--text); }
+  .admin-panel input[type="text"], .admin-panel input[type="password"], .admin-panel select { width: 100%; }
+  .badge { font-size: 11px; color: var(--accent2); border: 1px solid currentColor; border-radius: 5px; padding: 1px 6px; margin-left: 6px; }
+  .note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  .btn-bar { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+  #save-state { min-height: 18px; font-size: 13px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="admin-wrap">
+  <div class="admin-hero">
+    <h1>⚙ Админка — настройки LLM</h1>
+    <a href="/" class="btn small">← В игру</a>
+  </div>
+  <p class="muted">Глобальные настройки провайдеров и генерации. Пустое поле = вернуть значение из .env.
+     API-ключи при пустом поле не меняются.</p>
+
+  <div class="admin-panel">
+    <h2>🧠 Основная модель (рассказчик)</h2>
+    <p class="muted">Если выбранная модель недоступна — новый мир не создастся (ошибка 503).</p>
+    <label>Провайдер
+      <select id="a-main-provider">
+        <option value="llamacpp">llama.cpp — локальный (127.0.0.1:8080)</option>
+        <option value="ollama">Ollama — локальный</option>
+        <option value="openai_compat">OpenAI-совместимый API (RouterAI и др.)</option>
+      </select>
+    </label>
+    <label>Base URL <input type="text" id="a-main-base-url" placeholder="http://127.0.0.1:8080/v1"></label>
+    <label>API Key <input type="password" id="a-main-api-key" placeholder=""></label>
+    <label>Модель (если нужно) <input type="text" id="a-main-model" placeholder="имя модели"></label>
+  </div>
+
+  <div class="admin-panel">
+    <h2>🗄 Эмбеддинги (память RAG)</h2>
+    <label>Провайдер
+      <select id="a-embedding-provider">
+        <option value="routerai">RouterAI — qwen/qwen3-embedding-8b</option>
+        <option value="openai_compat">OpenAI-совместимый API</option>
+        <option value="local">Локальный FastEmbed — оффлайн (ru+en, 384-dim)</option>
+        <option value="none">Выключено</option>
+      </select>
+    </label>
+    <label>Base URL <input type="text" id="a-embedding-base-url" placeholder="https://routerai.ru/api/v1"></label>
+    <label>API Key <input type="password" id="a-embedding-api-key" placeholder=""></label>
+    <label>Модель <input type="text" id="a-embedding-model" placeholder="qwen/qwen3-embedding-8b"></label>
+  </div>
+
+  <div class="admin-panel">
+    <h2>🔀 Реранкер</h2>
+    <label>Провайдер
+      <select id="a-rerank-provider">
+        <option value="routerai">RouterAI — voyageai/rerank-2.5</option>
+        <option value="openai_compat">OpenAI-совместимый /rerank</option>
+        <option value="none">Выключено</option>
+      </select>
+    </label>
+    <label>Base URL <input type="text" id="a-rerank-base-url" placeholder="https://routerai.ru/api/v1"></label>
+    <label>API Key <input type="password" id="a-rerank-api-key" placeholder=""></label>
+    <label>Модель <input type="text" id="a-rerank-model" placeholder="voyageai/rerank-2.5"></label>
+    <label class="check"><input type="checkbox" id="a-rerank-enabled"> Использовать реранкер</label>
+    <label title="Сколько кандидатов возвращает реранкер (top_n).">
+      Реранкер: сколько вернуть <input type="number" min="1" max="50" id="a-rerank-top-n" placeholder="20">
+    </label>
+    <label title="Порог уверенности реранкера (ниже = строже).">
+      Реранкер: порог уверенности <input type="number" min="0" max="1" step="0.01" id="a-rerank-threshold" placeholder="0.2">
+    </label>
+    <label class="check"><input type="checkbox" id="a-bgtasks-enabled"> Фоновые задачи памяти (RAG-индексация, карточки, сводки)</label>
+  </div>
+
+  <div class="admin-panel">
+    <h2>🎛 Генерация по умолчанию (для новых миров)</h2>
+    <label>Температура <input type="text" id="a-default-temp" placeholder="0.8"></label>
+    <label>Top-P <input type="text" id="a-default-top-p" placeholder="0.95"></label>
+    <label>Max токенов <input type="text" id="a-max-tokens" placeholder="2000"></label>
+    <label>Размер контекста <input type="text" id="a-context-tokens" placeholder="32768"></label>
+    <label title="Вес BM25 в гибридном поиске памяти (0 = только косинус Chroma, 1 = только BM25).">
+      Вес BM25 в гибридном поиске RAG <input type="number" min="0" max="1" step="0.05" id="a-hybrid-weight" placeholder="0.4">
+    </label>
+  </div>
+
+  <div class="admin-panel">
+    <h2>🧠 Память (сколько вспоминать)</h2>
+    <p class="muted">Сколько фактов долгосрочной памяти/лора попадает в контекст рассказчика. При большом
+      размере контекста мира (128k/256k) эти значения автоматически растут (пропорционально от 32k) —
+      здесь задаётся база и потолок.</p>
+    <label title="Сколько RAG-фактов памяти вспоминать за ход (при контексте 32k). При 256k автоматически до потолка.">
+      RAG-фактов памяти (база) <input type="number" min="1" max="64" id="a-rag-k" placeholder="4">
+    </label>
+    <label title="Потолок RAG-фактов при максимальном контексте мира.">
+      RAG-фактов памяти (потолок) <input type="number" min="1" max="64" id="a-rag-k-max" placeholder="24">
+    </label>
+    <label title="Сколько кандидатов из Chroma берём до реранкинга.">
+      RAG-кандидатов (до реранкинга) <input type="number" min="4" max="200" id="a-rag-candidates" placeholder="20">
+    </label>
+    <label title="Запасной бюджет недавней истории (когда у мира не задан свой контекст).">
+      Бюджет недавней истории (токенов) <input type="number" min="400" max="100000" id="a-recent-budget" placeholder="2600">
+    </label>
+    <label title="Максимальный размер сводки старой истории (токенов).">
+      Бюджет сводки (токенов) <input type="number" min="200" max="10000" id="a-summary-budget" placeholder="700">
+    </label>
+    <label title="Сколько токенов лора попадает в промпт (при контексте 32k).">
+      Лор-бюджет (токенов, база) <input type="number" min="200" max="20000" id="a-lore-budget" placeholder="900">
+    </label>
+    <label title="Потолок лор-бюджета при максимальном контексте.">
+      Лор-бюджет (потолок) <input type="number" min="200" max="40000" id="a-lore-budget-max" placeholder="4500">
+    </label>
+    <label title="Сколько чанков лора из RAG-поиска (при контексте 32k).">
+      Лор-чанков из RAG (база) <input type="number" min="1" max="30" id="a-lore-k" placeholder="3">
+    </label>
+    <label title="Потолок лор-чанков при максимальном контексте.">
+      Лор-чанков из RAG (потолок) <input type="number" min="1" max="40" id="a-lore-k-max" placeholder="12">
+    </label>
+    <label title="Порог косинусной близости для облачных эмбеддингов (выше = строже отбор).">
+      Порог косинуса (облачные эмбеддинги) <input type="number" min="0" max="1" step="0.01" id="a-cosine" placeholder="0.35">
+    </label>
+    <label title="Порог косинуса для локального FastEmbed (ниже, т.к. близости разрежённые).">
+      Порог косинуса (локальный FastEmbed) <input type="number" min="0" max="1" step="0.01" id="a-cosine-local" placeholder="0.20">
+    </label>
+  </div>
+
+  <div class="admin-panel">
+    <h2>🎛 Фоновые агенты и мир</h2>
+    <label class="check"><input type="checkbox" id="a-judge-enabled"> ⚖️ Судья логики (фоновая проверка противоречий)</label>
+    <label>Интервал судьи логики (ходов) <input type="number" min="1" max="100" id="a-judge-interval" placeholder="3"></label>
+    <label class="check"><input type="checkbox" id="a-events-enabled"> 🌍 Динамические события мира</label>
+    <label title="Делитель в формуле шанса события: p = (ходов с прошлого события) / N, потолок 50%. Меньше N = шанс растёт быстрее; событие никогда не гарантировано (не «раз в N ходов»).">
+      Скорость роста шанса событий (делитель; меньше — быстрее, потолок 50%) <input type="number" min="1" max="100" id="a-event-every" placeholder="10">
+    </label>
+    <label class="check"><input type="checkbox" id="a-master-enabled"> 🤖 Автономный «мастер» (вывод из тупика)</label>
+    <label>Интервал мастера (ходов) <input type="number" min="1" max="100" id="a-master-interval" placeholder="6"></label>
+    <label class="check"><input type="checkbox" id="a-enemy-ai-enabled"> ⚔️ Боевой ИИ врагов</label>
+    <label>Интервал боевого ИИ (ходов) <input type="number" min="1" max="100" id="a-enemy-ai-interval" placeholder="2"></label>
+    <label class="check"><input type="checkbox" id="a-tick-enabled"> 🌀 Авто-тик статус-эффектов</label>
+    <label class="check"><input type="checkbox" id="a-tick-needs-enabled"> 🍖 Авто-тик потребностей и рассудка</label>
+    <label>Кулдаун Провидения (ходов, 0 = без) <input type="number" min="0" max="100" id="a-divine-cd" placeholder="0"></label>
+    <label>Макс. длина действия игрока (символов) <input type="number" min="50" max="10000" id="a-max-action" placeholder="640"></label>
+  </div>
+
+  <div class="admin-panel">
+    <h2>🗄 Переносимость и наблюдаемость</h2>
+    <p class="muted">Бэкапы, метрики и авто-детект окна модели. Всё это про надёжность сохранения
+      миров, а не про правила повествования.</p>
+    <label class="check" title="Запрашивать у модели её реальный лимит контекста (llama.cpp /props,
+      Ollama /api/show, OpenAI-совместимые /models) и не давать миру заявить окно больше — иначе
+      ответы молча обрезаются. Если лимит определить не удалось — ничего не меняется.">
+      <input type="checkbox" id="a-detect-ctx"> 🔎 Авто-детект размера контекста модели</label>
+    <label class="check" title="При старте сервера делать согласованный снимок data/game.db в data/backups/
+      (SQLite Backup API). game.db не лежит в git — это единственная страховка от потери прохождения.">
+      <input type="checkbox" id="a-backup-start"> 💾 Бэкап БД при каждом запуске</label>
+    <label>Хранить снимков БД <input type="number" min="1" max="200" id="a-backup-keep" placeholder="10"></label>
+    <label class="check" title="Каждый ход дописывается в data/metrics.jsonl — иначе статистика времени
+      генерации, токенов и качества ответов обнуляется при перезапуске сервера.">
+      <input type="checkbox" id="a-metrics-persist"> 📈 Журнал метрик ходов на диск (переживает рестарт)</label>
+    <label>Сколько последних записей журнала читать в /api/metrics
+      <input type="number" min="50" max="100000" id="a-metrics-tail" placeholder="500"></label>
+  </div>
+
+  <div class="admin-panel">
+    <h2>🔊 Озвучка (TTS)</h2>
+    <p class="muted">Глобальные настройки озвучки рассказчика (per-мир переопределяется во вкладке Настройки мира).</p>
+    <label>Провайдер
+      <select id="a-tts-provider">
+        <option value="">По умолчанию</option>
+        <option value="piper">Piper — локальный (русские голоса, роботизированный)</option>
+        <option value="kokoro">Kokoro-82M — локальный (без русского)</option>
+        <option value="edge">⭐ Edge — облачный Microsoft TTS (лучшие русские голоса, рекомендован)</option>
+        <option value="none">Выключено</option>
+      </select>
+    </label>
+    <label id="a-tts-voice-row">Голос
+      <select id="a-tts-voice"></select>
+      <input id="a-tts-voice-custom" style="display:none" list="a-tts-voice-list" placeholder="впиши свой голос, напр. ru_RU-irina-medium">
+      <datalist id="a-tts-voice-list"></datalist>
+    </label>
+    <label id="a-tts-rate-row">Скорость речи <input type="text" id="a-tts-rate" placeholder="+0% (от -50% до +50%)"></label>
+    <label class="check"><input type="checkbox" id="a-tts-enabled"> Озвучивать ответы рассказчика (глобально)</label>
+    <label class="check"><input type="checkbox" id="a-tts-auto-play"> Автоматически проигрывать новые ответы</label>
+    <label class="check"><input type="checkbox" id="a-tts-cache"> Кэшировать аудио (повторные фразы не синтезируются)</label>
+    <label>Срок жизни кэша аудио (дней, 0 = вечно) <input type="number" min="0" max="3650" id="a-tts-cache-ttl" placeholder="60"></label>
+    <label>Макс. символов на синтез за ответ <input type="number" min="200" max="10000" id="a-tts-max-chars" placeholder="2400"></label>
+    <div class="btn-bar">
+      <button id="a-tts-test" class="btn">🔊 Проверить голос</button>
+      <button id="a-tts-dl-piper" class="btn">⬇ Скачать русский голос Piper</button>
+      <button id="a-tts-dl-kokoro" class="btn">⬇ Скачать Kokoro (~350 МБ)</button>
+    </div>
+    <p class="note" id="a-tts-state"></p>
+  </div>
+
+  <div class="admin-panel">
+    <div class="btn-bar">
+      <button id="a-save" class="btn primary">💾 Сохранить всё</button>
+      <button id="a-reset" class="btn danger">Сбросить всё к .env</button>
+    </div>
+    <p class="note">Сохранение применяется сразу (пересчитывается конфиг). Изменения провайдеров затрагивают
+      миры без своих пер-мировых настроек.</p>
+    <div id="save-state"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+// Null-безопасные чтения: если элемент отсутствует — пустая строка / false, без падения
+const $val = (id) => { const el = $(id); return (el && el.value != null) ? el.value : ""; };
+const $checked = (id) => { const el = $(id); return !!(el && el.checked); };
+const API = (path, opts = {}) =>
+  fetch(path, { headers: { "Content-Type": "application/json" }, ...opts })
+    .then(async (r) => {
+      const data = await r.json().catch(() => null);
+      if (!r.ok) throw new Error((data && (data.detail || data.error)) || r.statusText);
+      return data;
+    });
+
+const MAIN_DEFAULTS = {
+  llamacpp: "http://127.0.0.1:8080/v1",
+  ollama: "http://127.0.0.1:11434/v1",
+  openai_compat: "https://routerai.ru/api/v1",
+};
+const EMB_DEFAULTS = { routerai: "https://routerai.ru/api/v1", openai_compat: "" };
+const RERANK_DEFAULTS = { routerai: "https://routerai.ru/api/v1", openai_compat: "" };
+const KEYMASK = "••••••••";
+
+function setProviderPlaceholder(kind, provider) {
+  const map = { main: MAIN_DEFAULTS, embedding: EMB_DEFAULTS, rerank: RERANK_DEFAULTS }[kind];
+  const url = $(`a-${kind}-base-url`);
+  const sel = $(`a-${kind}-provider`);
+  if (map && provider in map && url) {
+    const dflt = map[provider] || "";
+    url.value = "";
+    url.placeholder = dflt || "https://.../v1";
+  }
+  if (sel && !sel.dataset.placeholderBound) {
+    sel.dataset.placeholderBound = "1";
+    sel.addEventListener("change", () => setProviderPlaceholder(kind, sel.value));
+  }
+}
+
+// ── Голоса TTS в админке (как в настройках мира: select + «свой голос») ──
+let _ttsStatus = null;
+function aTtsProvider() { return $val("a-tts-provider").trim() || ""; }
+function aTtsVoiceOptions(provider) {
+  const st = _ttsStatus || {};
+  const voices = (st.voices || {})[provider || "edge"] || [];
+  const labels = (st.voice_labels || {})[provider] || {};
+  return voices.map((v) => ({ v, label: labels[v] || v }));
+}
+function aTtsSelectedVoice() {
+  const sel = $("a-tts-voice");
+  if (sel && sel.value === "!custom") return $val("a-tts-voice-custom").trim();
+  return $val("a-tts-voice").trim() || "";
+}
+function fillAdminVoiceOptions(provider, saved) {
+  const sel = $("a-tts-voice");
+  const custom = $("a-tts-voice-custom");
+  if (!sel) return;
+  const opts = aTtsVoiceOptions(provider);
+  sel.innerHTML = `<option value="">По умолчанию (голос провайдера)</option>` +
+    opts.map((o) => `<option value="${esc(o.v)}">${esc(o.label)}</option>`).join("") +
+    `<option value="!custom">✍️ Свой голос…</option>`;
+  const showCustom = saved && saved !== "" && !opts.some((o) => o.v === saved);
+  if (showCustom) {
+    sel.value = "!custom";
+    if (custom) { custom.value = saved; custom.style.display = ""; }
+  } else {
+    sel.value = saved || "";
+    if (custom) custom.style.display = "none";
+  }
+  const dl = $("a-tts-voice-list");
+  if (dl) dl.innerHTML = opts.map((o) => `<option value="${esc(o.v)}">`).join("");
+}
+function updateAdminTtsButtons() {
+  const st = _ttsStatus || {};
+  const provider = aTtsProvider() || "edge";
+  // «Выключено» — голос/скорость не нужны
+  const none = provider === "none";
+  const vr = $("a-tts-voice-row"), rr = $("a-tts-rate-row");
+  if (vr) vr.style.display = none ? "none" : "";
+  if (rr) rr.style.display = none ? "none" : "";
+  const piperBtn = $("a-tts-dl-piper");
+  const kokoroBtn = $("a-tts-dl-kokoro");
+  if (piperBtn) {
+    const downloaded = (st.voices || {}).piper || [];
+    const voice = aTtsSelectedVoice();
+    piperBtn.style.display = provider === "piper" && !(voice && downloaded.includes(voice)) ? "" : "none";
+  }
+  if (kokoroBtn) kokoroBtn.style.display = provider === "kokoro" && !st.kokoro_ready ? "" : "none";
+}
+
+async function load() {
+  const d = await API("/api/admin/settings");
+  const stored = d.stored || {};
+  const eff = d.effective || {};
+  const prov = eff.providers || {};
+
+  ["main", "embedding", "rerank"].forEach((kind) => {
+    const p = prov[kind] || {};
+    const seld = $(`a-${kind}-provider`); if (seld) seld.value = p.id || "";
+    const url = $(`a-${kind}-base-url`);
+    if (url) { url.value = stored[`${kind.toUpperCase()}_BASE_URL`] || ""; url.placeholder = p.base_url || "https://.../v1"; }
+    const model = $(`a-${kind}-model`);
+    if (model) { model.value = stored[`${kind.toUpperCase()}_MODEL`] || ""; model.placeholder = p.model || "имя модели"; }
+    const key = $(`a-${kind}-api-key`);
+    if (key) {
+      key.value = "";
+      key.placeholder = stored[`${kind.toUpperCase()}_API_KEY`] ? `не менять (ключ: ${KEYMASK})` : p.api_key ? `ключ задан (${KEYMASK})` : "sk-... (пусто = не менять)";
+    }
+    setProviderPlaceholder(kind, p.id);
+  });
+  const rerEn = $("a-rerank-enabled");
+  if (rerEn) rerEn.checked = !!eff.rerank_enabled && (prov.rerank || {}).id !== "none";
+  const bg = $("a-bgtasks-enabled");
+  if (bg) bg.checked = stored.BACKGROUND_TASKS_ENABLED !== undefined ? stored.BACKGROUND_TASKS_ENABLED === "true" : !!eff.background_tasks_enabled;
+
+  // Память
+  const mem = eff.memory || {};
+  const setMem = (id, key, fallback) => {
+    const el = $(id);
+    if (!el) return;
+    el.value = stored[key] !== undefined ? stored[key] : (fallback ?? "");
+    el.placeholder = "" + (fallback ?? "");
+  };
+  setMem("a-rag-k", "RAG_MEMORY_K", mem.rag_memory_k);
+  setMem("a-rag-k-max", "RAG_MEMORY_MAX", mem.rag_memory_max);
+  setMem("a-rag-candidates", "RAG_CANDIDATES", mem.rag_candidates);
+  setMem("a-recent-budget", "RECENT_TOKEN_BUDGET", mem.recent_token_budget);
+  setMem("a-summary-budget", "SUMMARY_TOKEN_BUDGET", mem.summary_token_budget);
+  setMem("a-lore-budget", "LORE_TOKEN_BUDGET", mem.lore_token_budget);
+  setMem("a-lore-budget-max", "LORE_TOKEN_BUDGET_MAX", mem.lore_token_budget_max);
+  setMem("a-lore-k", "LORE_RAG_K", mem.lore_rag_k);
+  setMem("a-lore-k-max", "LORE_RAG_K_MAX", mem.lore_rag_k_max);
+  setMem("a-cosine", "COSINE_THRESHOLD", mem.cosine_threshold);
+  setMem("a-cosine-local", "COSINE_THRESHOLD_LOCAL", mem.cosine_threshold_local);
+
+  // Фоновые агенты и мир
+  const ag = eff.agents || {};
+  const setAg = (id, key, fallback) => {
+    const el = $(id);
+    if (!el) return;
+    el.value = stored[key] !== undefined ? stored[key] : (fallback ?? "");
+    el.placeholder = "" + (fallback ?? "");
+  };
+  const setAgCheck = (id, key, fb) => {
+    const el = $(id);
+    if (!el) return;
+    el.checked = stored[key] !== undefined ? stored[key] === "true" : !!fb;
+  };
+  setAgCheck("a-judge-enabled", "LOGIC_JUDGE_ENABLED", ag.logic_judge_enabled);
+  setAg("a-judge-interval", "LOGIC_JUDGE_INTERVAL", ag.logic_judge_interval);
+  setAgCheck("a-events-enabled", "DYNAMIC_EVENTS_ENABLED", ag.dynamic_events_enabled);
+  setAg("a-event-every", "EVENT_EVERY_TURNS", ag.event_every_turns);
+  setAgCheck("a-master-enabled", "AUTONOMOUS_MASTER_ENABLED", ag.autonomous_master_enabled);
+  setAg("a-master-interval", "AUTONOMOUS_MASTER_INTERVAL", ag.autonomous_master_interval);
+  setAgCheck("a-enemy-ai-enabled", "ENEMY_AI_ENABLED", ag.enemy_ai_enabled);
+  setAg("a-enemy-ai-interval", "ENEMY_AI_INTERVAL", ag.enemy_ai_interval);
+  setAgCheck("a-tick-enabled", "TICK_EFFECTS_ENABLED", ag.tick_effects_enabled);
+  setAgCheck("a-tick-needs-enabled", "TICK_NEEDS_ENABLED", ag.tick_needs_enabled);
+  setAg("a-divine-cd", "DIVINE_COOLDOWN_TURNS", ag.divine_cooldown_turns);
+  setAg("a-max-action", "MAX_ACTION_CHARS", ag.max_action_chars);
+  // Переносимость и наблюдаемость (сессия 33)
+  const pz = eff.persist || {};
+  setAgCheck("a-detect-ctx", "DETECT_MODEL_CONTEXT", pz.detect_model_context);
+  setAgCheck("a-backup-start", "BACKUP_DB_ON_START", pz.backup_db_on_start);
+  setAg("a-backup-keep", "BACKUP_KEEP", pz.backup_keep);
+  setAgCheck("a-metrics-persist", "METRICS_PERSIST", pz.metrics_persist);
+  setAg("a-metrics-tail", "METRICS_TAIL", pz.metrics_tail);
+  const rtop = $("a-rerank-top-n"); if (rtop) { rtop.value = stored.RERANK_TOP_N !== undefined ? stored.RERANK_TOP_N : (eff.rerank_top_n ?? ""); rtop.placeholder = "" + (eff.rerank_top_n ?? ""); }
+  const rthr = $("a-rerank-threshold"); if (rthr) { rthr.value = stored.RERANK_THRESHOLD !== undefined ? stored.RERANK_THRESHOLD : (eff.rerank_threshold ?? ""); rthr.placeholder = "" + (eff.rerank_threshold ?? ""); }
+
+  // TTS (озвучка)
+  const ttsEff = eff.tts || {};
+  const ttsProvider = $("a-tts-provider");
+  if (ttsProvider) {
+    ttsProvider.value = stored.TTS_PROVIDER !== undefined ? stored.TTS_PROVIDER : "";
+    ttsProvider.placeholder = ttsEff.provider || "edge";
+  }
+  _ttsStatus = await API("/api/tts/status").catch(() => null);
+  fillAdminVoiceOptions(aTtsProvider() || ttsEff.provider || "edge", stored.TTS_VOICE !== undefined ? stored.TTS_VOICE : "");
+  const ttsRate = $("a-tts-rate");
+  if (ttsRate) { ttsRate.value = stored.TTS_RATE !== undefined ? stored.TTS_RATE : ""; ttsRate.placeholder = ttsEff.rate || "+0%"; }
+  const ttsEn = $("a-tts-enabled");
+  if (ttsEn) ttsEn.checked = stored.TTS_ENABLED !== undefined ? stored.TTS_ENABLED === "true" : !!ttsEff.enabled;
+  const ttsAp = $("a-tts-auto-play");
+  if (ttsAp) ttsAp.checked = stored.TTS_AUTO_PLAY !== undefined ? stored.TTS_AUTO_PLAY === "true" : !!ttsEff.auto_play;
+  const ttsCache = $("a-tts-cache");
+  if (ttsCache) ttsCache.checked = stored.TTS_CACHE_ENABLED !== undefined ? stored.TTS_CACHE_ENABLED === "true" : !!ttsEff.cache_enabled;
+  const ttl = $("a-tts-cache-ttl");
+  if (ttl) { ttl.value = stored.TTS_CACHE_TTL_DAYS !== undefined ? stored.TTS_CACHE_TTL_DAYS : (ttsEff.cache_ttl_days ?? ""); ttl.placeholder = "" + (ttsEff.cache_ttl_days ?? ""); }
+  const tmc = $("a-tts-max-chars");
+  if (tmc) { tmc.value = stored.TTS_MAX_CHARS !== undefined ? stored.TTS_MAX_CHARS : (ttsEff.max_chars ?? ""); tmc.placeholder = "" + (ttsEff.max_chars ?? ""); }
+  updateAdminTtsButtons();
+
+  const def = eff.defaults || {};
+  ["temp", "top-p", "tokens", "context-tokens"].forEach((f) => {
+    const el = $(`a-default-${f}`);
+    if (el) el.value = "";
+  });
+  const setField = (id, storedKey, fallback) => {
+    const el = $(id);
+    if (!el) return;
+    el.value = stored[storedKey] !== undefined ? stored[storedKey] : (fallback ?? "");
+    el.placeholder = "" + (fallback ?? "");
+  };
+  setField("a-default-temp", "DEFAULT_TEMP", def.temperature);
+  setField("a-default-top-p", "DEFAULT_TOP_P", def.top_p);
+  setField("a-max-tokens", "MAX_TOKENS", def.max_tokens);
+  setField("a-context-tokens", "CONTEXT_TOKENS", def.context_tokens);
+  setField("a-hybrid-weight", "HYBRID_WEIGHT_BM25", eff.hybrid_weight_bm25);
+}
+
+function collect() {
+  const payload = {};
+  ["main", "embedding", "rerank"].forEach((kind) => {
+    const U = kind.toUpperCase();
+    payload[`${kind}_provider`] = $val(`a-${kind}-provider`);
+    const url = $val(`a-${kind}-base-url`).trim();
+    const key = $val(`a-${kind}-api-key`).trim();
+    const model = $val(`a-${kind}-model`).trim();
+    if (url) payload[`${kind}_base_url`] = url;
+    if (key && key !== KEYMASK) payload[`${kind}_api_key`] = key;
+    if (model) payload[`${kind}_model`] = model;
+  });
+  payload.rerank_enabled = $checked("a-rerank-enabled");
+  const rtop = $val("a-rerank-top-n").trim();
+  if (rtop !== "") payload.rerank_top_n = rtop;
+  const rthr = $val("a-rerank-threshold").trim();
+  if (rthr !== "") payload.rerank_threshold = rthr;
+  payload.background_tasks_enabled = $checked("a-bgtasks-enabled");
+  const hw = $val("a-hybrid-weight").trim();
+  if (hw !== "") payload.hybrid_weight_bm25 = hw;
+  // ⚠ баг: JS строил id через `a-${f}` с подчёркиванием (a-context_tokens), а в HTML id через дефис
+  // (a-context-tokens) → $val возвращал "" → поля генерации/памяти МОЛЧА не сохранялись.
+  // Чиним: явное соответствие f (ключ payload) → id элемента (дефисный).
+  const GEN_FIELD_ID = {
+    default_temp: "a-default-temp", default_top_p: "a-default-top-p",
+    max_tokens: "a-max-tokens", context_tokens: "a-context-tokens",
+  };
+  Object.entries(GEN_FIELD_ID).forEach(([f, id]) => {
+    const v = $val(id).trim();
+    if (v !== "") payload[f] = v;
+  });
+  // Память (f → id элемента; в HTML — дефисные id)
+  const MEM_FIELD_ID = {
+    rag_memory_k: "a-rag-k", rag_memory_max: "a-rag-k-max", rag_candidates: "a-rag-candidates",
+    recent_token_budget: "a-recent-budget", summary_token_budget: "a-summary-budget",
+    lore_token_budget: "a-lore-budget", lore_token_budget_max: "a-lore-budget-max",
+    lore_rag_k: "a-lore-k", lore_rag_k_max: "a-lore-k-max",
+    cosine_threshold: "a-cosine", cosine_threshold_local: "a-cosine-local",
+  };
+  Object.entries(MEM_FIELD_ID).forEach(([f, id]) => {
+    const v = $val(id).trim();
+    if (v !== "") payload[f] = v;
+  });
+  // Фоновые агенты и мир
+  payload.logic_judge_enabled = $checked("a-judge-enabled");
+  const ji = $val("a-judge-interval").trim(); if (ji !== "") payload.logic_judge_interval = ji;
+  payload.dynamic_events_enabled = $checked("a-events-enabled");
+  const ee = $val("a-event-every").trim(); if (ee !== "") payload.event_every_turns = ee;
+  payload.autonomous_master_enabled = $checked("a-master-enabled");
+  const mi = $val("a-master-interval").trim(); if (mi !== "") payload.autonomous_master_interval = mi;
+  payload.enemy_ai_enabled = $checked("a-enemy-ai-enabled");
+  const ei = $val("a-enemy-ai-interval").trim(); if (ei !== "") payload.enemy_ai_interval = ei;
+  payload.tick_effects_enabled = $checked("a-tick-enabled");
+  payload.tick_needs_enabled = $checked("a-tick-needs-enabled");
+  const dc = $val("a-divine-cd").trim(); if (dc !== "") payload.divine_cooldown_turns = dc;
+  const ma = $val("a-max-action").trim(); if (ma !== "") payload.max_action_chars = ma;
+  // Переносимость и наблюдаемость
+  payload.detect_model_context = $checked("a-detect-ctx");
+  payload.backup_db_on_start = $checked("a-backup-start");
+  const bk = $val("a-backup-keep").trim(); if (bk !== "") payload.backup_keep = bk;
+  payload.metrics_persist = $checked("a-metrics-persist");
+  const mt = $val("a-metrics-tail").trim(); if (mt !== "") payload.metrics_tail = mt;
+  // TTS
+  payload.tts_provider = aTtsProvider();
+  const tv = aTtsSelectedVoice();
+  if (tv) payload.tts_voice = tv;
+  const tr = $val("a-tts-rate").trim();
+  if (tr) payload.tts_rate = tr;
+  payload.tts_enabled = $checked("a-tts-enabled");
+  payload.tts_auto_play = $checked("a-tts-auto-play");
+  payload.tts_cache_enabled = $checked("a-tts-cache");
+  const ttl = $val("a-tts-cache-ttl").trim(); if (ttl !== "") payload.tts_cache_ttl_days = ttl;
+  const tmc = $val("a-tts-max-chars").trim(); if (tmc !== "") payload.tts_max_chars = tmc;
+  return payload;
+}
+
+async function save() {
+  const b = $("a-save");
+  if (b) b.disabled = true;
+  const st = $("save-state");
+  if (st) st.textContent = "Сохраняю…";
+  try {
+    const res = await API("/api/admin/settings", { method: "POST", body: JSON.stringify(collect()) });
+    if (st) st.textContent = "✅ Сохранено. Применено: " +
+      (res.effective.providers.main.name || "") + " · temp " + res.effective.defaults.temperature +
+      " · контекст " + res.effective.defaults.context_tokens;
+  } catch (e) {
+    if (st) st.textContent = "❌ " + e.message;
+  }
+  if (b) b.disabled = false;
+  load();
+}
+
+$("a-save").onclick = save;
+// Все ключи админки, которые умеет отдавать обратно в .env (имена env в верхнем регистре).
+const ALL_ADMIN_KEYS = [
+  "MAIN_BASE_URL", "MAIN_API_KEY", "MAIN_MODEL",
+  "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
+  "RERANK_BASE_URL", "RERANK_API_KEY", "RERANK_MODEL", "RERANK_ENABLED",
+  "RERANK_TOP_N", "RERANK_THRESHOLD", "HYBRID_WEIGHT_BM25",
+  "DEFAULT_TEMP", "DEFAULT_TOP_P", "MAX_TOKENS", "CONTEXT_TOKENS",
+  "RAG_MEMORY_K", "RAG_MEMORY_MAX", "RAG_CANDIDATES", "RECENT_TOKEN_BUDGET",
+  "SUMMARY_TOKEN_BUDGET", "LORE_TOKEN_BUDGET", "LORE_TOKEN_BUDGET_MAX",
+  "LORE_RAG_K", "LORE_RAG_K_MAX", "COSINE_THRESHOLD", "COSINE_THRESHOLD_LOCAL",
+  "BACKGROUND_TASKS_ENABLED",
+  "LOGIC_JUDGE_ENABLED", "LOGIC_JUDGE_INTERVAL", "DYNAMIC_EVENTS_ENABLED",
+  "EVENT_EVERY_TURNS", "AUTONOMOUS_MASTER_ENABLED", "AUTONOMOUS_MASTER_INTERVAL",
+  "ENEMY_AI_ENABLED", "ENEMY_AI_INTERVAL", "TICK_EFFECTS_ENABLED", "TICK_NEEDS_ENABLED",
+  "DIVINE_COOLDOWN_TURNS", "MAX_ACTION_CHARS",
+  "DETECT_MODEL_CONTEXT", "BACKUP_DB_ON_START", "BACKUP_KEEP",
+  "METRICS_PERSIST", "METRICS_TAIL",
+  "TTS_ENABLED", "TTS_PROVIDER", "TTS_VOICE", "TTS_RATE", "TTS_AUTO_PLAY",
+  "TTS_CACHE_ENABLED", "TTS_CACHE_TTL_DAYS", "TTS_MAX_CHARS",
+];
+
+$("a-reset").onclick = async () => {
+  if (!confirm("Сбросить ВСЕ админ-настройки к .env? (API-ключи тоже)")) return;
+  // ВАЖНО: булев тумблер не умеет «не задано» — раньше сброс писал `false` во все
+  // выключатели и «возврат к .env» на самом деле ВЫКЛЮЧАЛ судью, мастера, боевой ИИ,
+  // события и озвучку. Теперь удаляем строки через `reset` (приоритет возвращается .env),
+  // а выбранный провайдер оставляем как есть.
+  const payload = { reset: ALL_ADMIN_KEYS.slice() };
+  ["main", "embedding", "rerank"].forEach((k) => { payload[`${k}_provider`] = $val(`a-${k}-provider`); });
+  try {
+    await API("/api/admin/settings", { method: "POST", body: JSON.stringify(payload) });
+    const st = $("save-state"); if (st) st.textContent = "✅ Сброшено к .env";
+  } catch (e) { const st = $("save-state"); if (st) st.textContent = "❌ " + e.message; }
+  load();
+};
+
+// ── TTS-кнопки админки ──
+function esc(s) { return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+const ttsState = $("a-tts-state");
+function b64ToBlob(b64, mime) {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+$("a-tts-test").onclick = async () => {
+  const b = $("a-tts-test"); b.disabled = true; b.textContent = "Синтез…";
+  if (ttsState) ttsState.textContent = "";
+  try {
+    const payload = { provider: aTtsProvider() || undefined, voice: aTtsSelectedVoice(), rate: $val("a-tts-rate").trim() || undefined };
+    const res = await API("/api/tts/test", { method: "POST", body: JSON.stringify(payload) });
+    if (!res.ok) throw new Error(res.error || "не удалось");
+    const url = URL.createObjectURL(b64ToBlob(res.data, res.mime));
+    const a = new Audio(url);
+    a.onended = () => URL.revokeObjectURL(url);
+    await a.play();
+    if (ttsState) ttsState.textContent = "✅ Голос звучит";
+  } catch (e) { if (ttsState) ttsState.textContent = "❌ " + e.message; }
+  b.disabled = false; b.textContent = "🔊 Проверить голос";
+};
+$("a-tts-dl-piper").onclick = async () => {
+  if (!confirm("Скачать русский голос Piper (ru_RU-ruslan-medium, ~70 МБ)?")) return;
+  await dlTts("piper", aTtsSelectedVoice() || "ru_RU-ruslan-medium");
+};
+$("a-tts-dl-kokoro").onclick = async () => {
+  if (!confirm("Скачать Kokoro-82M (~350 МБ)? Без русского — для англ. миров.")) return;
+  await dlTts("kokoro", "");
+};
+async function dlTts(provider, voice) {
+  if (ttsState) ttsState.textContent = `Скачивание ${provider}… (интернет, пара минут)`;
+  try {
+    const res = await API("/api/tts/download", { method: "POST", body: JSON.stringify({ provider, voice }) });
+    if (!res.ok) throw new Error(res.error || "ошибка");
+    if (ttsState) ttsState.textContent = res.already ? "✅ Уже установлено" : `✅ Готово (${res.size_mb} МБ)`;
+    await load();
+  } catch (e) { if (ttsState) ttsState.textContent = "❌ " + e.message; }
+}
+
+// Смена провайдера/голоса в админке — обновляем select голосов и кнопки скачивания
+const aProvSel = $("a-tts-provider");
+if (aProvSel) aProvSel.addEventListener("change", () => {
+  const provider = aTtsProvider();
+  const saved = $val("a-tts-voice") && $("a-tts-voice").value !== "!custom" ? aTtsSelectedVoice() : "";
+  const keep = saved && aTtsVoiceOptions(provider || "edge").some((o) => o.v === saved) ? saved : "";
+  fillAdminVoiceOptions(provider || "edge", keep);
+  updateAdminTtsButtons();
+});
+const aVoiceSel = $("a-tts-voice");
+if (aVoiceSel) aVoiceSel.addEventListener("change", () => {
+  const custom = $("a-tts-voice-custom");
+  if (custom) custom.style.display = aVoiceSel.value === "!custom" ? "" : "none";
+  updateAdminTtsButtons();
+});
+const aVoiceCustom = $("a-tts-voice-custom");
+if (aVoiceCustom) aVoiceCustom.addEventListener("input", updateAdminTtsButtons);
+
+load().catch((e) => { const st = $("save-state"); if (st) st.textContent = "Ошибка загрузки: " + e.message; });
+</script>
+</body>
+</html>

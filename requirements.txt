@@ -1,0 +1,26 @@
+# Text Game RPG — зависимости сервера игры (проверено на Python 3.12.10, Windows).
+# Установка:  python -m pip install -r requirements.txt
+#
+# ЧТО ЗДЕСЬ НЕ НУЖНО (ставится отдельно, это намеренно):
+#   * ChromaDB — СВОЙ изолированный venv в data/chroma-venv (scripts/start_chroma.bat,
+#     порт 8001), чтобы не конфликтовать с другими проектами. См. AGENT.md, правило 2.
+#   * Тяжёлые опциональные движки (озвучка, локальные эмбеддинги) — requirements-optional.txt.
+#     Без них игра полностью работоспособна: TTS = none, эмбеддинги = облачные/выкл.
+#   * rank-bm25 не нужен: BM25 для гибридного поиска реализован в backend/embeddings.py
+#     собственным кодом (без внешних зависимостей).
+
+# ── Веб-слой / API (starlette тянется сама как зависимость fastapi) ───
+fastapi==0.141.1
+uvicorn==0.50.2
+
+# ── Схемы и валидация (backend/schemas.py, backend/directives.py) ─────
+pydantic==2.13.4
+
+# ── HTTP-клиент: llama.cpp / Ollama / OpenAI-совместимые, Chroma, RouterAI ──
+httpx==0.28.1
+
+# ── Хранилище: SQLite в фоновом asyncio-цикле (backend/db.py) ─────────
+aiosqlite==0.22.1
+
+# ── Тесты (python -X utf8 -m pytest) ─────────────────────────────────
+pytest==9.1.1

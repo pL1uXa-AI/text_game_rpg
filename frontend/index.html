@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Text Game RPG — ИИ-рассказчик</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <div class="topbar">
+    <a href="/admin" class="btn small topbar-admin" title="Глобальные настройки LLM и провайдеров">⚙ Админка</a>
+  </div>
+  <!-- Экран «Старт»: выбор мира/темы -->
+  <div id="screen-start">
+    <header class="hero">
+      <h1>⚔️ Text Game RPG</h1>
+      <p class="sub">Живой мир с ИИ-рассказчиком и долгосрочной памятью</p>
+      <div id="sys-status" class="status-pill">проверка сервисов…</div>
+    </header>
+
+    <div class="start-layout">
+      <section class="panel">
+        <h2>🌍 Мои миры</h2>
+        <div id="world-list" class="world-list"></div>
+      </section>
+
+      <section class="panel">
+        <h2 class="panel-h2">✨ Новый мир <button id="btn-reload-plots" class="btn small" title="Перечитать сюжеты из папки plots/ (без перезапуска)">🔄 Обновить сюжеты</button></h2>
+        <div class="theme-grid" id="theme-grid"></div>
+
+        <div id="custom-plot-box" style="display:none">
+          <label>Название сюжета (необязательно)
+            <input id="custom-plot-name" placeholder="Мой уникальный мир" maxlength="60">
+          </label>
+          <label>Сюжет/завязка (обязательно)
+            <textarea id="custom-plot-text" rows="4" placeholder="Например: город, где каждую ночь исчезает один житель, а ты — детектив, который помнит их всех..."></textarea>
+          </label>
+          <label>Лор мира (необязательно) — что рассказчик обязан знать
+            <textarea id="custom-lore-text" rows="5" placeholder="Статьи лора: строки вида «## Заголовок» начинают новую статью.
+Например:
+## География
+Континент расколот на три королевства...
+## Магия
+Магия пьёт память того, кто её использует..."></textarea>
+          </label>
+          <p class="muted">Лор — большая «библия» мира (история, системы, фракции). Она индексируется и подаётся рассказчику через RAG: в промпт попадает актуальное и релевантное, а не всё сразу.</p>
+        </div>
+
+        <div id="my-plots-section">
+          <div class="plots-head">
+            <h3>📜 Мои сюжеты</h3>
+            <button id="btn-add-plot" class="btn small">+ Добавить</button>
+          </div>
+          <div id="plots-list" class="plots-list"></div>
+        </div>
+
+        <div class="form-row">
+          <div class="field-block">
+            <span class="field-label">Жанры (необязательно — можно несколько, поверх темы)</span>
+            <div class="genre-chips" id="genre-chips"></div>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label>Сложность
+            <select id="new-difficulty">
+              <option value="easy">Лёгкая</option>
+              <option value="normal" selected>Средняя</option>
+              <option value="hardcore">Хардкор</option>
+            </select>
+          </label>
+          <label>Перспектива
+            <select id="new-perspective">
+              <option value="second" selected>Ты (второе лицо)</option>
+              <option value="first">Я (первое лицо)</option>
+              <option value="third">Он/она (третье лицо)</option>
+            </select>
+          </label>
+          <label>Язык
+            <select id="new-language">
+              <option value="ru" selected>Русский</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <label>Рассказчик
+            <select id="new-narrator"></select>
+            <p class="muted" id="new-narrator-preview"></p>
+          </label>
+        </div>
+        <div class="form-row">
+          <label>Имя мира (необязательно)
+            <input id="new-name" placeholder="Мой мир" maxlength="60">
+          </label>
+        </div>
+        <div class="form-row">
+          <label>Свой зацеп/вступление (необязательно)
+            <input id="new-hook" placeholder="Например: я — контрабандист, у меня долг…" maxlength="240">
+          </label>
+        </div>
+        <button id="btn-create-world" class="btn primary big" disabled>Создать мир</button>
+        <p class="muted" id="create-state"></p>
+      </section>
+    </div>
+  </div>
+
+  <!-- Экран игры -->
+  <div id="screen-game" style="display:none">
+    <aside class="sidebar">
+      <div class="world-head">
+        <div class="head-row">
+          <h2 id="world-name">—</h2>
+          <button id="btn-menu" class="btn small" title="Вернуться в меню миров">← Меню</button>
+        </div>
+        <div class="world-meta" id="world-meta"></div>
+      </div>
+      <nav class="tabs">
+        <button class="tab active" data-tab="state">Состояние</button>
+        <button class="tab" data-tab="map">Карта</button>
+        <button class="tab" data-tab="entities">Карточки</button>
+        <button class="tab" data-tab="lore">Лор</button>
+        <button class="tab" data-tab="saves">Сохранения</button>
+        <button class="tab" data-tab="settings">Настройки</button>
+      </nav>
+      <div class="tab-panels">
+        <!-- Состояние -->
+        <div class="panel-body" id="tab-state">
+          <div class="stat-bars">
+            <div class="bar"><span>HP</span><div class="track"><div class="fill hp" id="hp-bar"></div></div><b id="hp-num"></b></div>
+            <div class="bar"><span>MP</span><div class="track"><div class="fill mp" id="mp-bar"></div></div><b id="mp-num"></b></div>
+          </div>
+          <div class="card-frame">
+            <div class="kv" id="player-kv"></div>
+          </div>
+          <h3>📊 Характеристики</h3>
+          <div class="card-frame">
+            <div class="kv" id="stats-kv"></div>
+          </div>
+          <h3>🧙 Персонаж</h3>
+          <div id="character"></div>
+          <h3>🧠 Эффекты (игрок)</h3>
+          <ul id="effects-list" class="list"></ul>
+          <h3 id="inventory-title">🧰 Инвентарь</h3>
+          <ul id="inventory" class="list"></ul>
+          <h3>🛡 Экипировано</h3>
+          <ul id="equipped-list" class="list"></ul>
+          <h3>📍 Локация</h3>
+          <div id="location"></div>
+          <h3>⏳ Таймеры мира</h3>
+          <ul id="timers-list" class="list"></ul>
+          <h3>📜 Доска объявлений</h3>
+          <ul id="board-list" class="list"></ul>
+          <h3>🌙 Очередь видений</h3>
+          <ul id="visions-list" class="list"></ul>
+          <h3>📜 Квесты</h3>
+          <ul id="quests" class="list"></ul>
+          <h3>🏪 Магазины</h3>
+          <ul id="shops-list" class="list"></ul>
+          <h3>🛠 Крафт</h3>
+          <ul id="crafts-list" class="list"></ul>
+          <h3>⚔️ Враги рядом</h3>
+          <ul id="enemies" class="list"></ul>
+          <h3>🗣 NPC</h3>
+          <ul id="npc-list" class="list"></ul>
+          <h3>🤝 Компаньоны</h3>
+          <ul id="companions-list" class="list"></ul>
+          <h3>🚩 Флаги</h3>
+          <div id="flags" class="chips"></div>
+          <p class="muted" id="flags-hint">Флаги — небольшие факты о мире: «дверь_открыта: да» = дверь открыта.</p>
+        </div>
+
+        <!-- Карта мира -->
+        <div class="panel-body" id="tab-map" style="display:none">
+          <p class="muted">Колесо мыши — масштаб · зажми и тяни — двигать карту · двойной клик / ⤢ — подогнать всё. Кликни по соседней локации, чтобы пойти туда; по дальней — увидеть путь.</p>
+          <div id="map-filters" class="map-filters">
+            <span class="mf-head">Показывать:</span>
+            <label class="mf"><input type="checkbox" id="mf-reach" checked> только достижимые</label>
+            <label class="mf"><input type="checkbox" id="mf-labels"> все подписи</label>
+            <button id="mf-clear" class="map-btn-2" style="display:none" title="Убрать подсветку кратчайшего пути">✕ Сбросить путь</button>
+          </div>
+          <div id="map-wrap" class="map-wrap">
+            <svg id="world-map" width="100%" height="100%"></svg>
+          </div>
+          <div class="legend">
+            <span class="lg lg-cur">● здесь ты</span>
+            <span class="lg lg-near">● рядом (можно пойти)</span>
+            <span class="lg lg-far">● известна, но путь не найден</span>
+            <span class="lg lg-path">─ путь</span>
+          </div>
+        </div>
+
+        <!-- Карточки сущностей -->
+        <div class="panel-body" id="tab-entities" style="display:none">
+          <div class="toolbar">
+            <select id="ent-kind-filter">
+              <option value="">Все</option>
+              <option value="npc">Персонажи</option>
+              <option value="location">Локации</option>
+              <option value="faction">Фракции</option>
+              <option value="quest">Квесты</option>
+              <option value="item">Предметы</option>
+              <option value="event">События</option>
+              <option value="enemy">Враги</option>
+              <option value="shop">Магазины</option>
+              <option value="companion">Компаньоны</option>
+              <option value="craft">Рецепты крафта</option>
+              <option value="race">Расы</option>
+              <option value="class">Классы</option>
+              <option value="profession">Профессии</option>
+              <option value="skill">Навыки</option>
+              <option value="effect">Эффекты</option>
+            </select>
+            <button id="btn-new-entity" class="btn small">+ Карточка</button>
+          </div>
+          <div id="entities-list" class="entities"></div>
+        </div>
+
+        <!-- Лор мира (библия) -->
+        <div class="panel-body" id="tab-lore" style="display:none">
+          <p class="muted">Лор — «библия» вселенной: история, системы, фракции, термины. Рассказчик получает через RAG актуальное и релевантное (а не всё сразу). Можно дополнять и править вручную.</p>
+          <div class="toolbar">
+            <input id="lore-search" placeholder="🔎 Поиск по лору (RAG)">
+            <button id="btn-lore-add" class="btn small">+ Статья</button>
+          </div>
+          <div id="lore-list" class="entities"></div>
+        </div>
+
+        <!-- Сохранения -->
+        <div class="panel-body" id="tab-saves" style="display:none">
+          <div class="toolbar">
+            <input id="save-name" placeholder="Имя сохранения">
+            <button id="btn-save" class="btn small">💾 Сохранить</button>
+          </div>
+          <ul id="saves-list" class="list"></ul>
+        </div>
+
+        <!-- Настройки -->
+        <div class="panel-body" id="tab-settings" style="display:none">
+          <details class="settings-section" open>
+            <summary class="settings-head"><span class="s-ico">🎛</span><span class="s-mid"><span class="s-title">Генерация</span><span class="s-sub">температура · контекст · судья</span></span><span class="s-caret"></span></summary>
+            <div class="settings-body">
+              <label class="s-field"><span class="s-lbl">Температура: <b id="temp-val" class="val-now"></b></span>
+                <input type="range" id="set-temp" min="0" max="1.5" step="0.05">
+              </label>
+              <p class="field-desc">Случайность ответов: выше — разнообразнее и рискованнее, ниже — стабильнее. ≈0.8 — хорошее равновесие.</p>
+              <label class="s-field"><span class="s-lbl">Top-P: <b id="topp-val" class="val-now"></b></span>
+                <input type="range" id="set-topp" min="0" max="1" step="0.05">
+              </label>
+              <p class="field-desc">Насколько «узко» модель выбирает слова: 1 — максимум разнообразия, ниже — сосредоточеннее. ≈0.95 — равновесие.</p>
+              <label class="s-field"><span class="s-lbl">Max токенов: <b id="mtok-val" class="val-now"></b></span>
+                <input type="range" id="set-mtok" min="200" max="4096" step="50">
+              </label>
+              <p class="field-desc">Максимальная длина одного ответа рассказчика.</p>
+              <label class="s-field"><span class="s-lbl">Размер контекста: <b id="ctx-val" class="val-now"></b></span>
+                <input type="range" id="set-ctx" min="1024" max="262144" step="128">
+              </label>
+              <p class="field-desc" id="ctx-limit-note" hidden></p>
+              <p class="field-desc">Окно памяти мира: столько истории каждый ответ видит целиком. 32k — стандарт;
+                для облачных моделей можно поднимать до 256k, если их реальный лимит контекста это позволяет.
+                Память (недавняя история) — примерно <b id="ctx-budget-val"></b> токенов из этого окна.
+                От размера контекста автоматически растёт и число вспоминаемых RAG-фактов/лора (можно переопределить ниже).</p>
+              <label class="s-field"><span class="s-lbl">Сколько фактов памяти вспоминать (RAG): <b id="ragk-val" class="val-now"></b></span>
+                <input type="range" id="set-ragk" min="0" max="64" step="1">
+              </label>
+              <p class="field-desc">Сколько фрагментов долгосрочной памяти подмешивается в каждый ответ.
+                <b>0</b> — автоматически от размера контекста (база 4 при 32k, больше при 128k/256k).
+                Увеличь, если рассказчик «забывает» ранние события при большом окне.</p>
+              <label class="s-field"><span class="s-lbl">Лор-чанков из RAG: <b id="lorek-val" class="val-now"></b></span>
+                <input type="range" id="set-lorek" min="0" max="30" step="1">
+              </label>
+              <p class="field-desc">Сколько релевантных фрагментов «библии» мира (лор) подмешивается.
+                <b>0</b> — автоматически от контекста (база 3 при 32k).</p>
+              <label class="check"><input type="checkbox" id="set-logic-judge"> ⚖️ Судья логики (фоновая
+                проверка противоречий — сверяет ответы с фактами мира: живые NPC, флаги)</label>
+              <p class="field-desc">Работает в фоне и не замедляет ответ. Если найдено грубое противоречие —
+                ошибка рассказчика оборачивается в атмосферный сюжетный поворот («искажение реальности»).</p>
+              <button id="btn-save-settings" class="btn small">Применить</button>
+            </div>
+          </details>
+
+          <details class="settings-section">
+            <summary class="settings-head"><span class="s-ico">🎤</span><span class="s-mid"><span class="s-title">Рассказчик</span><span class="s-sub">персона повествователя</span></span><span class="s-caret"></span></summary>
+            <div class="settings-body">
+              <label>Персона рассказчика
+                <select id="set-narrator"></select>
+              </label>
+              <p class="muted" id="narrator-preview"></p>
+              <button id="btn-narrators" class="btn small">📖 Создать / править рассказчиков</button>
+            </div>
+          </details>
+
+          <details class="settings-section">
+            <summary class="settings-head"><span class="s-ico">🔌</span><span class="s-mid"><span class="s-title">Провайдеры</span><span class="s-sub">модель · эмбеддинги · реранкер</span></span><span class="s-caret"></span></summary>
+            <div class="settings-body">
+              <div class="f-group">
+                <div class="fg-head">🧠 Основная модель (LLM)</div>
+                <select id="set-prov-main"></select>
+                <div class="prov-fields" id="prov-fields-main"></div>
+              </div>
+              <div class="f-group">
+                <div class="fg-head">🧩 Эмбеддинги (память RAG)</div>
+                <select id="set-prov-embedding"></select>
+                <div class="prov-fields" id="prov-fields-embedding"></div>
+              </div>
+              <div class="f-group">
+                <div class="fg-head">🔁 Реранкер</div>
+                <select id="set-prov-rerank"></select>
+                <div class="prov-fields" id="prov-fields-rerank"></div>
+              </div>
+              <div class="f-check-row"><label class="check"><input type="checkbox" id="set-rerank-enabled"> Использовать реранкер</label></div>
+              <button id="btn-save-providers" class="btn small">Применить провайдеров</button>
+            </div>
+          </details>
+
+          <details class="settings-section">
+            <summary class="settings-head"><span class="s-ico">🔊</span><span class="s-mid"><span class="s-title">Озвучка (TTS)</span><span class="s-sub">голос · скорость · автоплей</span></span><span class="s-caret"></span></summary>
+            <div class="settings-body">
+              <div class="f-group">
+                <div class="fg-head">🔊 Источник голоса</div>
+                <label class="check"><input type="checkbox" id="tts-enabled"> Озвучивать ответы рассказчика</label>
+                <label>Провайдер
+                  <select id="tts-provider">
+                    <option value="">По умолчанию (глобально)</option>
+                    <option value="piper">Piper — локальный (sherpa-onnx, русские голоса, роботизированный)</option>
+                    <option value="kokoro">Kokoro-82M — локальный (без русского)</option>
+                    <option value="edge">⭐ Edge — облачный Microsoft TTS (лучшие русские голоса, рекомендован)</option>
+                    <option value="none">Выключено в этом мире</option>
+                  </select>
+                </label>
+                <label id="tts-voice-row">Голос
+                  <select id="tts-voice"></select>
+                  <input id="tts-voice-custom" style="display:none" list="tts-voice-list" placeholder="впиши свой голос, напр. ru_RU-irina-medium">
+                  <datalist id="tts-voice-list"></datalist>
+                </label>
+                <label id="tts-rate-row"><span class="s-lbl">Скорость речи: <b id="tts-rate-val">0%</b></span>
+                  <input type="range" id="tts-rate" min="-50" max="50" step="5" value="0">
+                </label>
+                <label class="check"><input type="checkbox" id="tts-auto-play"> Автоматически проигрывать новые ответы</label>
+              </div>
+              <div class="toolbar">
+                <button id="btn-save-tts" class="btn small">💾 Применить озвучку</button>
+                <button id="btn-tts-test" class="btn small">🔊 Проверить голос</button>
+                <button id="btn-tts-download" class="btn small">⬇ Скачать голос</button>
+              </div>
+              <p class="muted" id="tts-state"></p>
+            </div>
+          </details>
+
+          <details class="settings-section">
+            <summary class="settings-head"><span class="s-ico">🧭</span><span class="s-mid"><span class="s-title">Действия</span><span class="s-sub">подсказка · экспорт · удалить</span></span><span class="s-caret"></span></summary>
+            <div class="settings-body">
+              <button id="btn-hint" class="btn small">💡 Подсказка</button>
+              <button id="btn-export" class="btn small">📤 Экспорт истории</button>
+              <button id="btn-export-json" class="btn small">🗄 Полный дамп (JSON)</button>
+              <button id="btn-import-json" class="btn small">📥 Импорт из дампа</button>
+              <input type="file" id="import-json-file" accept="application/json,.json" hidden>
+              <button id="btn-delete-world" class="btn danger small">🗑 Удалить мир</button>
+            </div>
+          </details>
+
+          <details class="settings-section">
+            <summary class="settings-head"><span class="s-ico">🔎</span><span class="s-mid"><span class="s-title">Память</span><span class="s-sub">поиск по RAG</span></span><span class="s-caret"></span></summary>
+            <div class="settings-body">
+              <div class="toolbar">
+                <input id="mem-search" placeholder="Что вспомнить?">
+                <button id="btn-mem-search" class="btn small">Найти</button>
+              </div>
+              <div id="mem-results"></div>
+            </div>
+          </details>
+
+          <details class="settings-section">
+            <summary class="settings-head"><span class="s-ico">🛠</span><span class="s-mid"><span class="s-title">Режим мастера</span><span class="s-sub">JSON-патч состояния</span></span><span class="s-caret"></span></summary>
+            <div class="settings-body">
+              <p class="muted">Изменить состояние мира вручную (JSON-патч по ключам state):</p>
+              <textarea id="master-patch" rows="5" placeholder='{"player":{"gold":100},"flags":{"door_open":true}}'></textarea>
+              <button id="btn-master-patch" class="btn small">Применить патч</button>
+            </div>
+          </details>
+        </div>
+      </div>
+    </aside>
+
+    <main class="chat">
+      <button id="btn-divine" class="btn small divine-btn" title="Воззвать к Провидению — если рассказчик ошибся (не выдал предмет / не списал ресурс и т.п.), Провидение проверит логику и исправит мир">👁 Воззвать к Провидению</button>
+      <div id="log" class="log"></div>
+      <div id="suggestion-bar" class="suggestion-bar" style="display:none"></div>
+      <div class="input-row">
+        <input id="cmd" autocomplete="off" placeholder="Что ты делаешь? (например: осмотреться, поговорить с трактирщиком, обыскать стол…)">
+        <button id="btn-send" class="btn primary">➤</button>
+      </div>
+    </main>
+  </div>
+</div>
+
+<div id="modal" class="modal" style="display:none">
+  <div class="modal-box">
+    <h3 id="modal-title">Заголовок</h3>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button id="modal-ok" class="btn primary">OK</button>
+      <button id="modal-cancel" class="btn">Отмена</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
