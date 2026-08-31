@@ -702,6 +702,17 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
         except Exception as e:
             log.warning("дневник (world %s, seq %s): %s", world_id, idx_seq, e, exc_info=True)
 
+        # C9 «Чеховские ружья» (сессия 34): держим список заряженных, но ещё
+        # не прозвучавших намёков (знакомство/предмет/флаг/место).
+        # Попадает в format_state как «на горизонте…» — только подсказка:
+        # выстрелит или нет, решает мастер (законы 2/3).
+        try:
+            journal.chekhov_update(setting, pre_turn_snapshot, setting,
+                                   reply=final_text, action=text, seq=idx_seq)
+        except Exception as e:
+            log.warning("ружья Чехова (world %s, seq %s): %s", world_id, idx_seq, e,
+                        exc_info=True)
+
     # ── Автосохранение: после каждого обычного хода (не при перегенерации) ──
     if not regenerate:
         try:

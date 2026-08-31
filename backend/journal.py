@@ -97,9 +97,10 @@ def notable_diff(prev: dict, now: dict, action: str = "", sys_msgs: Optional[lis
         if old is None:
             note = f" ({v['desc'][:90]})" if v.get("desc") else ""
             out.append({"cat": CAT_NPC, "title": f"Новое знакомство: {name}{note}",
-                        "text": str(v.get("mood") or "")[:80]})
+                        "text": str(v.get("mood") or "")[:80], "subject": name})
         elif _as_dict(old).get("alive", True) and v.get("alive") is False:
-            out.append({"cat": CAT_NPC, "title": f"{name} мёртв", "text": ""})
+            out.append({"cat": CAT_NPC, "title": f"{name} мёртв", "text": "",
+                        "subject": name})
         elif (v.get("notes") or {}) and isinstance(v.get("notes"), dict) and \
                 (v["notes"] != _as_dict(old).get("notes")):
             # заметки мастера изменились — значит NPC что-то знает/скрыл/раскрыл
@@ -124,14 +125,14 @@ def notable_diff(prev: dict, now: dict, action: str = "", sys_msgs: Optional[lis
             it = _as_dict(ni[name])
             desc = f" — {it['desc'][:90]}" if it.get("desc") else ""
             out.append({"cat": CAT_ITEM, "title": f"Впервые в руках: {name}{desc}",
-                        "text": ""})
+                        "text": "", "subject": str(name)[:60]})
 
     # ── флаги-истины: только новые (поворотные по определению) ──
     pf, nf = _as_dict(prev.get("flags")), _as_dict(now.get("flags"))
     for k in nf:
         if k not in pf and nf[k] is not False:
             out.append({"cat": CAT_FLAG, "title": f"Так в мире и осталось: {k}",
-                        "text": ""})
+                        "text": "", "subject": str(k)[:60]})
 
     # ── бой: кто повержен (счётчик убийств + исчезновение врага) ──
     pe, ne = _as_dict(prev.get("enemies")), _as_dict(now.get("enemies"))
@@ -168,9 +169,9 @@ def notable_diff(prev: dict, now: dict, action: str = "", sys_msgs: Optional[lis
     pl, nl = _as_dict(prev.get("locations")), _as_dict(now.get("locations"))
     for lid in nl:
         if lid not in pl:
-            out.append({"cat": CAT_PLACE,
-                        "title": f"Открыто новое место: {str(_as_dict(nl[lid]).get('name') or lid)[:60]}",
-                        "text": ""})
+            _lname = str(_as_dict(nl[lid]).get("name") or lid)[:60]
+            out.append({"cat": CAT_PLACE, "title": f"Открыто новое место: {_lname}",
+                        "text": "", "subject": _lname})
     cur_now = str(now.get("current_location") or "")
     if cur_now and cur_now != str(prev.get("current_location") or "") and _as_dict(nl.get(cur_now)):
         nm = str(_as_dict(nl[cur_now]).get("name") or cur_now)[:60]
@@ -212,7 +213,8 @@ def record_turn(world_id: int, prev: dict, now: dict, seq: int, action: str = ""
             key = f"t{seq}-{cat}-{abs(hash(title)) % 10_000_000}"
             ent = db.upsert_entity(world_id, KIND, key, name=title,
                                    summary=str(item.get("text") or "")[:220],
-                                   meta={"seq": seq, "cat": cat, "icon": _ICON.get(cat, "•")},
+                                   meta={"seq": seq, "cat": cat, "icon": _ICON.get(cat, "•"),
+                                         "subject": str(item.get("subject") or "")[:60]},
                                    seq=seq)
             if ent:
                 saved.append(ent)
@@ -247,9 +249,20 @@ def entries(world_id: int, limit: int = 100, cat: str = "") -> list[dict]:
         out.append({"seq": int(meta.get("seq") or r.get("seq") or 0), "cat": c,
                     "icon": str(meta.get("icon") or _ICON.get(c, "•")),
                     "title": r.get("name") or "", "text": r.get("summary") or "",
+                    "subject": str(meta.get("subject") or ""),
                     "key": r.get("entity_key")})
     out.sort(key=lambda x: (x["seq"], x["cat"]))
     return out[-max(1, int(limit)):] if limit else out
+
+
+def entry_categories(world_id: int) -> list[dict]:
+    """Категории дневника с числом записей (для фильтров во вкладке)."""
+    counts: dict[str, int] = {}
+    for it in entries(world_id, limit=0):
+        c = str(it.get("cat") or CAT_WORLD)
+        counts[c] = counts.get(c, 0) + 1
+    return [{"cat": c, "icon": _ICON.get(c, "•"), "count": n}
+            for c, n in sorted(counts.items(), key=lambda kv: -kv[1])]
 
 
 def render(world_id: int, limit: int = 40) -> str:
@@ -269,6 +282,81 @@ def render(world_id: int, limit: int = 40) -> str:
     return "\n".join(L)
 
 
+# ── «Чеховские ружья» (сессия 34, C9) ───────────────────────────────────────
+# Заряженные, но ещё НЕ прозвучавшие намёки: знакомство / предмет / флаг / место, о
+# которых мир с тех пор не заикался. Движок лишь ДЕРЖИТ список и показывает его в
+# состоянии («на горизонте…») — выстрелит ружьё, когда и как, решает мастер
+# (законы 2/3: отображение + подсказка, никаких сюжетных решений за рассказчиком).
+_CHEKHOV_CATS = (CAT_NPC, CAT_ITEM, CAT_FLAG, CAT_PLACE)
+_CHEKHOV_MAX = 6           # сколько ружей висит одновременно
+_CHEKHOV_TTL = 12          # ходов, после которых ружьё гаснет само (не вечно)
+
+
+def _mentioned(low: str, name: str) -> bool:
+    """Упомянуто ли имя в тексте (без регистра; значимая часть имени тоже считается).
+
+    «Старый компас» ищется и как целиком, и по самому длинному слову («компас») — иначе
+    ружьё никогда не снималось бы со стены: персонажей и вещи называют коротко.
+    Имена флагов (snake_case) сравниваются ещё и со словами после «_».
+    """
+    n = str(name or "").lower().strip()
+    if len(n) < 3:
+        return False
+    if n in low:
+        return True
+    words = [w for w in n.replace("_", " ").split() if len(w) >= 4]
+    return any(w in low for w in words)
+
+
+def chekhov_update(setting: dict, prev: dict, now: dict, reply: str = "",
+                   action: str = "", seq: int = 0) -> list[dict]:
+    """Продвинуть список ружей после хода: прозвучавшие — снять, новые значимые — зарядить.
+
+    Возвращает актуальный список (он же кладётся в setting["_chekhov"]).
+    """
+    guns = [dict(g) for g in (setting.get("_chekhov") or [])
+            if isinstance(g, dict) and g.get("subject")]
+    low = ((reply or "") + "\n" + (action or "")).lower()
+
+    alive: list[dict] = []
+    for g in guns:
+        if _mentioned(low, g.get("subject")):
+            continue                        # ружьё прозвучало — снимаем со «стены»
+        g["age"] = int(g.get("age") or 0) + 1
+        if g["age"] <= _CHEKHOV_TTL:
+            alive.append(g)
+
+    known = {str(g.get("subject", "")).lower() for g in alive}
+    for item in notable_diff(prev, now, action):
+        cat = str(item.get("cat") or "")
+        subj = str(item.get("subject") or "").strip()
+        if cat not in _CHEKHOV_CATS or not subj or subj.lower() in known:
+            continue
+        if _mentioned(low, subj):
+            continue                        # уже прозвучало в этом же ходу
+        alive.append({"subject": subj[:60], "cat": cat,
+                      "title": str(item.get("title") or subj)[:100],
+                      "seq": int(seq or 0), "age": 0})
+        known.add(subj.lower())
+
+    setting["_chekhov"] = alive[-_CHEKHOV_MAX:]
+    return setting["_chekhov"]
+
+
+def chekhov_text(setting: dict) -> str:
+    """Строка для format_state: что «на горизонте» (пусто — ничего не висит)."""
+    guns = [g for g in (setting.get("_chekhov") or []) if isinstance(g, dict) and g.get("subject")]
+    if not guns:
+        return ""
+    parts = []
+    for g in guns[-_CHEKHOV_MAX:]:
+        icon = _ICON.get(str(g.get("cat") or ""), "•")
+        age = int(g.get("age") or 0)
+        parts.append(f"{icon} {g['subject']}" + (f" (висит {age} х.)" if age else ""))
+    return "; ".join(parts)
+
+
 __all__ = ["KIND", "record_turn", "notable_diff", "entries", "render",
-           "add_player_note", "CAT_NOTE", "CAT_QUEST", "CAT_NPC", "CAT_ITEM", "CAT_FLAG",
+           "add_player_note", "chekhov_update", "chekhov_text", "entry_categories",
+           "CAT_NOTE", "CAT_QUEST", "CAT_NPC", "CAT_ITEM", "CAT_FLAG",
            "CAT_COMBAT", "CAT_ROLE", "CAT_PLACE", "CAT_WORLD"]

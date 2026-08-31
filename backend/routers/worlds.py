@@ -880,6 +880,35 @@ def _slash_journal(world_id: int, text: str = ""):
     return {"reply": body, "events": [], "state": setting, "game_over": False}
 
 
+# ───────────────────────────── Дневник / ресурсы ─────────────────────────────
+@router.get("/api/worlds/{world_id}/journal")
+async def journal_list(world_id: int, limit: int = 100, cat: str = ""):
+    """📔 Дневник приключений (сессия 34, C2) — хроника значимого для UI-вкладки.
+
+    `cat` — фильтр категории (quest/npc/item/flag/combat/role/place/world/note).
+    Закон 2: только чтение того, что движок уже зафиксировал по диффу состояний.
+    """
+    from .. import journal as _jr
+    if not db.get_world(world_id):
+        raise HTTPException(404, "Мир не найден")
+    return {"entries": _jr.entries(world_id, limit=limit, cat=cat),
+            "categories": _jr.entry_categories(world_id)}
+
+
+@router.get("/api/worlds/{world_id}/risk")
+async def risk_report(world_id: int, idea: str = ""):
+    """🧭 /risk как REST (сессия 34, C7) — чем персонаж может закрыть идею.
+
+    Чистый форматировщик состояния (без LLM, без вердиктов): перечень фактов «есть/нет».
+    """
+    from ..risk import describe_risk
+    world = db.get_world(world_id)
+    if not world:
+        raise HTTPException(404, "Мир не найден")
+    setting = json.loads(world["setting"])
+    return {"reply": describe_risk(setting, idea), "state": setting}
+
+
 # ───────────────────────────── Сохранения ─────────────────────────────
 @router.get("/api/worlds/{world_id}/rewind/points")
 async def rewind_points(world_id: int):
