@@ -14,7 +14,7 @@ import time
 
 from fastapi import HTTPException
 
-from .. import bg, db, graph, llm, metrics, narrator, tts
+from .. import bg, db, graph, journal, llm, metrics, narrator, tts
 from ..config import est_tokens, get_config, KEY_MASK
 from ..schemas import ProviderIn
 
@@ -690,6 +690,18 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
         except Exception as e:
             log.warning("карточки знаний (world %s, seq %s): %s", world_id, idx_seq, e)
 
+        # 📔 Дневник приключений (сессия 34, C2): что в этом ходу было ЗНАЧИМО (квест/итог,
+        # первая встреча, уникальная находка, смена роли, новое место, смерть, истёкший срок).
+        # Детерминированно по диффу «до/после» (pre_turn_snapshot снят до тика эффектов) —
+        # без LLM: хронике нужна точность фактов, а не фантазия (закон 2: только отображение).
+        try:
+            jcards = journal.record_turn(world_id, pre_turn_snapshot, setting, idx_seq,
+                                         action=text, sys_msgs=sys_msgs)
+            if jcards:
+                asyncio.get_event_loop().create_task(narrator.index_entities(world_id, jcards))
+        except Exception as e:
+            log.warning("дневник (world %s, seq %s): %s", world_id, idx_seq, e, exc_info=True)
+
     # ── Автосохранение: после каждого обычного хода (не при перегенерации) ──
     if not regenerate:
         try:
@@ -1078,8 +1090,9 @@ async def _maybe_autonomous_master(world_id: int, setting: dict, action: str, re
         if turns - last < interval:
             return
         # Детерминированный признак «застрял»: повтор последних действий игрока / брождение без квестов
-        evs = db.get_events(world_id)
-        actions = [e["content"] for e in evs if e["role"] == "player"]
+        # B5: берём ровно хвост действий из БД (нужны последние ≤6), а не весь лог мира
+        actions = [e["content"] for e in db.get_events(world_id, limit=24)
+                   if e["role"] == "player"]
         quests = s.get("quests") or {}
         active = sum(1 for q in quests.values() if isinstance(q, dict) and q.get("status") in ("active", None))
         reason = narrator.master_stuck_reason(actions, active, turns)

@@ -629,6 +629,29 @@ def get_events_before(world_id: int, before_seq: int) -> list[dict]:
         return _run(lambda: _get_events_before(world_id, before_seq))
 
 
+def get_history_page(world_id: int, before_seq: int = 0, limit: int = 60) -> list[dict]:
+    """Страница истории (сессия 34, B5): последние `limit` событий раньше before_seq —
+    ОГРАНИЧЕННО в SQL. Раньше роутер тянул ВЕСЬ лог мира и резал его в Python, поэтому
+    открытие длинного прохождения тем медленнее, чем дальше прошёл игрок."""
+    with _lock:
+        return _run(lambda: _get_history_page(world_id, before_seq, limit))
+
+
+async def _get_history_page(world_id: int, before_seq: int, limit: int) -> list[dict]:
+    conn = await _open()
+    args: list[Any] = [world_id]
+    where = "world_id = ?"
+    if before_seq:
+        where += " AND seq < ?"
+        args.append(int(before_seq))
+    n = max(1, int(limit or 0)) if limit else 100000
+    args.append(n)
+    cur = await conn.execute(
+        f"SELECT * FROM (SELECT * FROM events WHERE {where} ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC",
+        args)
+    return [_event_obj(r) for r in await cur.fetchall()]
+
+
 async def _get_events_before(world_id: int, before_seq: int) -> list[dict]:
     conn = await _open()
     cur = await conn.execute(

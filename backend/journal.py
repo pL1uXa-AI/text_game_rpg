@@ -28,7 +28,7 @@ from .logsetup import get_logger
 log = get_logger(__name__)
 
 KIND = "journal"
-# категории (для иконки/фильтра в UI)
+# категории (для иконки/фильтра в UI). note — заметка самого игрока (/journal note …)
 CAT_QUEST = "quest"
 CAT_NPC = "npc"
 CAT_ITEM = "item"
@@ -37,9 +37,11 @@ CAT_COMBAT = "combat"
 CAT_ROLE = "role"
 CAT_PLACE = "place"
 CAT_WORLD = "world"
+CAT_NOTE = "note"
 
 _ICON = {CAT_QUEST: "📜", CAT_NPC: "👤", CAT_ITEM: "🎒", CAT_FLAG: "🚩",
-         CAT_COMBAT: "⚔️", CAT_ROLE: "⭐", CAT_PLACE: "🗺", CAT_WORLD: "🌍"}
+         CAT_COMBAT: "⚔️", CAT_ROLE: "⭐", CAT_PLACE: "🗺", CAT_WORLD: "🌍",
+         CAT_NOTE: "✍️"}
 
 
 def _as_dict(v: Any) -> dict:
@@ -58,6 +60,8 @@ def notable_diff(prev: dict, now: dict, action: str = "", sys_msgs: Optional[lis
     """
     prev, now = _as_dict(prev), _as_dict(now)
     out: list[dict] = []
+    if not now:
+        return out
 
     # ── квесты: принятие / шаг / итог ──
     pq, nq = _as_dict(prev.get("quests")), _as_dict(now.get("quests"))
@@ -203,6 +207,8 @@ def record_turn(world_id: int, prev: dict, now: dict, seq: int, action: str = ""
             title = str(item.get("title") or "").strip()[:120]
             if not title:
                 continue
+            # ключ стабилен по (ход, категория, заголовок): перегенерация того же хода
+            # перезапишет свою запись, а не заведёт вторую
             key = f"t{seq}-{cat}-{abs(hash(title)) % 10_000_000}"
             ent = db.upsert_entity(world_id, KIND, key, name=title,
                                    summary=str(item.get("text") or "")[:220],
@@ -213,6 +219,17 @@ def record_turn(world_id: int, prev: dict, now: dict, seq: int, action: str = ""
     except Exception as e:
         log.warning("дневник (world %s, seq %s): запись не удалась: %s", world_id, seq, e)
     return saved
+
+
+def add_player_note(world_id: int, note: str) -> Optional[dict]:
+    """Заметка игрока (/journal note …). Закон 2: код хранит и показывает, смысл за ним."""
+    note = (note or "").strip()[:400]
+    if not note:
+        return None
+    seq = db.latest_seq(world_id)
+    return db.upsert_entity(world_id, KIND, f"t{seq}-note-{abs(hash(note)) % 100000}",
+                            name=note, summary="", seq=seq,
+                            meta={"seq": seq, "cat": CAT_NOTE, "icon": _ICON[CAT_NOTE]})
 
 
 def entries(world_id: int, limit: int = 100, cat: str = "") -> list[dict]:
@@ -250,3 +267,8 @@ def render(world_id: int, limit: int = 40) -> str:
             last_turn = it["seq"]
         L.append(f"  {it['icon']} {it['title']}" + (f"\n      {it['text']}" if it["text"] else ""))
     return "\n".join(L)
+
+
+__all__ = ["KIND", "record_turn", "notable_diff", "entries", "render",
+           "add_player_note", "CAT_NOTE", "CAT_QUEST", "CAT_NPC", "CAT_ITEM", "CAT_FLAG",
+           "CAT_COMBAT", "CAT_ROLE", "CAT_PLACE", "CAT_WORLD"]

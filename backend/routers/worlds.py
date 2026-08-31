@@ -276,12 +276,9 @@ async def world_graph(world_id: int, target: str | None = None):
 async def history(world_id: int, before: int = 0, limit: int = 60):
     """Вся история событий мира. Для постраничного просмотра лога:
     `before` — брать события строго раньше этого seq; `limit` — сколько штук (по умолчанию всё)."""
-    evs = db.get_events(world_id)
-    if before:
-        older = [e for e in evs if e["seq"] < before]
-        # последние `limit` событий до before, в хронологическом порядке (самые свежие из страницы)
-        evs = older[-limit:] if limit else older
-    return evs
+    # B5 (сессия 34): страница вырезается в SQL — раньше тянули ВЕСЬ лог мира и срезали в
+    # Python, из-за чего просмотр истории длинного прохождения тормозил линейно.
+    return db.get_history_page(world_id, before_seq=before or 0, limit=limit or 0)
 
 
 @router.get("/api/worlds/{world_id}/events")
@@ -450,16 +447,8 @@ async def divine(world_id: int, body: DivineIn, _rl: None = Depends(make_guard("
 
     providers = _world_providers(world)
     # Последний обмен (действие → ответ), на который указывает игрок — Провидение сверяет с ним
-    evs = db.get_events(world_id)
-    action_last, reply_last = "", ""
-    for e in reversed(evs):
-        r = e["role"]
-        if reply_last == "" and r == "narrator":
-            reply_last = e["content"]
-        elif action_last == "" and r == "player":
-            action_last = e["content"]
-        if action_last and reply_last:
-            break
+    # B5: последний обмен двумя короткими запросами вместо всего лога
+    action_last, reply_last = db.get_last_exchange(world_id)
 
     res = await narrator.divine_intervene(world_id, world, setting, complaint,
                                           action=action_last, reply=reply_last,
