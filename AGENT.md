@@ -466,6 +466,34 @@ git status --short | grep -E "^A.*\.env($|\b)"        # пусто (.env не в
 
 ## 📊 ТЕКУЩЕЕ СОСТОЯНИЕ (проверять перед работой)
 
+**Сессия 34 (пакет «реальность и устойчивость»: логи, бюджеты, перемотка, очередь, SSE, UX-фичи):**
+- **Логи (E1, `logsetup.py`)**: JSON-лог в `data/logs/game.log` (ротация) + контекст хода через `turn_context(world_id, seq, agent)`; middleware добавляет `request_id`; `log_once()` для легальных фолбэков (не заливать лог), `reset_for_tests()`/`reconfigure()` для тестов и админки. Оставшиеся тихие `except: pass` → лог (правило 14), список и оправдания легальных фолбэков — в коде.
+- **Перемотка (A1/A4/C1, `rewind.py`)**: единый `rewind_to(world_id, before_seq, mode="delete"|"hide", note)`; `folded` теперь 0/1/2 (visible/summary/hidden), `mark_folded` трогает только player/narrator; `load_save` переписан (раньше сворачивал ВСЁ подряд — терялась недавняя история); Chroma чистится по удалённым/сокрытым обменам и сводкам (`_purge_vectors`). Таблица `turn_snapshots(world_id, seq, setting, created_at)` — состояние ПЕРЕД ходом для отката (keep `TURN_SNAPSHOT_KEEP`). Эндпоинты: `GET /rewind/points`, `POST /rewind {seq, mode}`.
+- **Бюджеты контекста (A2/B4)**: `world_recent_budget` = контекст − (измеренный промпт + ответ) − доля окна на память (было: догадка 2600 при реальном ~6200 и резерв 16384 > локальных 8192); `build_messages` возвращает `(messages, meta)` и **гарантирует невыход за окно** (усекает лор→RAG→карточки→recent, карточки сцены никогда). Ярусы промпта `gated_rules/trim_prompt` (−30% токенов в мире без подсистем; правила 9/9а/16 не выкладываются — риск задвоенного урона).
+- **Очередь фоновых агентов (B3, `bg.py`)**: `submit(name, factory, priority, world_id, agent)` с heapq-приоритетом и семафором (`LLM_BG_CONCURRENCY`); `player_turn()` — ход игрока всегда первый; потолок очереди (`LLM_BG_MAX_QUEUE`); статистика в `/api/metrics` (`bg_queue`). Все 6 агентов переведены с `create_task` на `bg.submit` (deepcopy до лямбды!).
+- **Ретраи (B2, `retry.py`)**: `with_retries(factory, config_key, ...)` + `is_transient()`; `llm.complete`/`stream_chat` (стрим повторяется только до первого токена), `chroma_client._raw`, `embeddings._http_json`. Ключи `LLM_RETRIES/LLM_RETRY_BACKOFF/LLM_TIMEOUT/CHROMA_RETRIES/EMBEDDING_RETRIES`.
+- **Шина событий (D3, `bus.py`)**: `subscribe/publish/publish_threadsafe` + хук `db.add_event_listener` (события копятся в транзакции, рассылаются после COMMIT); `GET /api/worlds/{id}/events/stream?after=` (SSE + heartbeat), поллинг `/events?since=` остаётся запасным.
+- **Метрики качества (E3)**: `llm._capture_finish` (finish_reason/usage); `metrics.record` пишет `cut_by_limit/cut_mid/prompt_trimmed/rag_score_avg/bg_queue`; `retrieve_memory(..., scores_out=[])` — оценки релевантности; `_memory_audit(..., rag_scores)` кладёт score в плашку «🧠 Память».
+- **Игровые фичи (backend + фронт)**: `journal.py` (дневник: детерминированный дифф значимого, `record_turn` в транзакции хода, kind="journal" НЕ в контексте модели, `/journal` вкладка, `/journal note …`); `risk.py` (`/risk <идея>` — 9 осей ресурсов, чистый форматировщик без LLM/вердиктов); `chekhov_update/chekhov_text` (ружья Чехова: заряжаются из диффа, снимаются по упоминанию значимым словом, гаснут по TTL 12, «🏹 На горизонте» в format_state + правило 36); C5 (npc.notes → «🗝 Знания и тайны» в state + правило 35), C6 (`enemy_effect_add/remove`, `enemy_mark` — только хранение, не тикают; правила 34), C8 (`quest_success/quest_fail`, `quest {timer}` → дедлайн квеста через `setting.timers`; правила 33). Правила 33–36 в промпте; директивы зарегистрированы в `GAME_ENGINE_TOOL`/fmt_head/examples/`_EFFECT_KEYS`.
+- **Выборки (B5)**: `get_unfolded_events/get_turn_events/count_events/get_latest_by_role/get_last_exchange/get_history_page/get_summary_events` + индексы `(world_id, folded, seq)`, `(world_id, role, seq)`; `/history` отдаёт страницу из SQL.
+- **E2**: `ruff.toml` (E4/E7/E9/F, line-length 140, ignore E501/F401), `mypy.ini` (нестрогий), CI-шаги ruff (обязателен), mypy/coverage (continue-on-error). `.env.example` дополнен 15 ключами.
+- **Фронтенд**: вкладка «Дневник» (журнал + заметка + фильтр), кнопки «⏪ Назад к ходу» и «🧭 Мои средства», компас соседей (`#compass-bar`), часы мира (`#world-clock`), EventSource-подписка (поллинг фолбэк).
+- **Тесты**: 303 passed (было 278): `test_session34_rewind.py` (A1/A4/C1/B5/fold), `test_memory_layer.py` (A2/B4), `test_session34_features.py` (journal/risk/chekhov/rewind-endpoints).
+- **Проверено живьём**: перезапуск на 8002; `GET /journal` после `/journal note` отдаёт запись; `/risk?idea=взлом` — справка; `/rewind/points` растёт с ходами; метрики `cut_by_limit_rate=0`; `data/logs/game.log` пишется с `[w<id>]`-контекстом.
+
+**Подводные камни сессии 34 (проверять при доработках):**
+1. `admin_settings` читает БД отдельным соединением — config→db→config вешает сервер. LOG_* резолвятся в logsetup напрямую из env/.env (без админки).
+2. rewind в "hide" разворачивает строго `[unfold_from; seq-1]` — иначе вернёт сокрытое будущее.
+3. `bg.submit` принимает и лямбду, и корутину (`_CoroutineAdapter`); deepcopy — ДО лямбды.
+4. `llm.stream_chat` повторяется только до первого переданного токена.
+5. `build_messages` теперь возвращает `(messages, meta)` — обновляй вызывающих.
+6. `mark_folded` по умолчанию трогает только player/narrator.
+7. journal-карточки не должны попадать в `select_relevant_entities` (фильтр, а не штраф).
+8. `db.add_event_listener` копит события в транзакции, рассылает после COMMIT (не на rollback).
+9. Правила 9/9а/16 не выкладываются ярусами промпта (риск задвоенного урона).
+10. `lore_rules` — НЕ f-строка: фигурные скобки одинарные; в f-строках fmt_head/примеров — двойные.
+11. В тестах `LOG_FILE` = temp; `root.propagate=True` + NullHandler на корне (иначе caplog слепнет).
+
 **Сессия 33 (git + безопасность + переносимость миров + тесты слоя памяти):**
 - **Git-репозиторий** `origin = https://github.com/pL1uXa-AI/text_game_rpg` (приватный): `.gitignore`
   (секретные `.env`/`.env.*`, вся папка `data/` = 841 МБ, логи, `nul`, кэши, черновики, папка заметок
