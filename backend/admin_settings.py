@@ -64,13 +64,7 @@ def read_overrides() -> dict:
         return {}
 
 
-# Поля, которые админка может переопределять (для валидации в роутере / из docs)
-OVERRIDABLE_KEYS: tuple[str, ...] = (
-    "MAIN_PROVIDER", "MAIN_BASE_URL", "MAIN_API_KEY", "MAIN_MODEL",
-    "EMBEDDING_PROVIDER", "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
-    "RERANK_PROVIDER", "RERANK_BASE_URL", "RERANK_API_KEY", "RERANK_MODEL",
-    "RERANK_ENABLED", "HYBRID_WEIGHT_BM25",
-    "LOCAL_EMBEDDING_MODEL", "LOCAL_EMBEDDING_DIM", "LOCAL_EMBEDDING_CACHE",
-    "DEFAULT_TEMP", "DEFAULT_TOP_P", "MAX_TOKENS", "CONTEXT_TOKENS",
-    "TTS_ENABLED", "TTS_PROVIDER", "TTS_VOICE", "TTS_RATE", "TTS_AUTO_PLAY",
-)
+# Реестр «что можно переопределять» (OVERRIDABLE_KEYS) раньше жил здесь и не читался
+# НИОТКУДА — из-за чего отстал от реальных настроек админки (сессия 38, D1/B5).
+# Единственный источник — config.overridable_env_keys(): производен от dataclass, устареть
+# не может; его валидирует роутер и по нему фронт строит «сбросить всё к .env».

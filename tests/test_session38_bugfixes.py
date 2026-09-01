@@ -824,9 +824,19 @@ def test_frontend_handles_object_events_response():
 
 
 def test_frontend_dedupes_by_event_id():
-    """E3: дедюп сообщений по id события, а не по seq (служебные сообщения без seq)."""
+    """E3: дедюп сообщений лога — по id события, а не по seq.
+
+    По `data-seq` второе идентичное служебное сообщение (без seq — `appendMsg({role:
+    "system"…})`) считалось «уже нарисованным» и терялось, а селектор
+    `.msg[data-seq=""]`/`[data-seq="undefined"]` строился из значения из БД."""
     app = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")
-    assert "data-eid" in app, "нет дедюпликации по id события"
+    fn = app[app.index("function appendMsg("):]
+    fn = fn[:fn.index("\n}\n")]
+    assert 'data-id="' in fn and "CSS.escape" in fn, \
+        f"appendMsg не дедюплирует по id события:\n{fn[:400]}"
+    assert 'data-seq="${e.seq}"' not in fn, "старый хрупкий селектор по seq вернулся"
+    # локальным (оптимистичным) сообщениям без id выдаётся временный id
+    assert "_localMsgId" in fn, "локальные сообщения без seq снова слипаются"
 
 
 def test_check_frontend_passes():

@@ -139,6 +139,23 @@ class AdminSettingsIn(BaseModel):
     tick_needs_enabled: Optional[bool] = None
     divine_cooldown_turns: Optional[str] = None
     max_action_chars: Optional[str] = None
+    # наблюдаемость и устойчивость (сессия 38, B5): раньше README обещал, что админка
+    # покрывает «все ключевые параметры», а эти задавались только .env. Все они влияют на
+    # расход токенов или на наблюдаемость, поэтому имеют смысл в UI между запусками.
+    log_level: Optional[str] = None
+    log_max_bytes: Optional[str] = None
+    log_backup_count: Optional[str] = None
+    log_prompt_dump: Optional[bool] = None
+    llm_retries: Optional[str] = None
+    llm_retry_backoff: Optional[str] = None
+    llm_timeout: Optional[str] = None
+    chroma_retries: Optional[str] = None
+    embedding_retries: Optional[str] = None
+    llm_bg_concurrency: Optional[str] = None
+    llm_bg_max_queue: Optional[str] = None
+    llm_bg_yield_turn: Optional[bool] = None
+    prompt_tiers_enabled: Optional[bool] = None
+    turn_snapshot_keep: Optional[str] = None
     # переносимость и наблюдаемость (сессия 33)
     detect_model_context: Optional[bool] = None
     backup_db_on_start: Optional[bool] = None

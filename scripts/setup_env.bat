@@ -11,14 +11,22 @@ REM Запускать из корня проекта. Ничего не пер�
 setlocal
 cd /d %~dp0..
 
-set PY=D:\Development\Development_Tools\Runtimes\Python\3.12.10\python.exe
+REM D13 (аудит 38): абсолютный путь к python.exe был зашит в скрипт — на другой машине он
+REM был нерентабелен (правка файла руками). Теперь: PY из окружения → python из PATH →
+REM внятная ошибка с подсказкой, как задать свой интерпретатор.
+if "%PY%"=="" set "PY=python"
 if not exist "%PY%" (
-    echo [ERROR] Питон не найден: "%PY%"
-    echo         Поправь переменную PY в этом файле на свой python.exe ^(3.11+^).
+    REM не путь (имя в PATH) — проверяем запускаемость ниже
+    echo [INFO] "%PY%" — не путь к файлу, пробуем как имя из PATH
+)
+"%PY%" -V 1>nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Python 3.11+ не найден "(PY=%PY%)".
+    echo         Запусти так:  set PY=C:\путь\python.exe ^&^& scripts\setup_env.bat
+    echo         ^(или добавь python в PATH^)
     pause
     exit /b 1
 )
-"%PY%" -V || (echo [ERROR] python не запускается & pause & exit /b 1)
 
 echo.
 echo [1/4] Конфигурация

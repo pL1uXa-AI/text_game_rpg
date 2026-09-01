@@ -44,8 +44,17 @@ jobs:
       - name: "Mechanics regression (no server)"
         run: python -X utf8 scripts/test_directives.py
 
-      - name: "Plot validation (plots/*.js по схеме PLOTS.md)"
-        run: python -X utf8 scripts/check_plot.py plots/system/*.js
+      - name: "Plot validation (сюжеты по схеме PLOTS.md: комплектные и свои)"
+        # D15/B2 (аудит 38): раньше проверялись только plots/system — сюжет игрока с
+        # призрачным id квеста/локации доходил до рантайма. Каталог plots/user пуст,
+        # поэтому второй вызов — условный (glob не раскрывается → check_plot ругается).
+        run: |
+          python -X utf8 scripts/check_plot.py plots/system/*.js
+          if compgen -G "plots/user/*.js" > /dev/null; then
+            python -X utf8 scripts/check_plot.py plots/user/*.js
+          else
+            echo "::notice::plots/user пуст — свои сюжеты проверять нечего"
+          fi
 
       - name: "Frontend checks (node --check + id-ссылки)"
         run: python -X utf8 scripts/check_frontend.py

@@ -464,6 +464,30 @@ class Config:
         )
 
 
+def overridable_env_keys() -> tuple[str, ...]:
+    """Имена env/админки, которые МОЖНО переопределять: поля Config в верхнем регистре.
+
+    B5/D1 (аудит 38): раньше такой реестр (`admin_settings.OVERRIDABLE_KEYS`, 26 имён)
+    был только объявлением — ни роутер, ни документация его не читали, и он отстал от
+    реальных настроек (в нём не было AUTONOMOUS_MASTER_*, ENEMY_AI_*, LOGIC_JUDGE_*,
+    DIVINE_COOLDOWN_TURNS, RAG_*, LORE_*, COSINE_*, METRICS_*). Источник теперь выводится
+    из dataclass и устареть не может: имя env-ключа проекта = ИМЯ_ПОЛЯ Config (закреплено
+    тестом test_env_example_covers_all_config_keys).
+    """
+    return tuple(sorted(f.upper() for f in Config.__dataclass_fields__))
+
+
+def hidden_admin_keys() -> tuple[str, ...]:
+    """Ключи, которых в админке сознательно нет — их нельзя поменять «на живую».
+
+    Это инфраструктура (путь к данным/порты: нужен перезапуск) и `LOG_FILE`: logsetup
+    настраивается до первого чтения конфига и берёт путь из env/.env напрямую
+    (config→db→config — рекурсия опасна), поэтому правка пути к журналу через админку
+    молча не применилась бы. README и админка говорят об этом честно (B5)."""
+    return ("DB_PATH", "GAME_HOST", "GAME_PORT", "CHROMA_HOST", "CHROMA_PORT",
+            "CHROMA_COLLECTION", "LOG_FILE")
+
+
 def get_config() -> Config:
     if "cfg" not in _cache:
         _cache["cfg"] = Config.load()

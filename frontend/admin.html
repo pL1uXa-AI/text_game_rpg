@@ -177,6 +177,45 @@
   </div>
 
   <div class="admin-panel">
+    <!-- B5 (сессия 38): README обещал, что админка покрывает «все ключевые параметры», а эти
+         задавались только .env. Все они влияют на расход токенов или на наблюдаемость. -->
+    <h2>🛡 Устойчивость обращений и журнал</h2>
+    <p class="muted">Повторы при временных сбоях (429/5xx/таймаут), параллелизм фоновых агентов и
+      уровень журнала. Меняется на лету (кроме пути к файлу журнала — он только в <code>.env</code>).</p>
+    <label title="DEBUG показывает легальные фолбэки (log_once) и тихие деградации RAG">
+      Уровень журнала <select id="a-log-level">
+        <option value="">По умолчанию</option>
+        <option value="DEBUG">DEBUG</option>
+        <option value="INFO">INFO</option>
+        <option value="WARNING">WARNING</option>
+        <option value="ERROR">ERROR</option>
+      </select></label>
+    <label class="check" title="Дамп собранного промпта хода в лог на DEBUG — видно, что реально ушло в модель">
+      <input type="checkbox" id="a-log-prompt-dump"> 🧾 Дампить промпт хода в журнал</label>
+    <label>Размер файла журнала до ротации, байт
+      <input type="number" min="65536" max="268435456" step="65536" id="a-log-max-bytes" placeholder="5242880"></label>
+    <label>Архивных файлов журнала
+      <input type="number" min="0" max="30" id="a-log-backup-count" placeholder="3"></label>
+    <label title="Повторов ПОСЛЕ первой попытки; 0 = отключить">
+      Повторы LLM <input type="number" min="0" max="5" id="a-llm-retries" placeholder="2"></label>
+    <label>Базовая задержка повтора, сек (удваивается)
+      <input type="number" min="0" max="10" step="0.1" id="a-llm-retry-backoff" placeholder="0.8"></label>
+    <label>Таймаут запроса к модели, сек
+      <input type="number" min="10" max="3600" step="10" id="a-llm-timeout" placeholder="300"></label>
+    <label>Повторы ChromaDB <input type="number" min="0" max="5" id="a-chroma-retries" placeholder="1"></label>
+    <label>Повторы эмбеддингов <input type="number" min="0" max="5" id="a-embedding-retries" placeholder="1"></label>
+    <label title="Сколько фоновых LLM-проходов идёт одновременно (ход игрока всегда вне очереди)">
+      Фоновых LLM параллельно <input type="number" min="1" max="4" id="a-bg-concurrency" placeholder="2"></label>
+    <label>Потолок очереди фоновых задач <input type="number" min="1" max="512" id="a-bg-max-queue" placeholder="32"></label>
+    <label class="check" title="Пока идёт ход игрока, фоновые агенты не стартуют">
+      <input type="checkbox" id="a-bg-yield-turn"> ⏳ Фон уступает ход игрока</label>
+    <label class="check" title="Выключи, чтобы рассказчик всегда получал ПОЛНЫЙ промпт: ярусы режут правила о подсистемах, которых в мире пока нет">
+      <input type="checkbox" id="a-prompt-tiers"> ✂️ Ярусы системного промпта (экономия контекста)</label>
+    <label title="Каждая точка ~1–5 КБ JSON; 0 = хранить все">
+      Хранить точек перемотки на мир <input type="number" min="0" max="5000" id="a-snapshot-keep" placeholder="120"></label>
+  </div>
+
+  <div class="admin-panel">
     <h2>🔊 Озвучка (TTS)</h2>
     <p class="muted">Глобальные настройки озвучки рассказчика (per-мир переопределяется во вкладке Настройки мира).</p>
     <label>Провайдер
@@ -312,6 +351,7 @@ async function load() {
   const stored = d.stored || {};
   const eff = d.effective || {};
   const prov = eff.providers || {};
+  ALL_ADMIN_KEYS = (d.overridable && d.overridable.length) ? d.overridable : ALL_ADMIN_KEYS;
 
   ["main", "embedding", "rerank"].forEach((kind) => {
     const p = prov[kind] || {};
@@ -402,6 +442,27 @@ async function load() {
   }
   const rthr = $("a-rerank-threshold"); if (rthr) { rthr.value = stored.RERANK_THRESHOLD !== undefined ? stored.RERANK_THRESHOLD : (eff.rerank_threshold ?? ""); rthr.placeholder = "" + (eff.rerank_threshold ?? ""); }
 
+  // Устойчивость обращений и журнал (B5, сессия 38)
+  const rt = eff.runtime || {};
+  const logLevel = $("a-log-level");
+  if (logLevel) {
+    logLevel.value = stored.LOG_LEVEL !== undefined ? stored.LOG_LEVEL : "";
+    logLevel.placeholder = rt.log_level || "INFO";
+  }
+  setAgCheck("a-log-prompt-dump", "LOG_PROMPT_DUMP", rt.log_prompt_dump);
+  setAg("a-log-max-bytes", "LOG_MAX_BYTES", rt.log_max_bytes);
+  setAg("a-log-backup-count", "LOG_BACKUP_COUNT", rt.log_backup_count);
+  setAg("a-llm-retries", "LLM_RETRIES", rt.llm_retries);
+  setAg("a-llm-retry-backoff", "LLM_RETRY_BACKOFF", rt.llm_retry_backoff);
+  setAg("a-llm-timeout", "LLM_TIMEOUT", rt.llm_timeout);
+  setAg("a-chroma-retries", "CHROMA_RETRIES", rt.chroma_retries);
+  setAg("a-embedding-retries", "EMBEDDING_RETRIES", rt.embedding_retries);
+  setAg("a-bg-concurrency", "LLM_BG_CONCURRENCY", rt.llm_bg_concurrency);
+  setAg("a-bg-max-queue", "LLM_BG_MAX_QUEUE", rt.llm_bg_max_queue);
+  setAgCheck("a-bg-yield-turn", "LLM_BG_YIELD_TURN", rt.llm_bg_yield_turn);
+  setAgCheck("a-prompt-tiers", "PROMPT_TIERS_ENABLED", rt.prompt_tiers_enabled);
+  setAg("a-snapshot-keep", "TURN_SNAPSHOT_KEEP", rt.turn_snapshot_keep);
+
   // TTS (озвучка)
   const ttsEff = eff.tts || {};
   const ttsProvider = $("a-tts-provider");
@@ -486,8 +547,26 @@ function collect() {
     if (model) payload[`${kind}_model`] = model;
   });
   payload.rerank_enabled = boolOr("a-rerank-enabled");
+  // A17 (сессия 38): поля «сколько вернуть» (RERANK_TOP_N) в форме больше нет — размер
+  // выдачи задаётся RAG_MEMORY_K / LORE_RAG_K, вторая ручка на то же самое была декорацией.
   const rthr = valOr("a-rerank-threshold");
   if (rthr) payload.rerank_threshold = rthr;
+  // B5 (сессия 38): устойчивость обращений и журнал — без этого поля формы не сохранялись
+  const ll = valOr("a-log-level");
+  if (ll !== null) payload.log_level = ll;
+  const lpb = valOr("a-log-max-bytes"); if (lpb) payload.log_max_bytes = lpb;
+  const lbc = valOr("a-log-backup-count"); if (lbc) payload.log_backup_count = lbc;
+  payload.log_prompt_dump = boolOr("a-log-prompt-dump");
+  const lr = valOr("a-llm-retries"); if (lr) payload.llm_retries = lr;
+  const lrb = valOr("a-llm-retry-backoff"); if (lrb) payload.llm_retry_backoff = lrb;
+  const lt = valOr("a-llm-timeout"); if (lt) payload.llm_timeout = lt;
+  const cr = valOr("a-chroma-retries"); if (cr) payload.chroma_retries = cr;
+  const er = valOr("a-embedding-retries"); if (er) payload.embedding_retries = er;
+  const bc = valOr("a-bg-concurrency"); if (bc) payload.llm_bg_concurrency = bc;
+  const bq = valOr("a-bg-max-queue"); if (bq) payload.llm_bg_max_queue = bq;
+  payload.llm_bg_yield_turn = boolOr("a-bg-yield-turn");
+  payload.prompt_tiers_enabled = boolOr("a-prompt-tiers");
+  const sk = valOr("a-snapshot-keep"); if (sk) payload.turn_snapshot_keep = sk;
   payload.background_tasks_enabled = boolOr("a-bgtasks-enabled");
   const hw = valOr("a-hybrid-weight");
   if (hw !== null) payload.hybrid_weight_bm25 = hw;
@@ -574,8 +653,14 @@ async function save() {
 }
 
 $("a-save").onclick = save;
-// Все ключи админки, которые умеет отдавать обратно в .env (имена env в верхнем регистре).
-const ALL_ADMIN_KEYS = [
+// B5.2 (сессия 38): список ключей для «сбросить всё к .env» больше НЕ дублируется в
+// разметке. Раньше он жил ТРЕТЬИМ независимым местом (после схемы AdminSettingsIn и
+// ответа GET /api/admin/settings) и расходился с реальностью: добавленная в бэкенд
+// настройка не сбрасывалась, а удалённая (RERANK_TOP_N, A17) осталась «висеть».
+// Теперь список приходит от сервера (d.overridable — он производен от dataclass Config).
+// FALLBACK-список на случай, если сервер не вернул d.overridable. Расходится с реальностью
+// не должен — сверяется тестом test_admin_reset_keys_match_backend.
+let ALL_ADMIN_KEYS = [
   "MAIN_BASE_URL", "MAIN_API_KEY", "MAIN_MODEL",
   "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
   "RERANK_BASE_URL", "RERANK_API_KEY", "RERANK_MODEL", "RERANK_ENABLED",
@@ -589,6 +674,10 @@ const ALL_ADMIN_KEYS = [
   "EVENT_EVERY_TURNS", "AUTONOMOUS_MASTER_ENABLED", "AUTONOMOUS_MASTER_INTERVAL",
   "ENEMY_AI_ENABLED", "ENEMY_AI_INTERVAL", "TICK_EFFECTS_ENABLED", "TICK_NEEDS_ENABLED",
   "DIVINE_COOLDOWN_TURNS", "MAX_ACTION_CHARS",
+  "LOG_LEVEL", "LOG_MAX_BYTES", "LOG_BACKUP_COUNT", "LOG_PROMPT_DUMP",
+  "LLM_RETRIES", "LLM_RETRY_BACKOFF", "LLM_TIMEOUT", "CHROMA_RETRIES", "EMBEDDING_RETRIES",
+  "LLM_BG_CONCURRENCY", "LLM_BG_MAX_QUEUE", "LLM_BG_YIELD_TURN",
+  "PROMPT_TIERS_ENABLED", "TURN_SNAPSHOT_KEEP",
   "DETECT_MODEL_CONTEXT", "BACKUP_DB_ON_START", "BACKUP_KEEP",
   "METRICS_PERSIST", "METRICS_TAIL", "METRICS_MAX_BYTES",
   "TTS_ENABLED", "TTS_PROVIDER", "TTS_VOICE", "TTS_RATE", "TTS_AUTO_PLAY",
