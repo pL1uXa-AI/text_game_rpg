@@ -35,6 +35,19 @@ async def plots_reload():
     return {"ok": True, **narrator.reload_plots()}
 
 
+@router.get("/api/plots/errors")
+async def plots_errors():
+    """D15 (аудит 38): файлы сюжетов, которые НЕ попали в каталог (битый JSON, не
+    JSON-объект, пустой opening, сбой сборки темы).
+
+    Раньше битый файл исчезал молча (только log.warning): игрок видел «сюжетов стало
+    меньше» без объяснения. /api/themes остаётся списком (контракт фронта/тестов),
+    ошибки — отдельным лёгким запросом, который фронт показывает плашкой в окне
+    «Новый мир»."""
+    from .. import plots
+    return {"errors": plots.scan_errors()}
+
+
 @router.get("/api/genres")
 async def genres():
     """Доступные жанры (GENRE_HINTS) — для выбора нескольких жанров при создании мира."""

@@ -27,6 +27,8 @@
 
       <section class="panel">
         <h2 class="panel-h2">✨ Новый мир <button id="btn-reload-plots" class="btn small" title="Перечитать сюжеты из папки plots/ (без перезапуска)">🔄 Обновить сюжеты</button></h2>
+        <!-- D15: плашка о файлах сюжетов, не попавших в каталог (заполняет loadThemes) -->
+        <p class="muted" id="plots-errors" style="display:none"></p>
         <div class="theme-grid" id="theme-grid"></div>
 
         <div id="custom-plot-box" style="display:none">

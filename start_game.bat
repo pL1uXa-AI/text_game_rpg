@@ -35,25 +35,49 @@ exit /b 1
 :llama_ok
 
 REM 2. Проверка своей ChromaDB (порт 8001)
-curl -s http://127.0.0.1:8001/api/v1/heartbeat >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [START] Поднимаю собственную ChromaDB игры на 127.0.0.1:8001...
-    call scripts\start_chroma.bat
-    if %errorlevel% neq 0 (
-        echo [ERROR] ChromaDB не поднялась. Смотри data\chroma.log
-        pause
-        exit /b 1
-    )
+REM D14 (аудит 38): /api/v1/heartbeat + errorlevel curl → та же схема, что у llama.cpp в
+REM п.14: спрашиваем v2 (его же зовёт chroma_client.ping()) и считаем сервис живым при любом
+REM коде < 500. Разнобой эндпоинтов/критериев в трёх местах (этот bat, start_chroma.bat,
+REM ping()) означал бы, что игра либо отказывается стартовать при живой базе, либо стартует
+REM с мёртвой и падает на первом же ходе.
+set "CHROMA_CODE=000"
+for /f "usebackq delims=" %%c in (`curl -s -o nul --max-time 5 -w "%%{http_code}" http://127.0.0.1:8001/api/v2/heartbeat`) do set "CHROMA_CODE=%%c"
+if "%CHROMA_CODE%"=="000" goto chroma_start
+if not "%CHROMA_CODE:~0,1%"=="5" (
+    echo [OK] Game ChromaDB отвечает на 127.0.0.1:8001 (HTTP %CHROMA_CODE%)
+    goto chroma_ok
 )
+:chroma_start
+echo [START] Поднимаю собственную ChromaDB игры на 127.0.0.1:8001...
+call scripts\start_chroma.bat
+if %errorlevel% neq 0 (
+    echo [ERROR] ChromaDB не поднялась. Смотри data\logs\chroma.log
+    pause
+    exit /b 1
+)
+:chroma_ok
 
 REM 3. Сервер игры
 REM ВАЖНО: слушаем ТОЛЬКО 127.0.0.1. В .env лежат живые API-ключи, у игры нет авторизации —
 REM доступ с 0.0.0.0 отдаёт админку (/admin) и весь API всей локальной сети.
 if "%GAME_BIND%"=="" set GAME_BIND=127.0.0.1
+
+REM D13 (аудит 38): вместо жёсткого абсолютного пути к python.exe — интерпретатор берётся
+REM из GAME_PYTHON (можно задать в .env-стиле/окружении), иначе из PATH. Раньше на любой
+REM другой машине bat падал с «система не может найти указанный файл» без внятного текста.
+if "%GAME_PYTHON%"=="" set "GAME_PYTHON=python"
+"%GAME_PYTHON%" -V >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERROR] Интерпретатор "%GAME_PYTHON%" не найден в PATH.
+    echo         Запусти с GAME_PYTHON=C:\\путь\\python.exe (нужен Python 3.11+),
+    echo         либо добавь python в PATH. Установка зависимостей: scripts\\setup_env.bat
+    pause
+    exit /b 1
+)
 echo [START] Text Game RPG: http://127.0.0.1:8002
 echo [INFO]  bind=%GAME_BIND% (чтобы открыть наружу — запусти вручную с GAME_BIND=0.0.0.0,
 echo         помня: авторизации в игре нет, в .env живые ключи)
-"D:\Development\Development_Tools\Runtimes\Python\3.12.10\python.exe" -X utf8 -m uvicorn backend.app:app --host %GAME_BIND% --port 8002
+"%GAME_PYTHON%" -X utf8 -m uvicorn backend.app:app --host %GAME_BIND% --port 8002
 if %errorlevel% neq 0 (
     echo.
     echo [ERROR] Сервер не запустился или упал (код %errorlevel%).

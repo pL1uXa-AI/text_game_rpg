@@ -573,6 +573,11 @@ def test_list_worlds_counts_are_correct():
 
 
 def test_list_worlds_uses_single_group_by_query():
+    """SMOKE ПО ТЕКСТУ (аудит 38, D11): сверяет форму SQL в исходнике, а не поведение.
+
+    Регрессию не даёт: падает при безвредном рефакторинге и проходит при реальной поломке
+    счётчика. Поведение «считает ходы верно» закрывает соседний
+    test_list_worlds_counts_are_correct — он исполняет код."""
     src = io.open(ROOT / "backend" / "db.py", encoding="utf-8").read()
     body = _func_body(src, src.index("async def _list_worlds"))
     sql = " ".join(ln for ln in body.splitlines() if not ln.strip().startswith("#"))
@@ -585,7 +590,10 @@ def test_list_worlds_uses_single_group_by_query():
 # ══════════════════════════════════════════════════════════════════════
 
 def test_db_run_has_timeout_and_loop_guard():
-    """Есть потолок ожидания и явная защита от рекурсивного вызова с цикла БД."""
+    """Есть потолок ожидания и явная защита от рекурсивного вызова с цикла БД.
+
+    SMOKE ПО ТЕКСТУ (аудит 38, D11): наличие слов в исходнике, а не поведение; поведение
+    («вызов из потока цикла = понятная ошибка») проверяет test_db_run_from_bg_thread_raises."""
     src = io.open(ROOT / "backend" / "db.py", encoding="utf-8").read()
     body = _func_body(src, src.index("def _run("))
     assert "timeout" in body, "_run снова ждёт вечно — зависание неотличимо от работы"
@@ -913,7 +921,13 @@ def test_dedupe_known_compromise_documented():
 # ══════════════════════════════════════════════════════════════════════
 
 def test_start_bat_tolerates_401():
-    """401 от llama.cpp (--api-key) ≠ «сервер мёртв»: игра обязана стартовать."""
+    """401 от llama.cpp (--api-key) ≠ «сервер мёртв»: игра обязана стартовать.
+
+    SMOKE ПО ТЕКСТУ .bat (аудит 38, D11 — вариант C): bat здесь не исполняется, поэтому
+    регрессии поведения нет — тест ловит лишь «правку убрали» и падает при безвредном
+    рефакторинге. Честный harness (cmd /c с подменённым портом) — отдельная задача;
+    решено оставить проверку текста, но назвать её как есть (см. инвариант 19 в AGENT.md:
+    новые проверки так писать нельзя — только поведение; структурные — в scripts/check_*)."""
     bat = io.open(ROOT / "start_game.bat", encoding="utf-8").read()
     assert "http_code" in bat, "curl-проверка llama.cpp по-прежнему считает 401 смертью"
     seg = bat[bat.index("REM 1. Проверка llama.cpp"):bat.index("REM 2.")]

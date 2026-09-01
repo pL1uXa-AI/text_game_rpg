@@ -157,6 +157,31 @@ def _theme_from_plot(pid: str, plot: dict, group: str = "user") -> dict:
     }
 
 
+# D15 (аудит 38): ошибки сканирования файлов сюжетов, видимые ПОЛЬЗОВАТЕЛЮ.
+# Формат: {"file": "plots/user/мой-сюжет.js", "error": "короткое пояснение"}.
+# Прежняя реакция на битый файл была одна — log.warning: игрок видел лишь «сюжетов стало
+# меньше» без объяснения (plots/*.js — это JSON с расширением .js, соглашение PLOTS.md,
+# поэтому на них не навешивается ни редакторная валидация, ни node --check). Реестр
+# отдаётся в GET /api/themes → plots_errors и показывается плашкой в окне «Новый мир».
+# Соглашение про расширение принято осознанно (вариант B аудита): переименование файлов
+# в .json тронуло бы снапшоты id уже созданных миров, а выгода была бы косметической.
+SCAN_ERRORS: list[dict] = []
+
+
+def scan_errors() -> list[dict]:
+    """Копия реестра битых файлов сюжета (для каталога/UI)."""
+    return list(SCAN_ERRORS)
+
+
+def _bad(path, why: str) -> None:
+    """Зарегистрировать пропущенный файл сюжета (D15) — чтобы он был виден в UI."""
+    try:
+        rel = str(Path(path).relative_to(PLOTS_ROOT.parent))
+    except Exception:
+        rel = str(path)
+    SCAN_ERRORS.append({"file": rel, "error": why[:300]})
+
+
 def base_name(pid: str) -> str:
     """Человеческое имя из id (pepel-kontrakta → Пепел Контракта) — фолбэк, если в сюжете нет metadata.name."""
     return str(pid).replace("-", " ").replace("_", " ").strip().title() or pid
@@ -164,9 +189,11 @@ def base_name(pid: str) -> str:
 
 def _scan() -> tuple[list[dict], dict[str, dict]]:
     """Сканирует plots/system и plots/user. user переопределяет system при совпадении id.
-    Один битый файл не роняет остальные (пропуск с warning) и не роняет reload целиком."""
+    Один битый файл не роняет остальные (пропуск с warning) и не роняет reload целиком;
+    сам пропуск запоминается в SCAN_ERRORS — см. D15."""
     themes_by_id: dict[str, dict] = {}
     raw_by_id: dict[str, dict] = {}
+    SCAN_ERRORS.clear()
     for sub in PLOT_SEARCH:
         folder = PLOTS_ROOT / sub
         if not folder.is_dir():
@@ -181,14 +208,17 @@ def _scan() -> tuple[list[dict], dict[str, dict]]:
                 data = json.loads(f.read_text(encoding="utf-8"))
             except Exception as e:
                 log.warning("plots: пропущен файл %s (не JSON): %s", f, e)
+                _bad(f, f"не читается как JSON: {e}")
                 continue
             if not isinstance(data, dict):
                 log.warning("plots: пропущен %s (не JSON-объект)", f)
+                _bad(f, "файл — не JSON-объект (ожидаются поля схемы PLOTS.md)")
                 continue
             story = _as_dict(data.get("story"))
             opening = str(story.get("opening") or "").strip() or str(data.get("plot_text") or "").strip()
             if not opening:
                 log.warning("plots: пропущен %s (нет story.opening / plot_text — мир не сможет стартовать)", f)
+                _bad(f, "пусто story.opening и plot_text — миру нечем стартовать")
                 continue
             pid = str(data.get("id") or "").strip() or _slug_id(f.name)
             pid = re.sub(r"[^a-z0-9_-]+", "_", pid.lower()).strip("_") or _slug_id(f.name)
@@ -199,6 +229,7 @@ def _scan() -> tuple[list[dict], dict[str, dict]]:
                 themes_by_id[pid] = _theme_from_plot(pid, data, group=sub)
             except Exception as e:
                 log.warning("plots: пропущен %s (ошибка сборки темы): %s", f, e)
+                _bad(f, f"файл не собирается в тему: {e}")
                 continue
             raw_by_id[pid] = data
     themes = sorted(themes_by_id.values(),
@@ -217,8 +248,15 @@ def reload() -> dict:
     _PLOTS.update(plots)
     sys_n = sum(1 for t in THEMES if t.get("group") == "system")
     usr_n = len(THEMES) - sys_n
-    log.info("plots reload: %d сюжетов (system=%d, user=%d)", len(THEMES), sys_n, usr_n)
+    if SCAN_ERRORS:
+        # правило 14: молча потерять сюжет нельзя — считаем и пишем явно
+        log.warning("plots reload: %d сюжетов (system=%d, user=%d), ОТОБРАНО %d битых: %s",
+                    len(THEMES), sys_n, usr_n, len(SCAN_ERRORS),
+                    "; ".join(f"{e['file']}: {e['error']}" for e in SCAN_ERRORS))
+    else:
+        log.info("plots reload: %d сюжетов (system=%d, user=%d)", len(THEMES), sys_n, usr_n)
     return {"total": len(THEMES), "system": sys_n, "user": usr_n,
+            "broken": len(SCAN_ERRORS), "errors": scan_errors(),
             "ids": [t["plot_id"] for t in THEMES]}
 
 

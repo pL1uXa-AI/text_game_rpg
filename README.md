@@ -30,13 +30,19 @@ start_game.bat
 # 1) ChromaDB игры (только если не запущена)
 data/chroma-venv/Scripts/chroma.exe run --path data/chroma --host 127.0.0.1 --port 8001 --log-path data/chroma.log
 
-# 2) API
-D:\Development\Development_Tools\Runtimes\Python\3.12.10\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8002
+# 2) API — интерпретатор берётся из PATH (или укажи свой: set PY/GAME_PYTHON)
+python -X utf8 -m uvicorn backend.app:app --host 127.0.0.1 --port 8002
 ```
 
 Открой **http://127.0.0.1:8002** — выбери тему мира, рассказчика и играй.
 
-> 📖 Для разработчиков/ИИ-агентов: **AGENT.md** (архитектура + правила разработки) и **ROADMAP.md** (все идеи и статусы).
+> ⚠ Нужен конкретный интерпретатор (не тот, что в PATH) — задай переменную окружения
+> `GAME_PYTHON=C:\\путь\\python.exe` (её же читает `start_game.bat`; Python 3.11+,
+> см. `scripts/setup_env.bat`). Абсолютный путь в скрипты больше не зашит (сессия 38, D13).
+
+> 📖 Для разработчиков/ИИ-агентов: **AGENT.md** (архитектура + правила разработки + инварианты),
+> **AGENT_ARCHIVE.md** (хронология сессий 4–38: почему принято именно так) и **ROADMAP.md**
+> (все идеи и статусы).
 
 ## 🎤 Рассказчик (сменные персоны)
 

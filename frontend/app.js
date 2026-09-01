@@ -40,6 +40,20 @@ async function loadGenres() {
 
 async function loadThemes() {
   state.themes = await API("/api/themes");
+  // D15 (сессия 38): битые файлы сюжетов больше не исчезают молча — показываем причину
+  // прямо в окне «Новый мир» (раньше: только log.warning, игрок видел «сюжетов меньше»).
+  try {
+    const pe = await API("/api/plots/errors");
+    const box = $("plots-errors");
+    if (box) {
+      const errs = (pe && pe.errors) || [];
+      box.style.display = errs.length ? "" : "none";
+      box.innerHTML = errs.length
+        ? "⚠ Сюжеты с ошибками (не показаны в списке): " + errs.map((e) =>
+            `<div><b>${esc(e.file)}</b> — ${esc(e.error)}</div>`).join("")
+        : "";
+    }
+  } catch (_) { /* best-effort: каталог важнее плашки */ }
   const grid = $("theme-grid");
   grid.innerHTML = "";
   // Первая карточка — свой (кастомный) сюжет
