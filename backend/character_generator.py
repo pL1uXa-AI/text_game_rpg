@@ -15,9 +15,7 @@ character_generator.py — генерация персонажа и вступи
 from __future__ import annotations
 
 import json
-import logging
 import random
-import re
 
 from . import db, llm
 from .config import get_config

@@ -110,7 +110,10 @@ class Config:
     rerank_api_key: str = ""
     rerank_model: str = "voyageai/rerank-2.5"
     rerank_enabled: bool = True
-    rerank_top_n: int = 20
+    # A17 (аудит 38): ручки RERANK_TOP_N в проекте больше нет — размер выдачи реранкера
+    # задаётся размером RAG-выдачи (RAG_MEMORY_K / LORE_RAG_K), а не отдельной настройкой
+    # (две ручки на одно = источник путаницы). Порог релевантности ниже — РЕАЛЬНО применяется
+    # в embeddings.rerank_results (раньше и он был декоративным).
     rerank_threshold: float = 0.2
 
     # Гибрид BM25 + косинус
@@ -390,7 +393,6 @@ class Config:
             rerank_api_key=get("RERANK_API_KEY", default=""),
             rerank_model=get("RERANK_MODEL", default="voyageai/rerank-2.5"),
             rerank_enabled=get("RERANK_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
-            rerank_top_n=it(20, "RERANK_TOP_N"),
             rerank_threshold=flt(0.2, "RERANK_THRESHOLD"),
             hybrid_weight_bm25=flt(0.4, "HYBRID_WEIGHT_BM25"),
             cosine_threshold=flt(0.35, "COSINE_THRESHOLD"),
@@ -414,7 +416,12 @@ class Config:
             background_tasks_enabled=get("BACKGROUND_TASKS_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             logic_judge_enabled=get("LOGIC_JUDGE_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             logic_judge_interval=it(3, "LOGIC_JUDGE_INTERVAL"),
-            divine_cooldown_turns=it(0, "DIVINE_COOLDOWN_TURNS"),
+            # A6 (аудит 38): дефолт обязан совпадать с dataclass (`divine_cooldown_turns: int = 3`).
+            # Раньше здесь стоял литерал 0, и на ЛЮБОЙ чистой установке (копия .env.example без
+            # ключа, CI, свежий клон) кулдаун Провидения был 0 — анти-фарм «попросить у богов
+            # золото» не работал ровно там, где его и включали. Регресс-страховка:
+            # tests/test_session38_bugfixes.py::test_config_load_defaults_match_dataclass
+            divine_cooldown_turns=it(3, "DIVINE_COOLDOWN_TURNS"),
             tick_effects_enabled=get("TICK_EFFECTS_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             tick_needs_enabled=get("TICK_NEEDS_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             autonomous_master_enabled=get("AUTONOMOUS_MASTER_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
@@ -461,14 +468,6 @@ def get_config() -> Config:
     if "cfg" not in _cache:
         _cache["cfg"] = Config.load()
     return _cache["cfg"]  # type: ignore
-
-
-def _admin_overrides() -> dict:
-    """Настройки из админки (таблица admin_settings): поверх .env, но ниже переменных окружения.
-    Реализация вынесена в admin_settings.read_overrides() (отдельное sqlite-соединение без db.py —
-    иначе config→db→config рекурсия вешает сервер).
-    Оставлен тонкий wrapper для обратной совместимости."""
-    return admin_settings.read_overrides()
 
 
 def invalidate_config() -> None:

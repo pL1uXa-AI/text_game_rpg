@@ -13,14 +13,13 @@ delete_by_* применяется к ОБЕИМ коллекциям (base и l
 """
 from __future__ import annotations
 
-import json
 from typing import Optional
 
 import httpx
 
 from .config import get_config
 from .logsetup import get_logger, log_once
-from .retry import is_transient, with_retries
+from .retry import with_retries
 
 log = get_logger(__name__)
 
@@ -240,17 +239,3 @@ def cosine_from_distance(dist: float) -> float:
     """L2-расстояние нормализованных векторов → косинусная близость."""
     return max(0.0, min(1.0, 1.0 - dist / 2.0))
 
-
-def safe_json(s: str) -> dict | None:
-    """Попытка распарсить JSON из текста (ищет первую { ... })."""
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    m = __import__("re").search(r"\{.*\}", s, __import__("re").DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
-    return None

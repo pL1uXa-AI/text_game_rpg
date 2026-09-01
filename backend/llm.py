@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 from typing import AsyncGenerator, Optional
 

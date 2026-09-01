@@ -24,8 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
-import re
 import sqlite3
 import threading
 import time
@@ -515,12 +513,49 @@ def delete_world(world_id: int) -> None:
 
 
 async def _delete_world(world_id: int) -> None:
+    # A8 (аудит 38): раньше удалялись только worlds/events/saves/turn_snapshots — карточки,
+    # лор и узлы/рёбра графа оставались навсегда (в боевой БД на момент аудита: entities —
+    # 47 миров-сирот, lore — 37, graph_nodes — 31, graph_edges — 26). Миры живут под
+    # AUTOINCREMENT-id, и после VACUUM/импорта дампа id может совпасть с остатками сирот →
+    # чужие карточки/лор всплыли бы в новом мире.
+    # tts_cache к событиям НЕ привязан (ключ — хеш текста+голоса), это общий кэш аудио:
+    # его прибивает ротация по TTL (A18), а не удаление мира.
     conn = await _open()
+    for table in ("entities", "lore", "graph_nodes", "graph_edges",
+                  "turn_snapshots", "saves", "events"):
+        await conn.execute(f"DELETE FROM {table} WHERE world_id = ?", (world_id,))
     await conn.execute("DELETE FROM worlds WHERE id = ?", (world_id,))
-    await conn.execute("DELETE FROM events WHERE world_id = ?", (world_id,))
-    await conn.execute("DELETE FROM saves WHERE world_id = ?", (world_id,))
-    await conn.execute("DELETE FROM turn_snapshots WHERE world_id = ?", (world_id,))
     await _maybe_commit()
+
+
+# ── Аудит 38 (A8): чистка сирот ─────────────────────────────────────────────
+# Строки связанных таблиц, чей world_id больше не принадлежит ни одному миру
+# (миры, удалённые ДО появления этих таблиц, и следы прошлых удалений).
+# Идемпотентно и безопасно: удаляются только строки, у которых нет родителя в worlds.
+ORPHAN_TABLES: tuple[str, ...] = ("entities", "lore", "graph_nodes", "graph_edges",
+                                  "events", "saves", "turn_snapshots")
+
+
+def prune_orphan_rows() -> dict:
+    """Убрать строки связанных таблиц у несуществующих миров. Возвращает {таблица: число}.
+
+    Запускается один раз при старте сервера (само-исцеление, как нормылизация рангов в
+    app.py). Идемпотентно: при чистых данных ничего не делает."""
+    with _lock:
+        return _run(_prune_orphan_rows)
+
+
+async def _prune_orphan_rows() -> dict:
+    conn = await _open()
+    out: dict[str, int] = {}
+    for table in ORPHAN_TABLES:
+        cur = await conn.execute(
+            f"DELETE FROM {table} WHERE world_id NOT IN (SELECT id FROM worlds)")
+        if cur.rowcount:
+            out[table] = int(cur.rowcount)
+    if out:
+        await _maybe_commit()
+    return out
 
 
 # ─────────────────────────── события ───────────────────────────
@@ -571,6 +606,13 @@ def _flush_pending_events() -> None:
 
 async def _add_event(world_id: int, role: str, content: str, seq: int | None,
                      meta: dict | None) -> dict:
+    # A11 (аудит 38, страховка слоя данных): пустой текст события — баг вызывающего,
+    # а не данные. Раньше на `content=None` SQLite давал голый IntegrityError
+    # («NOT NULL constraint failed: events.content») с трейсбеком вместо внятной ошибки,
+    # а `content=""` проходил молча и рождал пустое сообщение в чате.
+    if content is None or not str(content).strip():
+        raise ValueError(f"Пустой content события (world {world_id}, роль {role!r}) — "
+                         "вызывающий обязан передать непустой текст")
     conn = await _open()
     if seq is None:
         cur0 = await conn.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM events WHERE world_id = ?",
@@ -625,9 +667,11 @@ def _event_obj(row) -> dict:
     return d
 
 
-def get_events(world_id: int, limit: int | None = None, since_seq: int = 0) -> list[dict]:
+def get_events(world_id: int, limit: int | None = None, since_seq: int = 0,
+               roles: tuple[str, ...] | None = None) -> list[dict]:
+    """События мира (хвост `limit` или всё с `since_seq`). `roles` — фильтр по ролям в SQL."""
     with _lock:
-        return _run(lambda: _get_events(world_id, limit, since_seq))
+        return _run(lambda: _get_events(world_id, limit, since_seq, roles))
 
 
 def get_events_after(world_id: int, after_seq: int = 0, limit: int = 500) -> list[dict]:
@@ -648,70 +692,55 @@ async def _get_events_after(world_id: int, after_seq: int, limit: int) -> list[d
     return [_event_obj(r) for r in await cur.fetchall()]
 
 
-async def _get_events(world_id: int, limit: int | None, since_seq: int) -> list[dict]:
+async def _get_events(world_id: int, limit: int | None, since_seq: int,
+                      roles: tuple[str, ...] | None = None) -> list[dict]:
     conn = await _open()
-    q = "SELECT * FROM events WHERE world_id = ? AND seq > ? ORDER BY seq"
-    args: list = [world_id, since_seq]
+    role_sql = ""
+    rargs: list[Any] = []
+    if roles:
+        role_sql = " AND role IN (" + ",".join("?" * len(roles)) + ")"
+        rargs = list(roles)
+    q = "SELECT * FROM events WHERE world_id = ? AND seq > ?" + role_sql + " ORDER BY seq"
+    args: list = [world_id, since_seq] + rargs
     if limit:
-        q = ("SELECT * FROM (SELECT * FROM events WHERE world_id = ? AND seq > ? ORDER BY seq DESC "
-             "LIMIT ?) ORDER BY seq ASC")
-        args = [world_id, since_seq, limit]
+        q = ("SELECT * FROM (SELECT * FROM events WHERE world_id = ? AND seq > ?" + role_sql
+             + " ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC")
+        args = [world_id, since_seq] + rargs + [limit]
     cur = await conn.execute(q, args)
     rows = await cur.fetchall()
     return [_event_obj(r) for r in rows]
 
 
-def get_events_range(world_id: int, start_seq: int, end_seq: int) -> list[dict]:
-    with _lock:
-        return _run(lambda: _get_events_range(world_id, start_seq, end_seq))
-
-
-async def _get_events_range(world_id: int, start_seq: int, end_seq: int) -> list[dict]:
-    conn = await _open()
-    cur = await conn.execute(
-        "SELECT * FROM events WHERE world_id = ? AND seq BETWEEN ? AND ? ORDER BY seq",
-        (world_id, start_seq, end_seq),
-    )
-    rows = await cur.fetchall()
-    return [_event_obj(r) for r in rows]
-
-
-def get_events_before(world_id: int, before_seq: int) -> list[dict]:
-    with _lock:
-        return _run(lambda: _get_events_before(world_id, before_seq))
-
-
-def get_history_page(world_id: int, before_seq: int = 0, limit: int = 60) -> list[dict]:
+def get_history_page(world_id: int, before_seq: int = 0, limit: int = 60,
+                     roles: tuple[str, ...] | None = None) -> list[dict]:
     """Страница истории (сессия 34, B5): последние `limit` событий раньше before_seq —
     ОГРАНИЧЕННО в SQL. Раньше роутер тянул ВЕСЬ лог мира и резал его в Python, поэтому
-    открытие длинного прохождения тем медленнее, чем дальше прошёл игрок."""
+    открытие длинного прохождения тем медленнее, чем дальше прошёл игрок.
+
+    `roles` (A10, аудит 38): если задан — только эти роли (роль `summary` и прочие
+    служебные строки не должны попадать в чат/лог игрока). Фильтр — в SQL, а не в Python,
+    иначе «последние N» резались бы до фильтрации и счётчик пагинации врал."""
     with _lock:
-        return _run(lambda: _get_history_page(world_id, before_seq, limit))
+        return _run(lambda: _get_history_page(world_id, before_seq, limit, roles))
 
 
-async def _get_history_page(world_id: int, before_seq: int, limit: int) -> list[dict]:
+async def _get_history_page(world_id: int, before_seq: int, limit: int,
+                            roles: tuple[str, ...] | None = None) -> list[dict]:
     conn = await _open()
     args: list[Any] = [world_id]
     where = "world_id = ?"
     if before_seq:
         where += " AND seq < ?"
         args.append(int(before_seq))
+    if roles:
+        where += " AND role IN (" + ",".join("?" * len(roles)) + ")"
+        args.extend(roles)
     n = max(1, int(limit or 0)) if limit else 100000
     args.append(n)
     cur = await conn.execute(
         f"SELECT * FROM (SELECT * FROM events WHERE {where} ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC",
         args)
     return [_event_obj(r) for r in await cur.fetchall()]
-
-
-async def _get_events_before(world_id: int, before_seq: int) -> list[dict]:
-    conn = await _open()
-    cur = await conn.execute(
-        "SELECT * FROM events WHERE world_id = ? AND seq < ? ORDER BY seq",
-        (world_id, before_seq),
-    )
-    rows = await cur.fetchall()
-    return [_event_obj(r) for r in rows]
 
 
 def mark_folded(world_id: int, up_to_seq: int,
@@ -748,15 +777,24 @@ async def _get_event(event_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def set_feedback(event_id: int, value: int) -> None:
+def set_feedback(event_id: int, value: int, world_id: int | None = None) -> bool:
+    """Поставить оценку событию. Возвращает False, если события нет (или оно не этого
+    мира — A4-bis: раньше WHERE был только по id, и фидбек чужому миру был возможен).
+    Молчаливый no-op превращался в «200 OK» на несуществующем событии."""
     with _lock:
-        _run(lambda: _set_feedback(event_id, value))
+        return _run(lambda: _set_feedback(event_id, value, world_id))
 
 
-async def _set_feedback(event_id: int, value: int) -> None:
+async def _set_feedback(event_id: int, value: int, world_id: int | None) -> bool:
     conn = await _open()
-    await conn.execute("UPDATE events SET feedback = ? WHERE id = ?", (value, event_id))
+    if world_id is None:
+        cur = await conn.execute("UPDATE events SET feedback = ? WHERE id = ?",
+                                 (value, event_id))
+    else:
+        cur = await conn.execute("UPDATE events SET feedback = ? WHERE id = ? AND world_id = ?",
+                                 (value, event_id, world_id))
     await _maybe_commit()
+    return bool(cur.rowcount)
 
 
 # ══════════════ свёртка событий: три состояния (сессия 34) ══════════════
@@ -1116,8 +1154,25 @@ async def _count_tts_cache() -> int:
     return int(row["c"])
 
 
+def all_tts_cache_paths() -> list[dict]:
+    """Все относительные пути файлов кеша озвучки (для обхода сирот, аудит 38, A18).
+    Только rel_path — полный дамп таблицы для этого не нужен."""
+    with _lock:
+        return _run(_all_tts_cache_paths)
+
+
+async def _all_tts_cache_paths() -> list[dict]:
+    conn = await _open()
+    cur = await conn.execute("SELECT rel_path FROM tts_cache")
+    return [{"rel_path": r["rel_path"]} for r in await cur.fetchall()]
+
+
 def prune_tts_cache(ttl_days: int = 60) -> int:
-    """Удаляет старые записи кэша озвучки, если TTL > 0. Возвращает число удалённых."""
+    """Удаляет старые записи кэша озвучки, если TTL > 0. Возвращает число удалённых.
+
+    Аудит 38 (A18): функция жила с сессии, но не вызывалась НИОТКУДА — настройка
+    `TTS_CACHE_TTL_DAYS` была декоративной. Теперь её крутит `tts.rotate_tts_cache`
+    (старт сервера + фоновый интервал)."""
     if not ttl_days:
         return 0
     cutoff = time.time() - ttl_days * 86400
@@ -1265,31 +1320,6 @@ async def _delete_entity(world_id: int, kind: str, entity_key: str) -> None:
     await conn.execute("DELETE FROM entities WHERE world_id = ? AND kind = ? AND entity_key = ?",
                        (world_id, kind, entity_key))
     await _maybe_commit()
-
-
-def find_entities_by_text(world_id: int, text: str, limit: int = 8) -> list[dict]:
-    """Грубый поиск карточек по имени/ключу (для отбора релевантных к действию)."""
-    words = [w for w in re.findall(r"[а-яА-ЯёЁa-zA-Z0-9]{2,}", text.lower()) if len(w) > 2]
-    with _lock:
-        rows = _run(lambda: _find_entities_raw(world_id))
-    scored = []
-    for r in rows:
-        d = dict(r)
-        hay = f"{d['name']} {d['entity_key']} {d.get('summary','')} {d.get('meta','')}".lower()
-        score = sum(1 for w in words if w in hay)
-        if score:
-            scored.append((score, d))
-    scored.sort(key=lambda x: -x[0])
-    return [d for _, d in scored[:limit]]
-
-
-async def _find_entities_raw(world_id: int) -> list[dict]:
-    conn = await _open()
-    cur = await conn.execute(
-        "SELECT * FROM entities WHERE world_id = ? ORDER BY updated_at DESC", (world_id,)
-    )
-    rows = await cur.fetchall()
-    return [dict(r) for r in rows]
 
 
 # ─────────────────────────── сохранения ───────────────────────────

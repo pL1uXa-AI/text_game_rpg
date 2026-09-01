@@ -3,7 +3,6 @@
 настройки per-world, аудио событий и поллинг готовности."""
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 from pathlib import Path
@@ -11,7 +10,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
-from .. import db, narrator, tts
+from .. import bg, db, narrator, tts
 from ..config import get_config
 from ..schemas import TtsDownloadIn, TtsSettingsIn, TtsTestIn
 
@@ -131,6 +130,9 @@ async def event_tts_retry(world_id: int, event_id: int):
     if not ev or ev.get("world_id") != world_id:
         raise HTTPException(404, "Событие не найдено")
     db.set_event_tts(event_id, 1, "")
-    asyncio.get_event_loop().create_task(
-        tts.ensure_event_audio(world_id, event_id, ev.get("content") or ""))
+    # D6 (аудит 38): bg.spawn вместо get_event_loop().create_task — держит ссылку на
+    # задачу (её мог собрать GC: «озвучка не появилась, в логе ничего») и берёт цикл
+    # через get_running_loop.
+    bg.spawn(tts.ensure_event_audio(world_id, event_id, ev.get("content") or ""),
+             name="tts-retry")
     return {"ok": True, "tts_status": 1}

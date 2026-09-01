@@ -44,6 +44,25 @@ log = get_logger(__name__)
 # оказаться залочен при рестарте («database is locked»). Закрываем по
 # порядку: сетевые httpx-клиенты → очередь фоновых агентов → цикл БД.
 # Каждый шаг в своёй страховке: падение одного не мешает закрыть остальные.
+async def _tts_cache_keepalive() -> None:
+    """Фоновый цикл ротации кеша озвучки (аудит 38, A18): почасовая сверка, внутри —
+    «не чаще раза в сутки» (метка-файл в tts.rotate_tts_cache)."""
+    while True:
+        try:
+            await asyncio.sleep(3600)          # почасовая сверка: метку режет сам модуль tts
+            if not get_config().tts_cache_enabled:
+                continue
+            r = await asyncio.to_thread(tts.rotate_tts_cache)
+            if r.get("pruned") or r.get("swept"):
+                log.info("ротация кеша озвучки в фоне: %s", r)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # правило 14: тихо сдохший keepalive = бесконечно растущий кеш без единой строки
+            log.warning("фоновая ротация кеша озвучки сбойнула (continue): %s", e)
+            await asyncio.sleep(3600)
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     bus.attach_loop(asyncio.get_running_loop())   # синхронный код БД публикует через него
@@ -53,9 +72,22 @@ async def _lifespan(_app: FastAPI):
              cfg.context_tokens, cfg.background_tasks_enabled, cfg.logic_judge_enabled,
              cfg.autonomous_master_enabled, cfg.enemy_ai_enabled, cfg.dynamic_events_enabled,
              cfg.tts_provider, cfg.llm_bg_concurrency)
+    # A18: ротация кеша озвучки — сразу после старта (в потоке: большой кеш не должен
+    # тормозить поднятие сервера) и далее почасово в фоне.
+    _rot_task: asyncio.Task | None = None
+    try:
+        if cfg.tts_enabled and cfg.tts_cache_enabled and int(cfg.tts_cache_ttl_days or 0) > 0:
+            _rot_task = bg.spawn(_tts_cache_keepalive(), name="tts-cache-keepalive")
+            bg.spawn(asyncio.to_thread(tts.rotate_tts_cache), name="tts-cache-rotation")
+        else:
+            log.debug("ротация кеша озвучки отключена (кеш выкл или TTL=0)")
+    except Exception as e:
+        log.warning("ротация кеша озвучки не запущена (кеш может расти): %s", e)
     try:
         yield
     finally:
+        if _rot_task is not None:
+            _rot_task.cancel()
         for name, fn in (("chroma_client", chroma_client.close),
                          ("embeddings", embeddings.close),
                          ("llm", llm.close)):
@@ -166,6 +198,23 @@ try:
             log.info("снимок БД сохранён: %s", _bak)
 except Exception as e:
     log.warning("стартовый бэкап БД не удался (игра стартует без него): %s", e)
+
+# ── Ротация кеша озвучки (аудит 38, A18) — см. _lifespan: она стартует вместе с
+# приложением, а не на импорте модуля (на импорте активного цикла событий ещё нет).
+# `TTS_CACHE_TTL_DAYS` обещал срок жизни аудио, но `db.prune_tts_cache` не вызывался
+# никогда; теперь чистка идёт при старте и далее раз в сутки.
+
+# ── Само-исцеление сирот в БД (аудит 38, A8) ──
+# Удаление мира раньше чистило только 4 таблицы из 8, и карточки/лор/граф удалённых миров
+# оставались навсегда (в боевой БД на момент аудита: entities — 47 миров-сирот, lore — 37,
+# graph_nodes — 31, graph_edges — 26). Идемпотентно: при чистых данных ничего не делает.
+try:
+    _orphans = db.prune_orphan_rows()
+    if _orphans:
+        log.info("чистка сирот: убрано %s (строки удалённых миров)",
+                 ", ".join(f"{k}:{v}" for k, v in sorted(_orphans.items())))
+except Exception as e:
+    log.warning("чистка сирот в БД не удалась (игра стартует с ними): %s", e)
 
 # Предзагрузка голосов TTS (Piper/Kokoro) при старте — прогревает sherpa-onnx,
 # чтобы первый ответ игрока озвучился без задержки на инициализацию движка (сессия 30).

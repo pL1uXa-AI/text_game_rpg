@@ -23,7 +23,7 @@ import asyncio
 import contextlib
 import json
 from collections import defaultdict
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from .logsetup import get_logger
 

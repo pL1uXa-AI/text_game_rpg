@@ -16,7 +16,6 @@ lore_retriever.py — лор мира (библия вселенной): ста�
 from __future__ import annotations
 
 import json
-import logging
 import re
 
 from . import chroma_client, db, embeddings

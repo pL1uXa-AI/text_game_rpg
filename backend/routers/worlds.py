@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 import time
 from urllib.parse import quote
@@ -13,7 +12,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from .. import bus, chroma_client, db, graph, llm, narrator, rewind, tts
+from .. import bg, bus, chroma_client, db, graph, llm, narrator, rewind, tts
 from ..config import get_config, PROVIDER_OPTIONS
 from ..ratelimit import make_guard
 from ..schemas import (ActionIn, DivineIn, FeedbackIn, GenSettingsIn, ImportIn, PatchIn,
@@ -21,16 +20,24 @@ from ..schemas import (ActionIn, DivineIn, FeedbackIn, GenSettingsIn, ImportIn, 
 from .core import (
     _apply_provider_override,
     _background_memory,
+    _bg_may_write,
     _context_guard,
     _ensure_action_len,
     _index_world_lore,
     _mask_provider,
+    _masked_provider_settings,
     _masked_world_providers,
     _process_action,
     invalidate_turn_registry,
     _world_persona,
     _world_provider_settings,
     _world_providers,
+    _safe_world_row,
+    _world_or_404,
+    _world_setting_or_404,
+    _json_object,
+    forget_world_state,
+    CHAT_LOG_ROLES,
 )
 
 router = APIRouter(tags=["Миры и действия"])
@@ -141,7 +148,7 @@ async def create_world(body: WorldCreate):
                                                 lang=language, provider=providers["main"],
                                                 lore=lore_texts or None)
         if not gen:
-            log.warning("create_world (world %s): generate_character вернул None — персонаж останается минимальным", world_id)
+            log.warning("create_world (world %s): generate_character вернул None — персонаж останется минимальным", world_id)
             # Фолбэк БЕЗ LLM. ВАЖНО: для миров из файлов сюжетов hook — это plot_text (завязка-лор),
             # а не личность игрока. Писать его в identity нельзя (в биографии окажется лор).
             # Личный зацеп (body.custom_hook) — можно, это осознанное пожелание игрока.
@@ -177,7 +184,7 @@ async def create_world(body: WorldCreate):
     try:
         kcards = narrator.ensure_knowledge_cards(world_id, setting, seq=0)
         if kcards:
-            asyncio.get_event_loop().create_task(narrator.index_entities(world_id, kcards))
+            bg.spawn(narrator.index_entities(world_id, kcards), name="index-kcards")
     except Exception as e:
         log.warning("create_world карточки знаний (world %s): %s", world_id, e)
     try:
@@ -199,7 +206,7 @@ async def create_world(body: WorldCreate):
                 narrator.seed_lore_from_custom(world_id, custom_lore)
         else:
             narrator.seed_lore_from_theme(world_id, theme)
-        asyncio.get_event_loop().create_task(_index_world_lore(world_id, providers))
+        bg.spawn(_index_world_lore(world_id, providers), name="index-lore")
     except Exception as e:
         # лор не критичен для создания мира, но без него рассказчик не знает канон —
         # молча потерять сидинг нельзя (правило 14)
@@ -216,11 +223,22 @@ async def create_world(body: WorldCreate):
     try:
         opening = await narrator.generate_opening(world, setting, persona=persona,
                                                   provider=providers["main"])
-    except Exception:
-        opening = theme.get("opening", "Мир пробуждается. Что ты делаешь?")
-    db.add_event(world_id, "narrator", opening)
+    except Exception as e:
+        # A11 (аудит 38): логировать, а не глотать молча (правило 14)
+        log.warning("generate_opening (world %s) упал — фолбэк на завязку сюжета: %s", world_id, e)
+        opening = theme.get("opening") or ""
+    # A11: гарантированно непустой текст. `dict.get(key, default)` срабатывает только при
+    # ОТСУТСТВИИ ключа: при `"opening": ""` (тема custom с пустым/whitespace plot_text —
+    # `theme_from_custom` кладёт туда сырой plot) возвращался пустой текст и
+    # db.add_event(...) ронял создание мира с IntegrityError, оставляя в БД «мёртвый»
+    # мир без вступления (500 на POST /api/worlds).
+    opening = (opening or "").strip() or (theme.get("opening") or "").strip() \
+        or "Мир пробуждается. Что ты делаешь?"
     ev = db.add_event(world_id, "system", f"🌍 Мир «{name}» создан. Пиши свои действия в поле ввода.")
-    asyncio.get_event_loop().create_task(_background_memory(world_id, 1, "Открытие мира", opening))
+    # D12 (аудит 38): событие вступления получало имя, которое не читалось, а в ответе
+    # «opening_event_id» уезжал id СИСТЕМНОЙ строки — поле теперь называется честно.
+    narr_ev = db.add_event(world_id, "narrator", opening)
+    bg.spawn(_background_memory(world_id, 1, "Открытие мира", opening), name="opening-memory")
 
     # Быстрые действия ИИ сразу на первом шаге (по вступительной сцене), а не только после хода.
     suggestions: list[str] = []
@@ -231,30 +249,35 @@ async def create_world(body: WorldCreate):
     except Exception:
         suggestions = []
 
-    return {"world_id": world_id, "world": db.get_world(world_id),
-            "opening": opening, "opening_event_id": ev["id"],
+    return {"world_id": world_id, "world": _safe_world_row(db.get_world(world_id)),
+            "opening": opening, "opening_event_id": narr_ev["id"],
+            "system_event_id": ev["id"],
             "suggestions": suggestions, "state": setting}
 
 
 @router.get("/api/worlds/{world_id}")
 async def world_detail(world_id: int):
-    world = db.get_world(world_id)
-    if not world:
-        raise HTTPException(404, "Мир не найден")
-    recent = db.get_events(world_id, limit=60)
+    world = _world_or_404(world_id)
+    # A10 (аудит 38): лог мира при открытии обязан совпадать с живым чатом. Раньше сюда
+    # попадали служебные роли (summary — «Сводка памяти», спойлеры свёрнутого прошлого),
+    # которые SSE/поллинг сознательно фильтруют: после F5 картина лога отличалась.
+    # Единый набор ролей — CHAT_LOG_ROLES (он же у /history, и он же отдаётся фронту).
+    recent = db.get_events(world_id, limit=60, roles=CHAT_LOG_ROLES)
     cfg = get_config()
-    return {"world": world, "setting": json.loads(world["setting"]),
-            "recent": recent, "gen_settings": json.loads(world.get("gen_settings") or "{}"),
+    return {"world": _safe_world_row(world), "setting": _json_object(world.get("setting")),
+            "recent": recent, "gen_settings": _json_object(world.get("gen_settings")),
+            "log_roles": list(CHAT_LOG_ROLES),
             "persona": _world_persona(world),
             "providers_effective": _masked_world_providers(world),
-            "provider_settings": _world_provider_settings(world),
+            # A3 (аудит 38, железное правило 3): маскированный снимок — живых api_key наружу.
+            "provider_settings": _masked_provider_settings(_world_provider_settings(world)),
             "rerank_enabled": cfg.rerank_enabled,
             "memory_defaults": {"rag_memory_k": cfg.rag_memory_k, "rag_memory_max": cfg.rag_memory_max,
                                 "lore_rag_k": cfg.lore_rag_k, "lore_rag_k_max": cfg.lore_rag_k_max,
                                 "lore_token_budget": cfg.lore_token_budget,
                                 "lore_token_budget_max": cfg.lore_token_budget_max},
             "tts": tts.tts_effective(world),
-            "tts_settings_raw": json.loads(world.get("tts_settings") or "{}")}
+            "tts_settings_raw": _json_object(world.get("tts_settings"))}
 
 
 @router.get("/api/worlds/{world_id}/graph")
@@ -262,10 +285,8 @@ async def world_graph(world_id: int, target: str | None = None):
     """🌐 Граф мира: узлы (локации + kind), связи, слои BFS от текущей локации
     и кратчайший путь к `target` (если достижим). Источник истины — графовая БД.
     Перед ответом синхронизируется с актуальным setting (best-effort)."""
-    world = db.get_world(world_id)
-    if not world:
-        raise HTTPException(404, "Мир не найден")
-    setting = json.loads(world["setting"])
+    world = _world_or_404(world_id)
+    setting = _json_object(world.get("setting"))
     try:
         graph.sync_from_setting(world_id, setting)
     except Exception as e:
@@ -276,19 +297,43 @@ async def world_graph(world_id: int, target: str | None = None):
 @router.get("/api/worlds/{world_id}/history")
 async def history(world_id: int, before: int = 0, limit: int = 60):
     """Вся история событий мира. Для постраничного просмотра лога:
-    `before` — брать события строго раньше этого seq; `limit` — сколько штук (по умолчанию всё)."""
+    `before` — брать события строго раньше этого seq; `limit` — сколько штук (по умолчанию всё).
+
+    A4 (аудит 38): 404 на отсутствующем мире — иначе фронт не отличает «мир удалён» от
+    «пустого лога». A10: те же роли, что и в чате (CHAT_LOG_ROLES), — счётчик «показать
+    ранние события» не должен врать из-за служебных строк summary."""
+    _world_or_404(world_id)
     # B5 (сессия 34): страница вырезается в SQL — раньше тянули ВЕСЬ лог мира и срезали в
     # Python, из-за чего просмотр истории длинного прохождения тормозил линейно.
-    return db.get_history_page(world_id, before_seq=before or 0, limit=limit or 0)
+    return db.get_history_page(world_id, before_seq=before or 0, limit=limit or 0,
+                               roles=CHAT_LOG_ROLES)
+
+
+# A14 (аудит 38): потолок «догона» событий на один ответ. Значение `since`/`after` приходит
+# из query-параметра, и запрос без LIMIT вытаскивал весь лог мира в память и в сокет
+# (ручной вызов с after=0, переподключение EventSource, долгий обрыв SSE).
+_EVENTS_PAGE_LIMIT = 500
 
 
 @router.get("/api/worlds/{world_id}/events")
 async def events_since(world_id: int, since: int = 0):
     """Новые события после seq — ЗАПАСНЫЙ путь живого чата (поллинг), если EventSource
-    недоступен (см. /events/stream)."""
-    evs = db.get_events(world_id, since_seq=since)
-    return [{"id": e["id"], "seq": e["seq"], "role": e["role"], "content": e["content"],
-             "feedback": e["feedback"], "folded": e["folded"], "meta": e.get("meta") or {}} for e in evs]
+    недоступен (см. /events/stream).
+
+    Роли НЕ фильтруются: фронт сам решает, что рисовать (и им нужны seq действий игрока,
+    чтобы двигать `seenSeq`). A14: выборка ограничена страницей, а поле `truncated` говорит
+    клиенту «догон не влез целиком — пересоединись/листай», а не «событий не было»."""
+    _world_or_404(world_id)
+    evs = db.get_events_after(world_id, since, _EVENTS_PAGE_LIMIT + 1)
+    truncated = len(evs) > _EVENTS_PAGE_LIMIT
+    if truncated:
+        evs = evs[:_EVENTS_PAGE_LIMIT]
+        log.info("events?since=%s (world %s): догон обрезан страницей %d — клиенту "
+                 "сообщено о подрезке", since, world_id, _EVENTS_PAGE_LIMIT)
+    return {"events": [{"id": e["id"], "seq": e["seq"], "role": e["role"], "content": e["content"],
+                        "feedback": e["feedback"], "folded": e["folded"],
+                        "meta": e.get("meta") or {}} for e in evs],
+            "truncated": truncated}
 
 
 @router.get("/api/worlds/{world_id}/events/stream")
@@ -300,14 +345,21 @@ async def events_stream(world_id: int, after: int = 0):
     (раньше до 15 секунд). Перед подпиской догружаем всё, что произошло с `after`, чтобы
     переподключение после обрыва не потеряло сообщения.
     """
-    if not db.get_world(world_id):
-        raise HTTPException(404, "Мир не найден")
+    _world_or_404(world_id)
     q = bus.subscribe(world_id)
 
     async def gen():
         try:
-            # 1) догоняем пропущенное (после обрыва/перезагрузки страницы)
-            for e in db.get_events(world_id, since_seq=after):
+            # 1) догоняем пропущенное (после обрыва/перезагрузки страницы).
+            # A14 (аудит 38): ОГРАНИЧЕННОЙ страницей и ПЕРВЫМИ событиями после `after`
+            # (db.get_events_after) — раньше db.get_events(since_seq=after) без LIMIT
+            # укладывал весь лог мира в один SSE-ответ.
+            backfill = db.get_events_after(world_id, after, _EVENTS_PAGE_LIMIT)
+            if len(backfill) >= _EVENTS_PAGE_LIMIT:
+                log.info("SSE-догон (world %s, after=%s) упёрся в страницу %d — часть "
+                         "пропущенного догрузит поллинг/пересоединение",
+                         world_id, after, _EVENTS_PAGE_LIMIT)
+            for e in backfill:
                 yield bus.sse_format({"type": "event", "event": {
                     "id": e["id"], "seq": e["seq"], "role": e["role"], "content": e["content"],
                     "feedback": e["feedback"], "folded": e["folded"], "meta": e.get("meta") or {}}})
@@ -329,9 +381,7 @@ async def events_stream(world_id: int, after: int = 0):
 # ───────────────────────────── Провайдеры per-world ─────────────────────────────
 @router.post("/api/worlds/{world_id}/providers")
 async def world_providers(world_id: int, body: ProvidersIn):
-    world = db.get_world(world_id)
-    if not world:
-        raise HTTPException(404, "Мир не найден")
+    world = _world_or_404(world_id)
     current = _world_provider_settings(world)
     cfg = get_config()
     # валидируем id
@@ -363,12 +413,34 @@ async def world_providers(world_id: int, body: ProvidersIn):
     if warns:
         log.warning("сохранены пер-мирные провайдеры с предупреждением (world %s): %s",
                     world_id, " | ".join(warns))
-    return {"ok": True, "provider_settings": current,
+    # A3 (аудит 38): наружу — только маскированные ключи (правило 3). Фронт сырой ключ
+    # не читает, а форма настроек заполняется из providers_effective; семантика
+    # «пусто/KEY_MASK = не менять» в _apply_provider_override сохраняется.
+    return {"ok": True, "provider_settings": _masked_provider_settings(current),
             "warnings": warns,
             "providers_effective": {k: _mask_provider(dict(v)) for k, v in eff.items()}}
 
 
 # ───────────────────────────── Действия ─────────────────────────────
+# A7 (аудит 38): ЕДИНЫЙ предикат «это слэш-команда». Раньше список команд жил в ДВУХ
+# местах — в `action` (полный) и в `action_stream` (урезанный: не было /risk, /journal,
+# /хроника, /дневник, /shops, /economy, /craft). `/journal`, посланный через stream, уходил
+# в LLM-ход вместо справки. Теперь источник один, и расхождение невозможно.
+_SLASH_PREFIXES = ("/roll ", "/hint", "/memory ", "/risk ", "/journal ", "/хроника ", "/дневник ")
+_SLASH_EXACT = ("/where", "/status", "/quests", "/stats", "/map", "/inventory",
+                "/shops", "/economy", "/craft", "/story", "/board", "/risk", "/journal",
+                "/хроника", "/дневник", "/help", "/помощь")
+
+
+def is_slash_command(text: str) -> bool:
+    """Похож ли ввод на служебную команду чата (а не на действие игрока).
+
+    Один предикат для `action` и `action_stream` — иначе они неизбежно разъедутся (A7).
+    """
+    low = (text or "").strip().lower()
+    return low.startswith(_SLASH_PREFIXES) or low in _SLASH_EXACT
+
+
 @router.post("/api/worlds/{world_id}/action")
 async def action(world_id: int, body: ActionIn, _rl: None = Depends(make_guard("action"))):
     text = _ensure_action_len(body.text)
@@ -406,7 +478,7 @@ async def action(world_id: int, body: ActionIn, _rl: None = Depends(make_guard("
         return {"reply": ("Команды: /roll <куб>, /hint, /memory <запрос>, /where, /status, /quests, /stats, "
                           "/map, /inventory, /shops (или /economy, /craft), /board, /story, /journal, "
                           "/risk <идея>, /help. Во всём остальном просто описывай действия."),
-                "events": [], "state": json.loads(db.get_world(world_id)["setting"]), "game_over": False}
+                "events": [], "state": _world_setting_or_404(world_id), "game_over": False}
     return await _process_action(world_id, text, regenerate=bool(body.regenerate))
 
 
@@ -415,10 +487,8 @@ async def suggest_actions(world_id: int):
     """Свежие варианты действий по текущей сцене (кнопка «Обновить сюжеты»/при открытии мира).
     Перегенерирует подсказки ИИ по последнему ответу рассказчика — чтобы кнопки не «залипали»
     на одних и тех же. Best-effort: при сбое возвращает пусто (фронт покажет фолбэк от состояния)."""
-    world = db.get_world(world_id)
-    if not world:
-        raise HTTPException(404, "Мир не найден")
-    setting = json.loads(world["setting"])
+    world = _world_or_404(world_id)
+    setting = _json_object(world.get("setting"))
     providers = _world_providers(world)
     # Рассказчик-персона (persona) здесь НЕ нужна: narrator.generate_suggestions /
     # suggestions_messages её не принимают — подсказки это «бытовые действия игрока»,
@@ -455,10 +525,8 @@ async def divine(world_id: int, body: DivineIn, _rl: None = Depends(make_guard("
     complaint = (body.complaint or "").strip()
     if not complaint:
         raise HTTPException(400, "Опишите, в чём искажение реальности.")
-    world = db.get_world(world_id)
-    if not world:
-        raise HTTPException(404, "Мир не найден")
-    setting = json.loads(world["setting"])
+    world = _world_or_404(world_id)
+    setting = _json_object(world.get("setting"))
     if setting.get("game_over"):
         raise HTTPException(409, "Игра окончена в этом мире.")
 
@@ -501,12 +569,24 @@ async def divine(world_id: int, body: DivineIn, _rl: None = Depends(make_guard("
     divine_content = twist
     if sys_msgs:
         divine_content += "\n" + "\n".join(sys_msgs)
+    # A15 (аудит 38): LLM-проход Провидения идёт секунды, и раньше правка мира писалась
+    # поверх того состояния, которое прочитал В НАЧАЛЕ запроса. Если за это время игрок
+    # успел сходить (или нажал ↻) — Провидение зтирало ход игрока (или откат снапшота
+    # съедал выдачи богов). Пять фоновых агентов от этого защищены `_bg_may_write` и
+    # барьером `bg.regen_block`; здесь — та же сверка, но с честным 409 вместо тихой порчи.
+    fresh = _world_setting_or_404(world_id)
+    if not _bg_may_write(world_id, fresh, "_divine_last_turn",
+                        setting.get("_divine_last_turn") or 0,
+                        setting.get("_player_turns", 0) or 0):
+        raise HTTPException(409, "Мир изменился, пока Провидение слушало (новый ход или "
+                                 "перегенерация). Повтори воззвание.")
     with db.transaction():
         plea_ev = db.add_event(world_id, "system", f"\U0001f64f Воззвание: \u201c{complaint}\u201d")
         div_ev = db.add_event(world_id, "divine", divine_content)
-        # фиксируемся и время последнего воззвания (для кулдауна)
+        # фиксируемся и время последнего воззвания (для кулдауна) — в СВЕЖЕЕ состояние,
+        # поверх которого разрешена запись (проверка выше)
         new_state = res.get("state") or setting
-        new_state["_divine_last_turn"] = new_state.get("_player_turns", 0) or 0
+        new_state["_divine_last_turn"] = fresh.get("_player_turns", 0) or 0
         db.update_world(world_id, setting=new_state)
     # индексируем воззвание и ответ в память мира
     try:
@@ -529,10 +609,8 @@ async def trigger_vision(world_id: int):
     """🌙 Разыграть видение/сон из очереди (pending_visions): отдельный LLM-проход, который
     оборачивает старые факты памяти в художественное сновидение. Рассказчик-мастер вызывает
     при отдыхе/сне/медитации (vision_add — положить в очередь). Не блокирует ход."""
-    world = db.get_world(world_id)
-    if not world:
-        raise HTTPException(404, "Мир не найден")
-    setting = json.loads(world["setting"])
+    world = _world_or_404(world_id)
+    setting = _json_object(world.get("setting"))
     pv = setting.get("pending_visions") or []
     if not isinstance(pv, list) or not pv:
         raise HTTPException(404, "Очередь видений пуста. Сначала положите видение (vision_add).")
@@ -571,16 +649,19 @@ async def trigger_vision(world_id: int):
 @router.post("/api/worlds/{world_id}/action/stream")
 async def action_stream(world_id: int, body: ActionIn, _rl: None = Depends(make_guard("action_stream"))):
     text = _ensure_action_len(body.text)
-    low = text.lower()
-    if (low.startswith("/roll ") or low.startswith("/hint") or low.startswith("/memory ") or low == "/where"
-            or low == "/status" or low == "/quests" or low == "/stats" or low == "/map" or low == "/inventory" or low == "/story"
-            or low == "/board"
-            or low in ("/help", "/помощь")):
-        # слэш-команды — без стриминга
+    # A4 (аудит 38): мир проверяется ДО стрима — раньше action_stream на несуществующем
+    # мире отдавал 200 + SSE `event: error` (фронт показал traceback-подобный текст),
+    # а не честный 404.
+    _world_or_404(world_id)
+    if is_slash_command(text):
+        # слэш-команды — без стриминга. A7 (аудит 38): событие обязано называться `result`,
+        # как и в обычном ходе: фронт слушает token/result/error и раньше ответ команды
+        # (`event: done`) просто терялся. Разбирает его штатный handleActionResult.
         result = await action(world_id, body)
-        async def gen():
-            yield f'event: done\ndata: {json.dumps(result, ensure_ascii=False)}\n\n'
-        return StreamingResponse(gen(), media_type="text/event-stream")
+
+        async def gen_command():
+            yield f'event: result\ndata: {json.dumps(result, ensure_ascii=False)}\n\n'
+        return StreamingResponse(gen_command(), media_type="text/event-stream")
 
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -596,9 +677,11 @@ async def action_stream(world_id: int, body: ActionIn, _rl: None = Depends(make_
         finally:
             await queue.put(("DONE", None))
 
-    task = asyncio.get_event_loop().create_task(worker())
+    # D6 (аудит 38): ссылку на задачу держим в переменной task (её отменяем в finally),
+    # а цикл берём через get_running_loop — get_event_loop() deprecated в 3.12.
+    task = asyncio.get_running_loop().create_task(worker())
 
-    async def gen():
+    async def gen_stream():
         try:
             while True:
                 item = await queue.get()
@@ -614,7 +697,7 @@ async def action_stream(world_id: int, body: ActionIn, _rl: None = Depends(make_
             if not task.done():
                 task.cancel()
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen_stream(), media_type="text/event-stream")
 
 
 async def _slash_roll(world_id: int, expr: str):
@@ -628,8 +711,8 @@ async def _slash_roll(world_id: int, expr: str):
 
 
 async def _slash_hint(world_id: int):
-    world = db.get_world(world_id)
-    setting = json.loads(world["setting"])
+    world = _world_or_404(world_id)
+    setting = _json_object(world.get("setting"))
     providers = _world_providers(world)
     persona = _world_persona(world)
     msgs = [{"role": "system", "content": narrator.build_system_prompt(world, setting, persona=persona)},
@@ -645,14 +728,14 @@ async def _slash_hint(world_id: int):
 
 
 async def _slash_memory(world_id: int, query: str):
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     chunks = await narrator.retrieve_memory(world_id, query, setting, k=5)
     out = "🔎 Воспоминания:\n\n" + "\n\n---\n\n".join(f"• {c[:500]}" for c in chunks) if chunks else "Ничего не вспомнилось."
     return {"reply": out, "events": [], "state": setting, "game_over": False}
 
 
 def _slash_where(world_id: int):
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     loc = setting.get("locations", {}).get(setting.get("current_location", "start"), {})
     name = loc.get("name") or setting.get("current_location", "неизвестно")
     desc = loc.get("desc") or ""
@@ -667,7 +750,7 @@ def _slash_where(world_id: int):
 
 
 def _slash_status(world_id: int):
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     p = setting["player"]
     name = p.get("name") or "Путник"
     L = [f"🧙 {name} — ур. {p.get('level', 1)}"]
@@ -712,7 +795,7 @@ def _slash_status(world_id: int):
 
 
 def _slash_quests(world_id: int):
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     quests = setting.get("quests", {})
     if not quests:
         return {"reply": "📜 Активных квестов нет.", "events": [], "state": setting, "game_over": False}
@@ -728,7 +811,7 @@ def _slash_quests(world_id: int):
 
 
 def _slash_stats(world_id: int):
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     p = setting["player"]
     name = p.get("name") or "Путник"
     L = [f"📊 {name} — статистика пути"]
@@ -751,7 +834,7 @@ def _slash_stats(world_id: int):
 
 
 def _slash_map(world_id: int):
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     locs = setting.get("locations", {})
     cur = setting.get("current_location", "start")
     if not locs:
@@ -807,7 +890,7 @@ def _slash_map(world_id: int):
 
 
 def _slash_inventory(world_id: int):
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     inv = setting["player"].get("inventory", []) or []
     if not inv:
         return {"reply": "🎒 Инвентарь пуст.", "events": [], "state": setting, "game_over": False}
@@ -822,8 +905,8 @@ def _slash_inventory(world_id: int):
 
 def _slash_economy(world_id: int):
     from backend.mechanics import (inventory_weight, carry_capacity, total_sell_value,
-                                   location_stations, can_craft, has_station)
-    setting = json.loads(db.get_world(world_id)["setting"])
+                                   location_stations, can_craft)
+    setting = _world_setting_or_404(world_id)
     p = setting["player"]
     L = ["💰 Экономика:"]
     L.append(f"🪙 Золото: {p.get('gold', 0)}")
@@ -860,7 +943,7 @@ def _slash_economy(world_id: int):
 
 
 def _slash_story(world_id: int):
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     evs = db.get_events(world_id, limit=40)
     turns = [e for e in evs if e["role"] in ("player", "narrator")][-20:]
     if not turns:
@@ -880,7 +963,7 @@ def _slash_story(world_id: int):
 def _slash_board(world_id: int):
     """Доска объявлений мира (таверна/форум/рация) — чистое отображение (закон 2)."""
     from backend.mechanics import board_text
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     board = board_text(setting, limit=20)
     if not board:
         return {"reply": "📜 Доска объявлений пуста.", "events": [], "state": setting, "game_over": False}
@@ -891,7 +974,7 @@ def _slash_risk(world_id: int, idea: str = ""):
     """/risk <идея> — «чем я могу это закрыть» (сессия 34, C7). Чистый форматировщик
     состояния без LLM: перечень фактов, а не вердикт (законы 2/3)."""
     from ..risk import describe_risk
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     return {"reply": describe_risk(setting, idea), "events": [], "state": setting,
             "game_over": False}
 
@@ -903,7 +986,7 @@ def _slash_journal(world_id: int, text: str = ""):
     смысл записи решает игрок). /journal <слово> — поиск по хронике.
     """
     from .. import journal as _jr
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     arg = (text or "").strip()
     # в chat может прийти полный ввод («/journal note …») — срезаем префикс команды
     for pfx in ("/journal", "/хроника", "/дневник"):
@@ -944,8 +1027,7 @@ async def journal_list(world_id: int, limit: int = 100, cat: str = ""):
     from .. import journal as _jr
     if not db.get_world(world_id):
         raise HTTPException(404, "Мир не найден")
-    return {"entries": _jr.entries(world_id, limit=limit, cat=cat),
-            "categories": _jr.entry_categories(world_id)}
+    return {"entries": _jr.entries(world_id, limit=limit, cat=cat),            "categories": _jr.entry_categories(world_id)}
 
 
 @router.get("/api/worlds/{world_id}/risk")
@@ -955,10 +1037,8 @@ async def risk_report(world_id: int, idea: str = ""):
     Чистый форматировщик состояния (без LLM, без вердиктов): перечень фактов «есть/нет».
     """
     from ..risk import describe_risk
-    world = db.get_world(world_id)
-    if not world:
-        raise HTTPException(404, "Мир не найден")
-    setting = json.loads(world["setting"])
+    world = _world_or_404(world_id)
+    setting = _json_object(world.get("setting"))
     return {"reply": describe_risk(setting, idea), "state": setting}
 
 
@@ -970,8 +1050,7 @@ async def rewind_points(world_id: int):
     preview — начало действия игрока на этом ходу, чтобы список в UI был понятен
     («идти в таверну», «напасть на стражника»). Дамп state не отдаётся — только указатели.
     """
-    if not db.get_world(world_id):
-        raise HTTPException(404, "Мир не найден")
+    _world_or_404(world_id)
     pts = []
     for s in db.list_turn_snapshots(world_id):
         cur = db.get_latest_by_role(world_id, "player", before_seq=s["seq"] + 1)
@@ -1001,16 +1080,14 @@ async def rewind_world(world_id: int, body: RewindIn):
     # реестр событий «последнего хода» устарел: часть id удалена/сокрыта, и следующий ↻
     # не должен опираться на них (сессия 36, п.3B)
     invalidate_turn_registry(world_id)
-    res["world"] = db.get_world(world_id)
+    res["world"] = _safe_world_row(db.get_world(world_id))
     return res
 
 
 @router.post("/api/worlds/{world_id}/saves")
 async def save_game(world_id: int, body: SaveIn):
-    world = db.get_world(world_id)
-    if not world:
-        raise HTTPException(404, "Мир не найден")
-    setting = json.loads(world["setting"])
+    world = _world_or_404(world_id)
+    setting = _json_object(world.get("setting"))
     seq = db.latest_seq(world_id)
     save_id = db.create_save(world_id, body.name or f"Сохранение {seq}", setting, seq)
     return {"ok": True, "save": db.get_save(save_id)}
@@ -1018,6 +1095,9 @@ async def save_game(world_id: int, body: SaveIn):
 
 @router.get("/api/worlds/{world_id}/saves")
 async def saves(world_id: int):
+    # A4-bis (аудит 38): read-only выборки тоже отдают 404 на отсутствующем мире — иначе
+    # фронт не отличает «мир удалён» от «пустого списка».
+    _world_or_404(world_id)
     return db.list_saves(world_id)
 
 
@@ -1047,7 +1127,7 @@ async def load_save(world_id: int, save_id: int):
         raise HTTPException(400, f"Загрузка сохранения не удалась: {e}")
     invalidate_turn_registry(world_id)   # тот же смысл, что при перемотке (п.3B)
     # системное сообщение уже записал rewind_to (с пометкой о сохранении) — не дублируем
-    return {"ok": True, "world": db.get_world(world_id), "setting": res["setting"],
+    return {"ok": True, "world": _safe_world_row(db.get_world(world_id)), "setting": res["setting"],
             "event": res["event"], "unfolded": res["unfolded"],
             "removed_events": res["removed_events"]}
 
@@ -1064,10 +1144,8 @@ async def delete_save(world_id: int, save_id: int):
 # ───────────────────────────── Настройки / обратная связь ─────────────────────────────
 @router.post("/api/worlds/{world_id}/settings")
 async def update_gen_settings(world_id: int, body: GenSettingsIn):
-    world = db.get_world(world_id)
-    if not world:
-        raise HTTPException(404, "Мир не найден")
-    g = json.loads(world.get("gen_settings") or "{}")
+    world = _world_or_404(world_id)
+    g = _json_object(world.get("gen_settings"))
     for k, v in [("temperature", body.temperature), ("top_p", body.top_p),
                  ("max_tokens", body.max_tokens)]:
         if v is not None:
@@ -1094,17 +1172,20 @@ async def update_gen_settings(world_id: int, body: GenSettingsIn):
 
 @router.post("/api/worlds/{world_id}/events/{event_id}/feedback")
 async def feedback(world_id: int, event_id: int, body: FeedbackIn):
-    db.set_feedback(event_id, max(-1, min(1, body.value)))
+    # A4 (аудит 38): раньше — тихий no-op и «200 OK» на несуществующем мире/событии.
+    # A4-bis: `db.set_feedback` теперь скоупится по world_id — иначе оценку можно было
+    # поставить событию ЧУЖОГО мира (UPDATE шёл только по id).
+    _world_or_404(world_id)
+    if not db.set_feedback(event_id, max(-1, min(1, body.value)), world_id=world_id):
+        raise HTTPException(404, "Событие не найдено в этом мире")
     return {"ok": True}
 
 
 @router.post("/api/worlds/{world_id}/state/patch")
 async def patch_state(world_id: int, body: PatchIn):
     """Режим «Мастер»: точечные правки состояния (игрок/NPC/квесты/флаги)."""
-    world = db.get_world(world_id)
-    if not world:
-        raise HTTPException(404, "Мир не найден")
-    setting = json.loads(world["setting"])
+    world = _world_or_404(world_id)
+    setting = _json_object(world.get("setting"))
     allowed = {"player", "enemies", "npc", "locations", "current_location", "quests",
                "flags", "weather", "time", "game_over", "style_notes"}
     def _merge(dst: dict, src: dict) -> None:
@@ -1187,9 +1268,9 @@ async def import_json(body: ImportIn):
         new_id = db.restore_world(body.payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Некорректный дамп: {e}")
-    asyncio.get_event_loop().create_task(_reindex_imported_world(new_id))
+    bg.spawn(_reindex_imported_world(new_id), name="reindex-import")
     w = db.get_world(new_id) or {}
-    return {"ok": True, "world_id": new_id, "world": w,
+    return {"ok": True, "world_id": new_id, "world": _safe_world_row(w),
             "note": "мир создан; память (RAG) перестраивается в фоне"}
 
 
@@ -1237,17 +1318,25 @@ async def _reindex_imported_world(world_id: int) -> None:
 
 @router.delete("/api/worlds/{world_id}")
 async def delete_world(world_id: int):
-    db.delete_world(world_id)
+    _world_or_404(world_id)      # A4: удалять можно только существующий мир (404, а не «ok»)
+    # A8-bis (аудит 38): порядок «сначала фон, потом БД». Раньше SQLite-строки уходили
+    # первыми, а чистка Chroma — последней и с «проглотили ошибку → warning»; при падении
+    # векторы удалённого мира оставались навсегда (и id из AUTOINCREMENT после VACUUM/импорта
+    # может достаться новому миру — тогда чужая память всплыла бы в свежем прохождении).
+    # Теперь: не можем достучаться до векторной памяти — НЕ удаляем мир и честно говорим 503.
     try:
         await chroma_client.delete_by_where({"world_id": world_id})
     except Exception as e:
-        # векторы удалённого мира останутся в Chroma (сожрут место и могут всплыть в поиске)
         log.warning("удаление мира %s: чистка векторов в Chroma не удалась: %s", world_id, e)
+        raise HTTPException(503, "Векторная память (ChromaDB) недоступна — мир НЕ удалён. "
+                                 "Подними ChromaDB и повтори, иначе её векторы осиротеют.")
+    db.delete_world(world_id)
+    forget_world_state(world_id)
     return {"ok": True}
 
 
 @router.get("/api/worlds/{world_id}/memory/search")
 async def memory_search(world_id: int, q: str):
-    setting = json.loads(db.get_world(world_id)["setting"])
+    setting = _world_setting_or_404(world_id)
     chunks = await narrator.retrieve_memory(world_id, q, setting, k=6)
     return {"results": chunks}

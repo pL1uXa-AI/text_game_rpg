@@ -17,7 +17,6 @@ PLOTS.md/README, расширение `.js`) в папке:
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 
 from .logsetup import get_logger

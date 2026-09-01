@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 from .. import chroma_client, db, narrator
 from ..logsetup import get_logger
 from ..schemas import EntityIn
+from .core import _world_or_404
 
 log = get_logger(__name__)
 
@@ -25,6 +26,9 @@ async def entities(world_id: int, kind: Optional[str] = None):
 
 @router.get("/api/worlds/{world_id}/entities/{kind}/{entity_key}")
 async def entity_detail(world_id: int, kind: str, entity_key: str):
+    # A4 (аудит 38): мир обязан существовать — иначе 404 «карточки нет» на удалённом мире
+    # неотличим от «мира нет».
+    _world_or_404(world_id)
     e = db.get_entity(world_id, kind, entity_key)
     if not e:
         raise HTTPException(404, "Карточка не найдена")
@@ -33,6 +37,9 @@ async def entity_detail(world_id: int, kind: str, entity_key: str):
 
 @router.post("/api/worlds/{world_id}/entities")
 async def entity_create(world_id: int, body: EntityIn):
+    # A4 (аудит 38): карточку нельзя завести для несуществующего мира (осиротевшая строка,
+    # см. A8) — проверка мира единая для всех методов этого роутера.
+    _world_or_404(world_id)
     if body.kind not in ("npc", "location", "faction", "quest", "item", "event",
                           "enemy", "shop", "companion", "craft",
                           "race", "class", "profession", "skill", "effect"):
@@ -46,6 +53,7 @@ async def entity_create(world_id: int, body: EntityIn):
 
 @router.patch("/api/worlds/{world_id}/entities/{kind}/{entity_key}")
 async def entity_patch(world_id: int, kind: str, entity_key: str, body: EntityIn):
+    _world_or_404(world_id)
     existing = db.get_entity(world_id, kind, entity_key)
     if not existing:
         raise HTTPException(404, "Карточка не найдена")
@@ -58,6 +66,11 @@ async def entity_patch(world_id: int, kind: str, entity_key: str, body: EntityIn
 
 @router.delete("/api/worlds/{world_id}/entities/{kind}/{entity_key}")
 async def entity_delete(world_id: int, kind: str, entity_key: str):
+    # A4 (аудит 38): раньше удаление возвращало 200 даже на несуществующих мире/карточке —
+    # тихий no-op. Теперь: сначала проверяем мир (404), потом саму карточку (404).
+    _world_or_404(world_id)
+    if not db.get_entity(world_id, kind, entity_key):
+        raise HTTPException(404, "Карточка не найдена")
     db.delete_entity(world_id, kind, entity_key)
     try:
         await chroma_client.delete_by_ids([f"ent_{world_id}_{kind}_{entity_key}".replace(' ', '_')])

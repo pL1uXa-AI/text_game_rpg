@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import logging
 import random
 import re
 from pathlib import Path
@@ -62,6 +61,13 @@ def _regen_active(world_id: int) -> bool:
     return bg.is_regenerating(world_id)
 
 
+# A13 (аудит 38): окно поиска событий одного хода при промахе in-memory реестра.
+# «Действие + кубы + ответ + системки» — несколько seq, плюс вставки фоновых агентов.
+# Раньше запрос шёл «от seq действия и до конца мира» (to_seq=None) и на длинном
+# прохождении сканировал весь хвост журнала — ровно то, от чего защищали B5/п.8.
+_TURN_EVENTS_WINDOW = 24
+
+
 def _turn_registry(world_id: int, idx_seq: int) -> list[int]:
     """id событий хода `idx_seq`, ПОДЛЕЖАЩИХ замене при перегенерации.
 
@@ -84,13 +90,20 @@ def _turn_registry(world_id: int, idx_seq: int) -> list[int]:
     if _turn_seq.get(world_id) == idx_seq and cached is not None:
         return list(cached)
     try:
-        evs = db.get_turn_events(world_id, idx_seq, None,
+        # A13: ограниченный диапазон хода вместо «весь хвост журнала»
+        evs = db.get_turn_events(world_id, idx_seq, idx_seq + _TURN_EVENTS_WINDOW,
                                  roles=("narrator", "dice", "system"), unfolded_only=False)
     except Exception as e:
         log.warning("реестр хода из БД (world %s, seq %s): %s", world_id, idx_seq, e)
         return []
     ids = [e["id"] for e in evs
            if isinstance(e.get("meta"), dict) and e["meta"].get("turn") == idx_seq]
+    if ids and len(evs) >= _TURN_EVENTS_WINDOW:
+        # окно выбрано целиком — возможен ход длиннее окна: тихо резать нельзя,
+        # иначе ↻ снова удвоит механику (тот баг, что закрывал п.3B)
+        log.warning("реестр хода (world %s, seq %s): окно %d выбрано целиком — возможно, "
+                    "ход длиннее, стоит поднять _TURN_EVENTS_WINDOW",
+                    world_id, idx_seq, _TURN_EVENTS_WINDOW)
     if not ids:
         # Консервативный фолбэк для миров, записанных ДО меты (живые сохранения
         # пользователя): берём нарратив и кубы сразу за ходом, но СИСТЕМКИ не трогаем —
@@ -114,6 +127,20 @@ def invalidate_turn_registry(world_id: int) -> None:
     _turn_seq.pop(int(world_id), None)
 
 
+def forget_world_state(world_id: int) -> None:
+    """Забыть про мир во всех in-memory наборах (удаление мира, аудит 38).
+
+    `_turn_events`/`_turn_seq` и busy-множества агентов ключуются id мира; после удаления
+    они оставались навсегда, а id из AUTOINCREMENT после VACUUM/импорта дампа может
+    достаться новому миру — и тогда новый мир «уже занят» для карточек/судьи/мастера,
+    и его ход не будет обработан фоном до перезапуска сервера."""
+    wid = int(world_id)
+    invalidate_turn_registry(wid)
+    for bucket in (_cards_busy, _event_busy, _judge_busy, _master_busy,
+                   _enemy_ai_busy, _vision_busy):
+        bucket.discard(wid)
+
+
 def _bg_may_write(world_id: int, fresh: dict, marker: str, last: int, base_turns: int) -> bool:
     """Может ли фоновый агент записать результат в мир (сессия 36, п.3A/п.17).
 
@@ -135,18 +162,23 @@ def _bg_may_write(world_id: int, fresh: dict, marker: str, last: int, base_turns
 
 # Максимальная длина действия игрока (символов) — защита от многотысячного ввода,
 # который ломает токен-бюджет контекста. Эвристика: len/3.2 ≈ 200 токенов при 640.
-MAX_ACTION_CHARS = int(get_config().max_action_chars)
+# A5 (аудит 38): значение читается ИЗ КОНФИГА на каждый вызов. Раньше константа
+# `MAX_ACTION_CHARS = int(get_config().max_action_chars)` вычислялась один раз при импорте
+# модуля, поэтому правка в админке («Лимит длины действия») не действовала до перезапуска
+# сервера — ровно тот класс дефекта, который закрывали в сессии 36 п.2. Это было единственное
+# модульное значение get_config() в backend.
 
 
 def _ensure_action_len(text: str) -> str:
-    """Валидация длины действия: 400/429 с понятным сообщением (фронт покажет в чате)."""
+    """Валидация длины действия: 400 с понятным сообщением (фронт покажет в чате)."""
     t = (text or "").strip()
     if not t:
         raise HTTPException(400, "Пустое действие")
-    if len(t) > MAX_ACTION_CHARS:
+    limit = int(get_config().max_action_chars)
+    if len(t) > limit:
         raise HTTPException(
             400,
-            f"Действие слишком длинное: {len(t)} символов (максимум {MAX_ACTION_CHARS}).\n"
+            f"Действие слишком длинное: {len(t)} символов (максимум {limit}).\n"
             "Разбей на несколько шагов или сократи.",
         )
     return t
@@ -172,6 +204,95 @@ def _world_providers(world: dict) -> dict:
 
 def _masked_world_providers(world: dict) -> dict:
     return {k: _mask_provider(dict(v)) for k, v in _world_providers(world).items()}
+
+
+def _masked_provider_settings(settings: dict) -> dict:
+    """Per-world переопределения провайдеров для ОТДАЧИ наружу — с замаскированным ключом.
+
+    A3 (аудит 38, железное правило 3): `world_detail` и ответ `POST .../providers`
+    возвращали сырой `provider_settings` с живым `api_key`. Фронт эти данные не читает
+    (форма настроек заполняется из `providers_effective`, а `_apply_provider_override`
+    трактует пустое поле и KEY_MASK как «не менять»), так что маскирование ничего не ломает.
+    Общий хелпер — чтобы новые роуты не забывали маскировать.
+    Аргумент — уже разобранный словарь переопределений (не строка JSON из БД)."""
+    return {k: _mask_provider(dict(v)) if isinstance(v, dict) else v
+            for k, v in (settings or {}).items()}
+
+
+def _safe_world_row(world: dict) -> dict:
+    """Строка мира для ОТДАЧИ наружу: `provider_settings` замаскирован внутри JSON-строки.
+
+    A3 (аудит 38): отдельного замаскированного поля в ответе мало — `world_detail` отдаёт
+    и весь dict мира (`world.provider_settings` — сырой JSON из БД), и через него живой
+    ключ утекал наружу. Server-side резолв провайдеров читает исходную строку, поэтому
+    его маскирование копии не затрагивает."""
+    out = dict(world or {})
+    try:
+        out["provider_settings"] = json.dumps(_masked_provider_settings(
+            _world_provider_settings(world)), ensure_ascii=False)
+    except Exception as e:
+        # отдать без поля безопаснее, чем отдать с ключом
+        log.warning("маскирование provider_settings (world %s) не удалось: %s",
+                    world.get("id"), e)
+        out.pop("provider_settings", None)
+    return out
+
+
+def _world_or_404(world_id: int) -> dict:
+    """Мир обязан существовать — иначе честный 404 вместо 500 (аудит 38, A4).
+
+    `db.get_world()` возвращает None на несуществующем мире, а ~19 мест сразу индексировали
+    `["setting"]` → TypeError → 500 с голым traceback. Единая точка проверки — здесь
+    (в routers/lore.py был свой локальный хелпер — теперь реэкспортируется этот).
+
+    Для ФОНОВЫХ агентов этот хелпер не годится (им нельзя ронять ход) — там своя проверка
+    `if not world: log + return`.
+    """
+    w = db.get_world(world_id)
+    if not w:
+        raise HTTPException(404, "Мир не найден")
+    return w
+
+
+def _world_setting_or_404(world_id: int) -> dict:
+    """Мир существует → его состояние (JSON разобран). 404 вместо 500 (аудит 38, A4)."""
+    return _json_object(_world_or_404(world_id).get("setting"))
+
+
+def _json_object(raw) -> dict:
+    """Разобрать JSON-колонку мира в dict; битая строка = {} (не роняем ответ)."""
+    try:
+        obj = json.loads(raw or "{}")
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _fresh_setting_or_none(world_id: int) -> dict | None:
+    """Свежее состояние мира для ФОНОВОГО агента (аудит 38, A4 п.2).
+
+    Фону нельзя кидать HTTPException — он не должен ронять ход и не должен светить
+    голый traceback: если мир успели удалить, это нормальная ситуация, а не авария.
+    Возвращает None + warning, чтобы в логе было видно «агент ушёл, потому что мира нет».
+    """
+    w = db.get_world(world_id)
+    if not w:
+        log.warning("фон (world %s): мир исчез (удалён?) — пропуск записи", world_id)
+        return None
+    return _json_object(w.get("setting"))
+
+
+# A10 (аудит 38): ЕДИНЫЙ источник «какие роли показывать игроку в логе мира».
+# Раньше world_detail отдавал db.get_events(limit=60) без фильтра, и при открытии мира
+# в чат попадали служебные роли (summary — спойлеры свёрнутого прошлого), тогда как
+# живые пути (SSE, поллинг) их сознательно фильтровали: картина «до F5» ≠ «после F5».
+# Тот же набор ролей применяется к /history (пагинация лога обязана совпадать с чатом,
+# иначе счётчик «показать ранние события» врёт) и отдаётся во фронт, где предикат один.
+# `player` здесь есть: при открытии мира действия игрока надо показать (в живом чате их
+# не догружают с сервера только потому, что фронт рисует их оптимистично сам).
+# `summary` — единственная роль, которую игрок не видит никогда: это материал промпта,
+# а не часть истории (память, слой 2 — зафиксировано в AGENT.md).
+CHAT_LOG_ROLES: tuple[str, ...] = ("player", "narrator", "system", "dice", "divine")
 
 
 async def _context_guard(world_id: int, providers: dict, gen_settings: dict) -> dict:
@@ -219,8 +340,19 @@ def _world_persona(world: dict) -> str | None:
         return None
     try:
         nr = db.get_narrator(int(nid))
-        return (nr or {}).get("prompt") or None
-    except Exception:
+        if not (nr or {}).get("prompt"):
+            # рассказа без текста персоны — не ошибка БД, а странность данных: тихо играть
+            # «без рассказчика» нельзя (игрок выбирал персону осознанно)
+            log.warning("персона рассказчика пуста (world %s, narrator_id %s) — мир играется "
+                        "со стандартным голосом", world.get("id"), nid)
+            return None
+        return nr["prompt"]
+    except Exception as e:
+        # A19 (аудит 38, правило 14): раньше это был голый `except: return None` — мир тихо
+        # терял выбранную персону, и «почему рассказчик снова безликий» приходилось гадать.
+        # Ход не роняем (законы 2/3: инфраструктура обслуживает рассказчика), но пишем.
+        log.warning("персона рассказчика (world %s, narrator_id %s) не загружена: %s",
+                    world.get("id"), nid, e, exc_info=True)
         return None
 
 
@@ -233,11 +365,19 @@ async def _index_world_lore(world_id: int, providers: dict | None = None) -> Non
         log.warning("_index_world_lore (world %s): %s", world_id, e)
 
 
-def _summaries(world_id: int, limit: int = 0) -> list[dict]:
-    """Сводки для промпта. limit=0 — все (по умолчанию срезалось `[-3:]`, из-за чего
-    масштабирование количества сводок от размера контекста в build_messages было мёртвым —
-    баг A3). Теперь количество задаёт build_messages/dynamic_memory_k, здесь только потолок."""
-    return db.get_summary_events(world_id, limit=limit or 0)
+# A12 (аудит 38): потолок сводок, поднимаемых из БД на каждый ход. build_messages оставляет
+# последние dynamic_memory_k(3..10) — берём с запасом, чтобы «свежие» точно попали в выборку,
+# но горячий путь не читал весь список сводок прохождения (был LIMIT=все).
+SUMMARIES_FETCH_LIMIT = 60
+
+
+def _summaries(world_id: int, limit: int = SUMMARIES_FETCH_LIMIT) -> list[dict]:
+    """Сводки для промпта (самые свежие `limit`, в хронологическом порядке).
+
+    limit=0 — все (так просят rewind/тесты). По умолчанию — ограниченный хвост: раньше
+    роутер читал ВСЕ сводки мира на каждый ход (B5-регрессия), а количество для промпта
+    всё равно задаёт build_messages/dynamic_memory_k (баг A3 закрыт в сессии 34)."""
+    return db.get_summary_events(world_id, limit=limit if limit is not None else 0)
 
 
 def _memory_audit(rag_chunks: list[str], lore_chunks: list[str], note: str | None = None,
@@ -312,15 +452,17 @@ def _gen_params(world: dict) -> dict:
             "max_tokens": g.get("max_tokens", cfg.max_tokens)}
 
 
-def _repetition_score(text: str) -> float:
-    """Метрика качества (ИИ-качество): доля слов, повторяющихся внутри одного ответа.
-    Признак деградации рассказчика — если он зациклился на одних фразах, доля
-    дубликатов растёт. 0..1, 0 = без повторов, >=0.4 ≈ заметная цикличность.
+def _lexical_dup_share(text: str) -> float:
+    """ДОЛЯ повторных вхождений слов в тексте (`1 - уникальные/все`).
 
-    ⚠ ИНВАРИАНТ (сессия 36, п.31): это МЕТРИКА для дашборда, а не цензор — на текст
-    ответа она не влияет. Завышается у стилистически повторяющихся моделей (короткие
-    предложения, рефрены, «ты/тебя» в каждом) — это ожидаемо, лечить порогами нельзя:
-    мера должна оставаться дешёвой и детерминированной.
+    A16 (аудит 38): раньше эта величина называлась `repetition` и трактовалась как
+    «признак зацикливания рассказчика» — но на нормальном художественном тексте она
+    стабильно 0.4–0.55 (любая живая проза повторяет «ты/его/на»), и дашборд всегда
+    показывал «модель зациклилась». Переименована по сути: это лексическое разнообразие,
+    а не цикл. Настоящий цикл считает `_repetition_score`.
+
+    ⚠ ИНВАРИАНТ (сессия 36, п.31): МЕТРИКА для дашборда, а не цензор — на текст ответа
+    не влияет. Завышается у стилистически повторяющихся моделей — это ожидаемо.
     """
     try:
         tokens = re.findall(r"[а-яА-Яa-zA-ZёЁ0-9]{3,}", (text or "").lower())
@@ -329,6 +471,37 @@ def _repetition_score(text: str) -> float:
         seen = set(tokens)
         dup = len(tokens) - len(seen)
         return round(dup / len(tokens), 3)
+    except Exception:
+        return 0.0
+
+
+def _repetition_score(text: str) -> float:
+    """Доля текста, приходящаяся на СОСЕДНИЕ дословные повторы (реальный цикл модели).
+
+    A16 (аудит 38): настоящая метрика зацикливания. Считается тем же распознаванием
+    блоков, что и «лечилка» `_dedupe_repeats`: если блок (абзац/предложение ≥30 символов)
+    повторен подряд — его символы идут в знаменатель «засорённости». Отличие от
+    `_lexical_dup_share`: нормальная проза даёт ~0.0, а цикл модели — заметную величину,
+    потому что повторяются блоки, а не слова.
+
+    ⚠ ИНВАРИАНТ (там же, где и у `_dedupe_repeats`, сессия 36 п.31): дешёвая и
+    детерминированная мера, а не цензор — на текст ответа она не влияет.
+    Порог «заметного цикла» (0.15) — ориентир дашборда; лечить текст порогами нельзя.
+    """
+    t = (text or "").strip()
+    if len(t) < 80:
+        return 0.0
+    try:
+        pieces = re.split(r"((?<=\n)\s*|(?<=[.!?…])\s+)", t)
+        blocks = [p.strip() for p in pieces if p and p.strip()]
+        if len(blocks) < 2:
+            return 0.0
+        total = sum(len(b) for b in blocks)
+        dup = 0
+        for i in range(1, len(blocks)):
+            if len(blocks[i]) >= 30 and blocks[i] == blocks[i - 1]:
+                dup += len(blocks[i])
+        return round(dup / total, 3) if total else 0.0
     except Exception:
         return 0.0
 
@@ -712,11 +885,13 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
                     kept.update(d2)
                     directives = kept
         except Exception as e:
-            log.warning("нормилзация директив (world %s): %s", world_id, e)
+            log.warning("аудит директив (world %s): %s", world_id, e)
     # Нормализация типов директив: «str вместо dict» из LLM выправляется/отбрасывается,
     # чтобы ход не падал с 'str' object has no attribute 'get'.
     directives = narrator.normalize_directives(directives) or None
     sys_msgs: list[str] = []
+    zone_off_msgs: list[str] = []      # A2: снятие эффектов старой локации-зоны
+    zone_on_msgs: list[str] = []       # наложение эффектов новой
     roll_extra = ""
     dice_events: list[dict] = []
     try:
@@ -726,21 +901,26 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
             # Сессия 32: при перемещении (move) эффекты старой локации-зоны снимаются,
             # новой — накладываются (радиация/туман/проклятие). Это «физика»: защита и
             # последствия решает мастер (закон 3).
+            #
+            # A2 (аудит 38): раньше снятие старой зоны попадало в sys_msgs ДО присваивания
+            # `sys_msgs = narrator.apply_directives(...)` и обнулялось — игрок никогда не
+            # видел системки «эффект зоны снят», хотя эффект физически снимался (лог
+            # расходился с сайдбаром). Теперь каждый блок в своём списке, порядок сборки —
+            # «снятие старой зоны → директивы → наложение новой».
             try:
                 if "move" in directives:
                     old_loc = setting.get("current_location", "start")
-                    msgs_loc = narrator.apply_location_effects(setting, old_loc, apply=False)
-                    sys_msgs.extend(msgs_loc)
+                    zone_off_msgs = narrator.apply_location_effects(setting, old_loc, apply=False)
             except Exception as e:
                 log.warning("снятие эффектов зоны при move (world %s): %s", world_id, e, exc_info=True)
             sys_msgs = narrator.apply_directives(setting, directives)
             try:
                 if "move" in directives:
                     new_loc = setting.get("current_location", "start")
-                    msgs_loc = narrator.apply_location_effects(setting, new_loc, apply=True)
-                    sys_msgs.extend(msgs_loc)
+                    zone_on_msgs = narrator.apply_location_effects(setting, new_loc, apply=True)
             except Exception as e:
                 log.warning("наложение эффектов зоны при move (world %s): %s", world_id, e, exc_info=True)
+            sys_msgs = zone_off_msgs + sys_msgs + zone_on_msgs
 
         # Бросок куба по запросу рассказчика
         if directives and "roll" in directives:
@@ -821,8 +1001,11 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
             if final_text.strip() and tts.tts_effective(world).get("enabled"):
                 db.set_event_tts(narrator_ev["id"], 1, "")
                 narrator_ev["tts_status"] = 1   # фронт сразу покажет «⟳» и опросит готовность
-                asyncio.get_event_loop().create_task(
-                    tts.ensure_event_audio(world_id, narrator_ev["id"], final_text))
+                # D6 (аудит 38): bg.spawn держит ссылку на задачу — asyncio хранит задачи
+                # слабыми ссылками, и «огонь-и-забыл» create_task мог собрать мусорщик
+                # посреди игры (симптом: озвучка/индекс не появились, в логе ничего).
+                bg.spawn(tts.ensure_event_audio(world_id, narrator_ev["id"], final_text),
+                         name="tts")
         except Exception as e:
             log.warning("TTS-задача (world %s, seq %s): %s", world_id, idx_seq, e)
 
@@ -832,7 +1015,13 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
         system_events = [db.add_event(world_id, "system", m, meta={"turn": idx_seq})
                          for m in tick_msgs + sys_msgs]
 
-        db.update_world(world_id, setting=setting)
+        # A1 (аудит 38): состояние мира пишем ОДНИМ вызовом и ПОСЛЕ всех мутаций этого
+        # хода (карточки знаний → дневник → ружья Чехова). Раньше `update_world` стоял в
+        # середине блока, а `journal.chekhov_update` мутировал `setting["_chekhov"]` уже ПОСЛЕ
+        # записи — на следующем ходу ключ перечитывался из БД отсутствующим, «ружейная»
+        # никогда не накапливалась и не гасла (фича была мертва с сессии 34, в БД — 0 миров
+        # с _chekhov при 34 мирах). Чтецы ниже берут setting из аргументов, а не из БД,
+        # поэтому перенос записи безопасен.
         if setting.get("game_over"):
             db.add_event(world_id, "system", "💀 Игра окончена. Используй «сохранить слот» или создай новый мир.",
                          meta={"turn": idx_seq})
@@ -850,7 +1039,7 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
         try:
             kcards = narrator.ensure_knowledge_cards(world_id, setting, seq=idx_seq, origins=sys_msgs)
             if kcards:
-                asyncio.get_event_loop().create_task(narrator.index_entities(world_id, kcards))
+                bg.spawn(narrator.index_entities(world_id, kcards), name="index-kcards")
         except Exception as e:
             log.warning("карточки знаний (world %s, seq %s): %s", world_id, idx_seq, e)
 
@@ -862,7 +1051,7 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
             jcards = journal.record_turn(world_id, pre_turn_snapshot, setting, idx_seq,
                                          action=text, sys_msgs=sys_msgs)
             if jcards:
-                asyncio.get_event_loop().create_task(narrator.index_entities(world_id, jcards))
+                bg.spawn(narrator.index_entities(world_id, jcards), name="index-jcards")
         except Exception as e:
             log.warning("дневник (world %s, seq %s): %s", world_id, idx_seq, e, exc_info=True)
 
@@ -876,6 +1065,9 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
         except Exception as e:
             log.warning("ружья Чехова (world %s, seq %s): %s", world_id, idx_seq, e,
                         exc_info=True)
+
+        # единая запись состояния хода — после всех мутаций (см. A1 выше)
+        db.update_world(world_id, setting=setting)
 
     # ── Автосохранение: после каждого обычного хода (не при перегенерации) ──
     if not regenerate:
@@ -900,49 +1092,53 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
     # одновременно, конкурируя со СЛЕДУЮЩИМ ходом игрока. Теперь они идут через bg-очередь:
     # ограниченный параллелизм (LLM_BG_CONCURRENCY), порядок по важности и старт только
     # после того, как ответ игроку отдан (этот ход обёрнут в bg.player_turn()).
-    loop = asyncio.get_event_loop()
+    # D6 (аудит 38): вместо `asyncio.get_event_loop()` (deprecated в 3.12, ошибка в 3.13) и
+    # create_task без ссылки — bg.spawn: он берёт бегущий цикл и держит ссылку на задачу.
     # Снимок состояния для фоновых агентов — ОДИН раз, в момент подачи задачи (как и раньше):
     # deepcopy внутри лямбды выполнился бы позже, и агент увидел бы уже изменённое состояние.
     agents_setting = copy.deepcopy(setting)
     if get_config().background_tasks_enabled:
-        loop.create_task(bg.submit("memory", lambda: _background_memory(world_id, idx_seq, text,
-                                                                        final_text),
-                                   priority=bg.PRIO_MEMORY, world_id=world_id, agent="memory"))
-        loop.create_task(bg.submit("cards", lambda: _background_cards(world_id, text, final_text),
-                                   priority=bg.PRIO_CARDS, world_id=world_id, agent="cards"))
+        bg.spawn(bg.submit("memory", lambda: _background_memory(world_id, idx_seq, text,
+                                                                final_text),
+                           priority=bg.PRIO_MEMORY, world_id=world_id, agent="memory"),
+                 name="bg-memory")
+        bg.spawn(bg.submit("cards", lambda: _background_cards(world_id, text, final_text),
+                           priority=bg.PRIO_CARDS, world_id=world_id, agent="cards"),
+                 name="bg-cards")
     # Динамические события мира — отдельный флаг (dynamic_events_enabled), не зависят от фоновых задач
-    loop.create_task(bg.submit("event", lambda: _maybe_dynamic_event(world_id),
-                               priority=bg.PRIO_EVENT, world_id=world_id, agent="event"))
+    bg.spawn(bg.submit("event", lambda: _maybe_dynamic_event(world_id),
+                       priority=bg.PRIO_EVENT, world_id=world_id, agent="event"),
+             name="bg-event")
     # Судья логики: фоновая проверка противоречий (не блокирует ответ; по интервалу ходов)
     if _maybe_logic_judge_enabled(world):
-        loop.create_task(bg.submit(
+        bg.spawn(bg.submit(
             "judge", lambda: _maybe_logic_judge(world_id, agents_setting, text, final_text),
-            priority=bg.PRIO_JUDGE, world_id=world_id, agent="judge"))
+            priority=bg.PRIO_JUDGE, world_id=world_id, agent="judge"), name="bg-judge")
 
     # Автономный «мастер»: если игрок «застрял» (повторяет действие / без квестов) — фоново
     # генерирует квест/сюжетный поворот, выводит из тупика. Не блокирует ответ, по интервалу ходов.
     if get_config().autonomous_master_enabled:
-        loop.create_task(bg.submit(
+        bg.spawn(bg.submit(
             "master",
             lambda: _maybe_autonomous_master(world_id, agents_setting, text, final_text),
-            priority=bg.PRIO_MASTER, world_id=world_id, agent="master"))
+            priority=bg.PRIO_MASTER, world_id=world_id, agent="master"), name="bg-master")
 
     # Боевой ИИ врагов: пока в бою есть живые враги, фоново выбирает их тактический ход
     # (охрана/отступление/переговоры/ловушка). Не блокирует ответ, по интервалу ходов.
     if get_config().enemy_ai_enabled:
-        loop.create_task(bg.submit(
+        bg.spawn(bg.submit(
             "enemy_ai",
             lambda: _maybe_enemy_ai(world_id, agents_setting, text, final_text),
-            priority=bg.PRIO_ENEMY_AI, world_id=world_id, agent="enemy_ai"))
+            priority=bg.PRIO_ENEMY_AI, world_id=world_id, agent="enemy_ai"), name="bg-enemy_ai")
 
     # Сны/видения (сессия 32): если рассказчик вызвал trigger_vision и в очереди есть
     # видение — разыгрываем его отдельным LLM-проходом в фоне (память как сюжет).
     try:
         if isinstance(directives, dict) and "trigger_vision" in directives \
                 and (setting.get("pending_visions") or []):
-            loop.create_task(bg.submit(
+            bg.spawn(bg.submit(
                 "vision", lambda: _maybe_trigger_vision(world_id, agents_setting),
-                priority=bg.PRIO_VISION, world_id=world_id, agent="vision"))
+                priority=bg.PRIO_VISION, world_id=world_id, agent="vision"), name="bg-vision")
     except Exception as e:
         log.warning("запуск видения (world %s): %s", world_id, e, exc_info=True)
 
@@ -975,6 +1171,9 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
             prompt_tokens=measured_prompt,
             memory_tokens=memory_tokens,
             repetition=_repetition_score(final_text),
+            # A16 (аудит 38): старый показатель «доля повторных СЛОВ» больше не притворяется
+            # зацикливанием — у него честное имя и своё поле в метриках.
+            lexical_dup_share=_lexical_dup_share(final_text),
             provider=prov_main.get("id"),
             game_over=bool(setting.get("game_over")),
             finish_reason=fr or None,
@@ -1055,8 +1254,8 @@ async def _maybe_logic_judge(world_id: int, setting: dict, action: str, reply: s
         # п.17/п.3A: отказ от записи и если идёт перегенерация того же хода, и если
         # _player_turns сдвинулся (иначе судья перезаписал бы setting состоянием на
         # момент своего чтения и «съел» ход игрока).
-        s2 = json.loads(db.get_world(world_id)["setting"])
-        if not _bg_may_write(world_id, s2, "_judge_last_turn", last, turns):
+        s2 = _fresh_setting_or_none(world_id)
+        if s2 is None or not _bg_may_write(world_id, s2, "_judge_last_turn", last, turns):
             log.debug("судья (world %s): запись пропущена (перегенерация/новый ход)", world_id)
             return
         s2["_judge_last_turn"] = turns
@@ -1067,9 +1266,9 @@ async def _maybe_logic_judge(world_id: int, setting: dict, action: str, reply: s
         # 2) корректировка согласованности биографии и роли (если судья нашёл несоответствие)
         corr_msgs: list[str] = []
         if res.get("corrections"):
-            s3 = json.loads(db.get_world(world_id)["setting"])
+            s3 = _fresh_setting_or_none(world_id)
             # перечитали состояние — снова сверяемся: за время индекса игрок мог сходить
-            if not _bg_may_write(world_id, s3, "_judge_last_turn", turns, turns):
+            if s3 is None or not _bg_may_write(world_id, s3, "_judge_last_turn", turns, turns):
                 log.debug("судья (world %s): корректировки отложены (мир изменился)", world_id)
             else:
                 try:
@@ -1187,7 +1386,7 @@ async def _maybe_dynamic_event(world_id: int) -> None:
             content += "\n" + "\n".join(msgs)
         ev_db = db.add_event(world_id, "system", "🌍 " + content)
         try:
-            asyncio.get_event_loop().create_task(narrator.index_exchange(
+            bg.spawn(narrator.index_exchange(
                 world_id, ev_db["seq"], "🌍 Случайное событие мира", content,
                 provider=providers.get("embedding")))
         except Exception as e:
@@ -1234,7 +1433,9 @@ async def _maybe_trigger_vision(world_id: int, setting: dict) -> None:
             return
         # с момента чтения s прошло два LLM-прохода: перечитаем состояние и не затираем
         # собой ход игрока/перегенерацию (сессия 36, п.17)
-        fresh = json.loads(db.get_world(world_id)["setting"])
+        fresh = _fresh_setting_or_none(world_id)
+        if fresh is None:
+            return
         if _regen_active(world_id) or int(fresh.get("_player_turns", 0) or 0) > \
                 int(s.get("_player_turns", 0) or 0):
             log.debug("видение (world %s): запись пропущена (перегенерация/новый ход)", world_id)
@@ -1302,8 +1503,8 @@ async def _maybe_autonomous_master(world_id: int, setting: dict, action: str, re
             return
         event_text, directives = res
         # свежее состояние: игрок мог успеть походить/мастер уже вмешался
-        s2 = json.loads(db.get_world(world_id)["setting"])
-        if not _bg_may_write(world_id, s2, "_master_last_turn", last, turns):
+        s2 = _fresh_setting_or_none(world_id)
+        if s2 is None or not _bg_may_write(world_id, s2, "_master_last_turn", last, turns):
             log.debug("автономный мастер (world %s): запись пропущена (перегенерация/новый ход)",
                       world_id)
             return
@@ -1315,7 +1516,7 @@ async def _maybe_autonomous_master(world_id: int, setting: dict, action: str, re
             content += "\n" + "\n".join(msgs)
         ev_db = db.add_event(world_id, "system", "🤖 Мастер: " + content)
         try:
-            asyncio.get_event_loop().create_task(narrator.index_exchange(
+            bg.spawn(narrator.index_exchange(
                 world_id, ev_db["seq"], "🤖 Действие автономного мастера",
                 event_text + ("\n" + "\n".join(msgs) if msgs else ""),
                 provider=(_world_providers(db.get_world(world_id)) or {}).get("embedding")))
@@ -1364,8 +1565,8 @@ async def _maybe_enemy_ai(world_id: int, setting: dict, action: str, reply: str)
             return
         eid, etext, mode, directives = res
         # свежее состояние: игрок мог добить/увести врагов; не вмешиваемся, если врагов уж нет
-        s2 = json.loads(db.get_world(world_id)["setting"])
-        if not _bg_may_write(world_id, s2, "_enemy_ai_last_turn", last, turns):
+        s2 = _fresh_setting_or_none(world_id)
+        if s2 is None or not _bg_may_write(world_id, s2, "_enemy_ai_last_turn", last, turns):
             log.debug("боевой ИИ (world %s): запись пропущена (перегенерация/новый ход)",
                       world_id)
             return
@@ -1379,7 +1580,7 @@ async def _maybe_enemy_ai(world_id: int, setting: dict, action: str, reply: str)
             content += "\n" + "\n".join(msgs)
         ev_db = db.add_event(world_id, "system", content)
         try:
-            asyncio.get_event_loop().create_task(narrator.index_exchange(
+            bg.spawn(narrator.index_exchange(
                 world_id, ev_db["seq"], "⚔️ Боевой ИИ врагов",
                 etext + ("\n" + "\n".join(msgs) if msgs else ""),
                 provider=(_world_providers(db.get_world(world_id)) or {}).get("embedding")))

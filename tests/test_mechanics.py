@@ -9,10 +9,13 @@ import pytest
 
 from backend import narrator
 from backend.narrator import (
-    THEMES, apply_directives, check_profession_advance, default_setting,
+    THEMES, apply_directives, default_setting,
     effective_stats, format_state, normalize_directives, recalc_derived, roll_expr, roll_outcome,
     split_engine, tick_effects,
 )
+# D2 (аудит 38): фасад narrator больше не реэкспортирует имя, которое никем не читалось
+# через narrator.X — берём напрямую из модуля-владельца (механика живёт в mechanics).
+from backend.mechanics import check_profession_advance
 
 
 @pytest.fixture
@@ -966,14 +969,30 @@ def test_apply_character_normalizes_mixed_skill_ranks(setting):
 
 # ── Профилирование и мониторинг + ИИ-качество ─────────────────────────
 
-def test_repetition_score_detects_loops():
-    from backend.routers.core import _repetition_score
+def test_lexical_dup_share_counts_repeated_words():
+    """A16 (аудит 38): старый «repetition» переименован по сути — это доля повторных
+    СЛОВ, а не зацикливание. На живой прозе он завышен (0.4–0.55) и это ожидаемо."""
+    from backend.routers.core import _lexical_dup_share
     # много повторов одного слова → высокий балл
-    assert _repetition_score("идём идём идём идём идём идём идём идём идём") >= 0.5
+    assert _lexical_dup_share("идём идём идём идём идём идём идём идём идём") >= 0.5
     # разнообразный текст → низкий балл
-    score = _repetition_score("Ты входишь в тёмную таверну. За стойкой хмурый трактирщик.")
-    assert score < 0.4
+    assert _lexical_dup_share("Ты входишь в тёмную таверну. За стойкой хмурый трактирщик.") < 0.4
     # пусто/коротко → 0
+    assert _lexical_dup_share("") == 0.0
+    assert _lexical_dup_share("Кот") == 0.0
+
+
+def test_repetition_detects_real_cycle():
+    """A16 (аудит 38): настоящая метрика цикла — доля СОСЕДНИХ дословных повторов блоков.
+    Цикл модели → высокий скор; та же по объёму проза без дублей → почти ноль."""
+    from backend.routers.core import _repetition_score
+    block = ("Ты медленно идёшь по скрипящим половицам, оглядывая тёмные углы таверны.")
+    cycle = " ".join([block] * 6)                     # модель застряла в одном абзаце
+    prose = ("Ты входишь в тёмную таверну. За стойкой хмурый трактирщик точит нож. "
+             "У окна трое игроков в кости молча двигают фигуры. Пахает дымом и кислым элем, "
+             "а где-то наверху скрипит половица — тяжело ступают чьи-то сапоги.")
+    assert _repetition_score(cycle) >= 0.5, "дословный повтор подряд обязан ловиться"
+    assert _repetition_score(prose) < 0.1, "нормальная проза не должна выглядеть циклом"
     assert _repetition_score("") == 0.0
     assert _repetition_score("Кот") == 0.0
 
@@ -981,7 +1000,7 @@ def test_repetition_score_detects_loops():
 def test_metrics_record_and_aggregate():
     from backend import metrics as mm
     mm.record(world_id=1, llm_ms=1000, completion_tokens=200, prompt_tokens=800,
-              repetition=0.05, provider="llamacpp", memory_tokens=600)
+              repetition=0.05, lexical_dup_share=0.42, provider="llamacpp", memory_tokens=600)
     # запись видна в «последних» снапшотах (глобальный буфер — там и другие вызовы тестов)
     last = mm.snapshot_latest()
     assert last is not None

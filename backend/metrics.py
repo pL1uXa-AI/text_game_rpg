@@ -2,7 +2,8 @@
 """metrics.py — Профилирование и мониторинг хода.
 
 Собирает по каждому ходу игрока метрики генерации (время LLM, оценка токенов в промпте/ответе,
-размер памяти/контекста, провайдер, температура, качество — повторы) и агрегирует их.
+размер памяти/контекста, провайдер, температура, качество — `repetition` (доля соседних
+dословных повторов) и `lexical_dup_share` (доля повторных слов) — и агрегирует их.
 
 Это лёгкий in-memory реестр (single-process uvicorn). Не критичен: при сбое любого шага
 сбора просто логируется warning и метрика пропускается — ход игрока не замедляется и не падает.
@@ -15,7 +16,6 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Optional
 
-import logging
 
 from .logsetup import get_logger
 
@@ -38,10 +38,6 @@ _totals: dict[str, Any] = {
 _agent_samples: deque[dict] = deque(maxlen=_MAX_SAMPLES)
 _agent_totals: dict[str, float] = {}
 _agent_counts: dict[str, int] = {}
-
-
-def _est_tokens(text: str) -> int:
-    return max(1, int(len(text or "") / 3.2))
 
 
 def record(turn_metrics: dict | None = None, **kw) -> None:
@@ -301,6 +297,10 @@ def _aggregate(samples: list[dict]) -> dict:
     pt = [s.get("prompt_tokens") or 0 for s in samples]
     mem = [s.get("memory_tokens") for s in samples if s.get("memory_tokens") is not None]
     rep = [s.get("repetition") for s in samples if s.get("repetition") is not None]
+    # A16 (аудит 38): «доля повторных слов» — отдельная, честно названная величина.
+    # Её нельзя трактовать как зацикливание: у живой прозы она 0.4–0.55 всегда.
+    lex = [s.get("lexical_dup_share") for s in samples
+           if s.get("lexical_dup_share") is not None]
     providers = defaultdict(int)
     for s in samples:
         providers[str(s.get("provider") or "?")] += 1
@@ -320,8 +320,12 @@ def _aggregate(samples: list[dict]) -> dict:
         "completion_tokens_avg": round(_avg(ct)),
         "prompt_tokens_avg": round(_avg(pt)),
         "memory_tokens_avg": _avg(mem),
+        # A16: `repetition` — доля СОСЕДНИХ дословных повторов блоков (реальный цикл модели).
+        # «Заметный цикл» — ≥0.15; прежний порог 0.4 belonged лексической мере и ловил «stilist-норму».
         "repetition_avg": _avg(rep),
-        "repetition_high_rate": round((sum(1 for x in rep if x and x >= 0.4) / len(rep)) if rep else 0, 3),
+        "repetition_high_rate": round((sum(1 for x in rep if x and x >= 0.15) / len(rep)) if rep else 0, 3),
+        # лексическое разнообразие (1 - уникальные/все слова): ориентир стиля, НЕ диагноз цикла
+        "lexical_dup_share_avg": _avg(lex),
         # доля ответов, обрезанных лимитом токенов / оборванных моделью (0..1)
         "cut_by_limit_rate": round(len(cuts) / n, 3) if n else 0,
         "cut_mid_rate": round(len(mids) / n, 3) if n else 0,

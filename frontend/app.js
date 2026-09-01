@@ -54,7 +54,7 @@ async function loadThemes() {
     card.className = "theme-card";
     card.setAttribute("data-id", t.id);
     const badge = t.group ? `<span class="g-badge ${t.group}">${t.group === "system" ? "системный" : "мой"}</span>` : "";
-    card.innerHTML = `<h4>${badge}${t.name}</h4><div class="g">${t.genre}</div><p>${t.desc}</p>`;
+    card.innerHTML = `<h4>${badge}${esc(t.name)}</h4><div class="g">${esc(t.genre)}</div><p>${esc(t.desc)}</p>`;
     card.onclick = () => selectThemeCard(card, t.id);
     grid.appendChild(card);
   });
@@ -293,7 +293,9 @@ async function openWorld(id) {
   state.setting = d.setting || null;
   state.gen = d.gen_settings || {};
   state.providersEffective = d.providers_effective || null;
-  state.providerSettings = d.provider_settings || {};
+  // E5 (аудит 38): поле provider_settings в state больше не хранится — оно записывалось
+  // из двух мест и НИКОГДА не читалось, а носителем в нём лежали per-world API-ключи
+  // (см. A3). Форма настроек заполняется из providers_effective (замаскированного).
   state.rerankGlobal = !!d.rerank_enabled;
   state.currentNarrator = d.world.narrator_id != null ? +d.world.narrator_id : (state.narrators[0]?.id ?? null);
   state.tts = d.tts || null;
@@ -318,8 +320,12 @@ async function openWorld(id) {
   $("log").innerHTML = "";
   logPagerBtn = null;               // кнопку пагинации создадим заново
   state.logMinSeq = 0;
-  d.recent.forEach((e) => appendMsg(e, false));
-  if (!d.recent.length) {
+  // A10: сервер уже отдал лог отфильтрованным по CHAT_LOG_ROLES, но предикат на фронте
+  // один (shouldRenderEvent) — он же отсекает folded и служебные роли, если мир вернулся
+  // с другим набором ролей (старый кеш ответа).
+  const recent = (d.recent || []).filter(shouldRenderEvent);
+  recent.forEach((e) => appendMsg(e, false));
+  if (!recent.length) {
     appendMsg({ role: "system", content: "Мир создан, но пуст. Начни с первого действия." }, false);
   }
   // запоминаем самый ранний загруженный seq — для подгрузки более ранних событий
@@ -330,7 +336,7 @@ async function openWorld(id) {
   // при открытии мира, даже если renderSetting где-то споткнулся выше.
   try { renderSuggestionBar(); } catch (_) {}
   state.seenSeq = 0;
-  d.recent.forEach((e) => { if (e.seq) state.seenSeq = Math.max(state.seenSeq, +e.seq); });
+  (d.recent || []).forEach((e) => { if (e.seq) state.seenSeq = Math.max(state.seenSeq, +e.seq); });
   // Сразу листаем лог в конец (к последнему ответу рассказчика)
   requestAnimationFrame(() => { $("log").scrollTop = $("log").scrollHeight; });
   if (state.pollTimer) clearInterval(state.pollTimer);
@@ -371,8 +377,9 @@ function startLiveBus() {
         if (!data || data.type !== "event" || !data.event) return;
         const e = data.event;
         if (e.seq > (state.seenSeq || 0)) state.seenSeq = +e.seq;
-        if (e.folded || e.role === "player") return;
-        if (document.querySelector(`.msg[data-seq="${e.seq}"]`)) return;
+        // A10/E3: единый предикат + дедюп по id события (см. appendMsg)
+        if (!shouldRenderLive(e)) return;
+        if (document.querySelector(`.msg[data-id="${CSS.escape(String(e.id))}"]`)) return;
         appendMsg(e, true);
       } catch (_) { /* битое сообщение шины — игнор, поллинг догонит */ }
     };
@@ -384,6 +391,14 @@ function startLiveBus() {
 
 function stopLiveBus() {
   if (state.eventSource) { try { state.eventSource.close(); } catch (_) {} state.eventSource = null; }
+}
+
+/* E4 (аудит 38): жива ли SSE-лента — по ней решаем, нужен ли запасной поллинг.
+ * readyState: 0 = connecting, 1 = open, 2 = closed. При connecting тоже молчим:
+ * EventSource переподключается сам, а долбить API в этот момент смысла нет. */
+function liveBusOpen() {
+  const es = state.eventSource;
+  return !!es && es.readyState !== 2;
 }
 
 /* ─────────────── C4: часы мира + компас соседних локаций ─────────────── */
@@ -509,30 +524,52 @@ async function openRiskModal() {
 
 async function pollEvents() {
   if (!state.currentWorld || state.streaming) return;
+  // E4 (аудит 38): поллинг — ЗАПАСНОЙ путь. Пока живая SSE-лента открыта, не долбить API
+  // двумя тяжёлыми запросами каждые 15 с (выборка событий + полный detail мира). Но и
+  // полную сверку состояния совсем убирать нельзя: фоновые агенты (архивариус карточек,
+  // синхронизация квестов) правят setting БЕЗ новых сообщений, и сайдбар «запаздывал» бы
+  // до перезагрузки. Поэтому при живой шине оставляем редкую (раз в 4 тика ≈ 60 с)
+  // сверку только СОСТОЯНИЯ, а выборку событий пропускаем.
+  if (liveBusOpen()) {
+    if ((++_pollTick % 4) !== 0) return;
+    await syncStateFromServer();
+    return;
+  }
   try {
-    const evs = await API(`/api/worlds/${state.currentWorld}/events?since=${state.seenSeq || 0}`);
+    // A14 (аудит 38): сервер отдаёт объект {events, truncated} и страницу с потолком.
+    // truncated = догон не влез целиком → пересоединяемся, а не молча теряем сообщения.
+    const body = await API(`/api/worlds/${state.currentWorld}/events?since=${state.seenSeq || 0}`);
+    const evs = (body && body.events) || [];
     let maxSeq = state.seenSeq || 0;
     evs.forEach((e) => { if (+e.seq > maxSeq) maxSeq = +e.seq; });
     if (maxSeq > (state.seenSeq || 0)) state.seenSeq = maxSeq;
-    const fresh = evs.filter((e) => !e.folded && e.role !== "player"
-      && !document.querySelector(`.msg[data-seq="${e.seq}"]`));
+    // A10: единый предикат; E3: дедюп по id события
+    const fresh = evs.filter((e) => shouldRenderLive(e)
+      && !document.querySelector(`.msg[data-id="${CSS.escape(String(e.id))}"]`));
     fresh.forEach((e) => appendMsg(e, true));
-    // фоновые задачи (архивариус карточек, сводки, динамические события) могут менять СОСТОЯНИЕ мира
-    // даже когда новых видимых сообщений нет (например, синхронизировать квесты из карточек в setting).
-    // Периодически сверяемся со свежим состоянием сервера, чтобы сайдбар не «запаздывал» до перезагрузки.
-    const d = await API(`/api/worlds/${state.currentWorld}`);
-    const next = d.setting || null;
-    const cur = state.setting || null;
-    const changed = JSON.stringify(cur) !== JSON.stringify(next);
-    if (next) state.setting = next;
-    if (changed) {
-      if (next) renderSetting(next);
-      loadEntities();
-      loadSaves();
-      // только что добавленные свежие сообщения тоже могли сдвинуть чат
-      if (fresh.length) requestAnimationFrame(() => { $("log").scrollTop = $("log").scrollHeight; });
+    if (body && body.truncated) {
+      // часть событий осталась за страницей — просим серверную ленту пересоединиться
+      startLiveBus();
     }
+    const changed = await syncStateFromServer();
+    // только что добавленные свежие сообщения тоже могли сдвинуть чат
+    if (fresh.length && changed) requestAnimationFrame(() => { $("log").scrollTop = $("log").scrollHeight; });
   } catch (_) { /* тихий опрос */ }
+}
+
+/* Сверка СОСТОЯНИЯ мира с сервером (фон мог править setting без новых сообщений). */
+let _pollTick = 0;
+async function syncStateFromServer() {
+  const d = await API(`/api/worlds/${state.currentWorld}`);
+  const next = d.setting || null;
+  const changed = JSON.stringify(state.setting || null) !== JSON.stringify(next);
+  if (next) state.setting = next;
+  if (changed) {
+    renderSetting(state.setting);
+    loadEntities();
+    loadSaves();
+  }
+  return changed;
 }
 
 /* ─────────────── Рассказчик (настройки) ─────────────── */
@@ -939,6 +976,10 @@ function renderSetting(s) {
     `<li class="item-clickable" onclick="showCompanion('${jsAttr(k)}')">${c.hp <= 0 ? "💀 " : "🤝 "}<b>${esc(c.name || k)}</b> ⚔ ${c.hp}/${c.max_hp || c.hp} Lv${c.level || 1}${c.loyalty ? ` · верность ${esc(c.loyalty)}` : ""}<small>${trunc(c.desc, 80)}</small></li>`).join("") || `<li>нет</li>`;
   $("flags").innerHTML = Object.entries(s.flags || {}).map(([k, v], fi) =>
     `<span class="item-clickable flag-pill" onclick="showFlag(${fi})" title="${esc(k)}=${esc(JSON.stringify(v))}">🚩 ${esc(flagLabel(k))}: ${flagWord(v)}</span>`).join("") || `<span class="flags-none">нет</span>`;
+  // E8 (аудит 38): у подсказки про флаги теперь есть смысл — она прячется, когда флагов
+  // нет (раньше id был объявлен в разметке и не упоминался ни в JS, ни в CSS).
+  const fh = $("flags-hint");
+  if (fh) fh.style.display = Object.keys(s.flags || {}).length ? "" : "none";
   renderMap();
   renderSuggestionBar();
   // C4 (сессия 34): часы мира (время/погода/сезон) и компас соседних локаций
@@ -1743,9 +1784,29 @@ function msgClass(role) {
   if (role === "system") return "system";
   if (role === "summary") return "summary";
   if (role === "divine") return "divine";
-  return "narrator";
+  // E2 (аудит 38): неизвестную роль раньше рисовали как рассказчика — визуально врёт
+  // (роль может прийти из импортированного дампа или режима мастера)
+  return "unknown";
 }
 const WHO = { player: "Вы", narrator: "Рассказчик", dice: "Кубы", system: "СИСТЕМА", summary: "Сводка памяти", divine: "\u2764\ufe0f Провидение" };
+
+/* A10 (аудит 38): ЕДИНЫЙ предикат «показывать ли это событие в логе игрока».
+ * Раньше openWorld рисовал всё, что прислал сервер (включая сводки памяти — спойлеры
+ * свёрнутого прошлого), а SSE/поллинг фильтровали по-своему: картина «до F5» и «после F5»
+ * отличалась. Теперь фильтр один, а набор ролей серверного журнала приходит с миром
+ * (d.log_roles = backend/routers/core.py::CHAT_LOG_ROLES — единый источник правды).
+ * Сводки (summary) игрок не видит НИГДЕ: это материал промпта, а не часть истории. */
+function shouldRenderEvent(e) {
+  if (!e || !e.role) return false;
+  if (e.role === "summary") return false;      // сводка памяти — служебный слой
+  if (e.folded) return false;                  // сокрыто перемоткой/загрузкой
+  return true;
+}
+/* Для живых доставок (SSE/поллинг) действия игрока не догружаются: они уже нарисованы
+ * оптимистично в sendAction/quickAction. При ОТКРЫТИИ мира, наоборот, нужны. */
+function shouldRenderLive(e) {
+  return shouldRenderEvent(e) && e.role !== "player";
+}
 
 /* Плашка «🧠 Память» у ответа рассказчика: показывает подхваченные фрагменты памяти/лора.
  * Данные берём из meta события (хранятся в БД — плашка переживает перезагрузку страницы). */
@@ -1785,8 +1846,8 @@ function buildMsg(e) {
         ${ttsBtn}
       </div>`
     : "";
-  div.innerHTML = `<div class="who">${WHO[e.role] || e.role}
-    <span class="muted">#${e.seq}</span></div>
+  div.innerHTML = `<div class="who">${esc(WHO[e.role] || e.role || "?")}
+    <span class="muted">#${esc(String(e.seq || ""))}</span></div>
     <div class="body">${esc(e.content)}</div>${actions}`;
   // Прозрачность RAG: плашка «🧠 Память» у ответа рассказчика. Данные подхваченных
   // фрагментов хранятся в meta события (переживают перезагрузку/пагинацию/опрос).
@@ -1819,13 +1880,18 @@ function buildMsg(e) {
 }
 
 function appendMsg(e, scroll = true) {
-  // Дедюп: не рисовать сообщение, уже присутствующее по seq. Это защищает от дублей,
-  // когда событие добавляет и обработчик ответа (например, Провидение), и параллельный
-  // опрос pollEvents, которые видят одни и те же строки БД. Для перегенерации безопасно:
-  // старые сообщения удаляются до добавления новых (res.replaced_events).
-  if (e.seq && document.querySelector(`.msg[data-seq="${e.seq}"]`)) {
-    if (+e.seq > (state.seenSeq || 0)) state.seenSeq = +e.seq;
-    return;
+  // E3 (аудит 38): дедюплицируем ПО ID события, а не по seq. Серверные id уникальны и
+  // есть всегда, а seq у локальных (оптимистичных) сообщений пустой — раньше второе
+  // идентичное служебное сообщение («Ошибка: …», «Мир создан, но пуст…») считалось
+  // «уже нарисованным» и молча терялось, а селектор `.msg[data-seq=""]` был хрупким.
+  const key = e.id != null && e.id !== "" ? String(e.id) : `local-${++_localMsgId}`;
+  if (e.id != null && e.id !== "") {
+    if (document.querySelector(`.msg[data-id="${CSS.escape(key)}"]`)) {
+      if (+e.seq > (state.seenSeq || 0)) state.seenSeq = +e.seq;
+      return;
+    }
+  } else {
+    e = Object.assign({}, e, { id: key });   // локальному сообщению даём временный id
   }
   const div = buildMsg(e);
   if (+e.seq > (state.seenSeq || 0)) state.seenSeq = +e.seq;
@@ -1836,6 +1902,8 @@ function appendMsg(e, scroll = true) {
 
 /* ─── Пагинация лога: подгрузка более ранних событий ─── */
 let logPagerBtn = null;
+// E3: счётчик id для локально нарисованных (оптимистичных) сообщений
+let _localMsgId = 0;
 
 function showLogPager(show) {
   if (!logPagerBtn) {
@@ -2652,7 +2720,8 @@ async function saveProviders() {
     const res = await API(`/api/worlds/${state.currentWorld}/providers`, {
       method: "POST", body: JSON.stringify(payload),
     });
-    state.providerSettings = res.provider_settings || {};
+    // E5: сырой снимок provider_settings не храним (там были живые ключи); для UI хватает
+    // замаскированного providers_effective, который сервер вернул в том же ответе.
     state.providersEffective = res.providers_effective || null;
     syncProvidersUI();
     // сессия 36, п.19: сервер может принять настройки и предупредить, что модель не

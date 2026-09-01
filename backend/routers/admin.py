@@ -30,7 +30,6 @@ async def admin_settings_get():
         "effective": {
             "providers": {k: _mask_provider(dict(v)) for k, v in prov.items()},
             "rerank_enabled": cfg.rerank_enabled,
-            "rerank_top_n": cfg.rerank_top_n,
             "rerank_threshold": cfg.rerank_threshold,
             "background_tasks_enabled": bool(cfg.background_tasks_enabled),
             "hybrid_weight_bm25": cfg.hybrid_weight_bm25,
@@ -132,7 +131,7 @@ async def admin_settings_save(body: AdminSettingsIn):
         if v is not None:
             payload[env] = "true" if v else "false"
     # числовые параметры памяти/агентов/мир (пустая строка = сброс к .env)
-    for f in ("rerank_top_n", "rerank_threshold", "rag_memory_k", "rag_memory_max",
+    for f in ("rerank_threshold", "rag_memory_k", "rag_memory_max",
               "rag_candidates", "recent_token_budget", "summary_token_budget",
               "lore_token_budget", "lore_token_budget_max", "lore_rag_k", "lore_rag_k_max",
               "cosine_threshold", "cosine_threshold_local", "logic_judge_interval",

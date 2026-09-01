@@ -17,6 +17,9 @@ from typing import Optional
 import httpx
 
 from .config import Config, get_config
+from .logsetup import get_logger
+
+log = get_logger(__name__)
 
 _client: Optional[httpx.AsyncClient] = None
 
@@ -322,6 +325,13 @@ def hybrid_rerank(query: str, candidates: list[dict], weight_bm25: float = 0.4) 
 # ──────────────────────────────────────────────
 async def rerank_results(query: str, candidates: list[dict], top_n: int = 5,
                         provider: dict | None = None) -> list[dict]:
+    """Облачный ререранк кандидатов.
+
+    A17 (аудит 38): `RERANK_THRESHOLD` из конфига наконец применяется — фильтр по
+    релевантности (скор провайдера `relevance_score >= rerank_threshold`). Порог 0 =
+    выключен (ничего не отбрасываем). `top_n` остаётся размером выдачи вызывающего
+    (K памяти / лор-чанки) — второй ручки на то же самое нет сознательно.
+    """
     if not candidates:
         return candidates
     cfg: Config = get_config()
@@ -352,4 +362,18 @@ async def rerank_results(query: str, candidates: list[dict], top_n: int = 5,
     for i, c in enumerate(candidates):
         c["_rerank"] = scored.get(i, 0.0)
     candidates.sort(key=lambda c: c.get("_rerank", 0), reverse=True)
+    # A17: порог релевантности (0 = фильтр выключен). Отбрасываем ХВОСТ ниже порога —
+    # память обязана помнить, но не тащить в промпт мусор, который реранкер посчитал
+    # нерелевантным. Порог выше всех скоров = отдаём пустой список (для вызывающего это
+    # штатный «ничего не вспомнилось», с фолбэками слоя памяти).
+    try:
+        thr = float(get_config().rerank_threshold or 0.0)
+    except (TypeError, ValueError):
+        thr = 0.0
+    if thr > 0:
+        kept = [c for c in candidates if float(c.get("_rerank", 0) or 0.0) >= thr]
+        if len(kept) != len(candidates):
+            log.debug("реранкер: отброшено %d кандидатов с relevance_score < %s",
+                      len(candidates) - len(kept), thr)
+        candidates = kept
     return candidates[:top_n]

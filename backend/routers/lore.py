@@ -11,18 +11,17 @@ from fastapi import APIRouter, HTTPException
 
 from .. import db, narrator
 from ..logsetup import get_logger
+from ..schemas import LoreIn
+from .core import _json_object
 
 log = get_logger(__name__)
-from ..schemas import LoreIn
 
 router = APIRouter(tags=["Лор мира"])
 
-
-def _world_or_404(world_id: int) -> dict:
-    w = db.get_world(world_id)
-    if not w:
-        raise HTTPException(404, "Мир не найден")
-    return w
+# A4 (аудит 38): хелпер «мир обязан существовать» больше не дублируется — единая точка в
+# routers/core.py, откуда его берут и остальные роутеры. Локальное имя сохранено как
+# реэкспорт, т.к. на него были ссылки внутри модуля и в тестах.
+from .core import _world_or_404   # noqa: E402  (реэкспорт единого хелпера)
 
 
 @router.get("/api/worlds/{world_id}/lore")
@@ -60,6 +59,11 @@ async def lore_update(world_id: int, lore_id: int, body: LoreIn):
                                tags=body.tags, is_core=body.is_core)
     except KeyError:
         raise HTTPException(404, "Статья лора не найдена")
+    # A4-bis (аудит 38): статья скоупится по id — без сверки с миром её можно было править
+    # адресом другого мира (та же порода, что «фидбек чужому событию»). Проверка постфактум
+    # дешевле новой сигнатуры db-функции, а гонка с удалением мира здесь безвредна.
+    if entry.get("world_id") != world_id:
+        raise HTTPException(404, "Статья лора не найдена в этом мире")
     from .core import _world_providers as _wp
     try:
         w = db.get_world(world_id)
@@ -73,8 +77,12 @@ async def lore_update(world_id: int, lore_id: int, body: LoreIn):
 @router.delete("/api/worlds/{world_id}/lore/{lore_id}")
 async def lore_delete(world_id: int, lore_id: int):
     _world_or_404(world_id)
-    if not db.get_lore(lore_id):
+    _row = db.get_lore(lore_id)
+    if not _row:
         raise HTTPException(404, "Статья лора не найдена")
+    if _row.get("world_id") != world_id:
+        # A4-bis (аудит 38): удалить статью чужого мира по её id — раньше было можно
+        raise HTTPException(404, "Статья лора не найдена в этом мире")
     db.delete_lore(lore_id)
     try:
         from .. import chroma_client
@@ -89,10 +97,12 @@ async def lore_delete(world_id: int, lore_id: int):
 @router.get("/api/worlds/{world_id}/lore/search")
 async def lore_search(world_id: int, q: str):
     """RAG-поиск по лору: набор релевантных фрагментов (для UI предпросмотра)."""
-    _world_or_404(world_id)
     from .core import _world_providers as _wp
-    w = db.get_world(world_id)
-    setting = __import__("json").loads(w["setting"])
+    # A4 (аудит 38): состояние берём из уже проверенного мира — раньше мир перечитывался
+    # вторым запросом БЕЗ проверки (`__import__("json").loads(w["setting"])`) — узкое место,
+    # дающее TypeError на гонке с удалением мира.
+    w = _world_or_404(world_id)
+    setting = _json_object(w.get("setting"))
     chunks = await narrator.retrieve_lore(world_id, q or "", setting,
                                           providers=_wp(w), budget=1200)
     return {"query": q, "chunks": chunks}

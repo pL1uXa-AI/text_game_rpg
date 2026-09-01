@@ -385,12 +385,12 @@ async def synthesize(text: str, provider: str, voice: str, rate: str) -> tuple[b
     text = _clean_tts_text(text)[:_max_chars()]
     provider = (provider or "none").lower()
     if provider == "piper":
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, _synth_piper, text, voice, _speed_for_piper(rate))
+        # D6 (аудит 38): asyncio.to_thread вместо get_event_loop().run_in_executor —
+        # get_event_loop() без активного цикла deprecated в 3.12 и ошибка в 3.13.
+        data = await asyncio.to_thread(_synth_piper, text, voice, _speed_for_piper(rate))
         return data, "wav", 22050
     if provider == "kokoro":
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, _synth_kokoro, text, voice, _speed_for_piper(rate))
+        data = await asyncio.to_thread(_synth_kokoro, text, voice, _speed_for_piper(rate))
         return data, "wav", 22050
     if provider == "edge":
         data = await _synth_edge(text, voice, rate)
@@ -454,6 +454,102 @@ def _cache_row(text_hash: str) -> dict | None:
     return rows[0] if rows else None
 
 
+# ═══════════ Ротация кеша озвучки (аудит 38, A18) ═══════════
+# Настройка `TTS_CACHE_TTL_DAYS` жила в .env/админке/README, а `db.prune_tts_cache` не
+# вызывался НИОТКУДА — аудио не устаревало никогда (data/tts ~290 МБ и линейный рост).
+# Здесь: запуск ротации при старте сервера и далее не чаще раза в сутки (метка-файл,
+# а не admin_settings: это служебное время, а не настройка — в «сброс к .env» попадать
+# не должно). ГОЛОСА (data/tts/voices, data/tts/kokoro) — НЕ кеш, их не трогаем.
+ROTATION_MARKER = CACHE_DIR.parent / ".cache_rotation"
+ROTATION_INTERVAL_S = 86400
+
+
+def sweep_orphan_cache_files() -> int:
+    """Удалить файлы в data/tts/cache/, на которые не ссылается ни одна строка tts_cache,
+    и подчистить опустевшие гнёзда `{provider}/{xx}/`. Строка `db.prune_tts_cache` свой файл
+    сносит сама — обход нужен на случай сбоя (файл пережил удаление строки)."""
+    try:
+        rows = db.all_tts_cache_paths()
+    except Exception as e:
+        log.warning("ротация кеша озвучки: список путей не получен, обход пропущен: %s", e)
+        return 0
+    keep: set[str] = set()
+    for r in rows:
+        rel = str(r.get("rel_path") or "")
+        if not rel:
+            continue
+        try:
+            keep.add(str((ROOT / "data" / rel).resolve()))
+        except OSError:
+            keep.add(rel)
+    if not CACHE_DIR.is_dir():
+        return 0
+    removed = 0
+    for p in sorted(CACHE_DIR.rglob("*")):
+        if p.is_dir():
+            continue
+        try:
+            if str(p.resolve()) in keep:
+                continue
+        except OSError:
+            pass
+        try:
+            p.unlink()
+            removed += 1
+        except OSError as e:
+            log.debug("ротация кеша озвучки: файл %s не удалён: %s", p, e)
+    # пустые каталоги-гнёзда после удаления файлов (сверху вниз по глубине)
+    for d in sorted((x for x in CACHE_DIR.rglob("*") if x.is_dir()),
+                    key=lambda x: len(x.parts), reverse=True):
+        try:
+            if any(d.iterdir()):
+                continue
+            d.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
+def rotate_tts_cache(force: bool = False) -> dict:
+    """Плановая ротация: TTL-чистка (строки+файлы) + обход сирот + метка «не чаще суток».
+
+    Синхронная функция (зовётся через asyncio.to_thread). Возвращает {"ran", "pruned",
+    "swept", "ttl_days"} или {"ran": False, "skip": …}. Правило 14: каждый шаг в своей
+    страховке с логом — молча проваленная ротация неотличима от «нечего удалять».
+    """
+    cfg = get_config()
+    ttl = int(getattr(cfg, "tts_cache_ttl_days", 0) or 0)
+    if not cfg.tts_cache_enabled or ttl <= 0:
+        return {"ran": False, "skip": "кеш выключен или TTL=0", "pruned": 0, "swept": 0,
+                "ttl_days": ttl}
+    if not force:
+        try:
+            age = time.time() - ROTATION_MARKER.stat().st_mtime
+        except OSError:
+            age = 1e18
+        if age < ROTATION_INTERVAL_S:
+            return {"ran": False, "skip": f"ротировано {int(age / 3600)} ч назад",
+                    "pruned": 0, "swept": 0, "ttl_days": ttl}
+    pruned = swept = 0
+    try:
+        pruned = db.prune_tts_cache(ttl_days=ttl)
+    except Exception as e:
+        log.warning("ротация кеша озвучки: TTL-чистка не удалась: %s", e, exc_info=True)
+    try:
+        swept = sweep_orphan_cache_files()
+    except Exception as e:
+        log.warning("ротация кеша озвучки: обход сирот не удался: %s", e, exc_info=True)
+    try:
+        ROTATION_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        ROTATION_MARKER.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+    except OSError as e:
+        log.warning("ротация кеша озвучки: метку не записать (%s) — в следующий раз "
+                    "ротация повторится", e)
+    log.info("кеш озвучки: убрано %d записей старше %d дн. и %d файлов-сирот",
+             pruned, ttl, swept)
+    return {"ran": True, "pruned": pruned, "swept": swept, "ttl_days": ttl}
+
+
 async def ensure_event_audio(world_id: int, event_id: int, text: str, opts: dict | None = None,
                              provider: str | None = None, voice: str | None = None,
                              rate: str | None = None) -> dict:
@@ -480,6 +576,15 @@ async def ensure_event_audio(world_id: int, event_id: int, text: str, opts: dict
         cached = _cache_row(h)
         if cached:
             rel = cached["rel_path"]
+            # A18 (аудит 38): строка кеша может пережить свой файл (файл снесла ротация/сбой,
+            # или его удалили вручную). Возвращать status=2 на отсутствующий файл нельзя —
+            # /audio отдал бы 404 «Файл аудио отсутствует» и кнопка 🔊 билась в пустоту.
+            # Отсутствие файла = промах кеша: пересинтезируем (дешевле, чем сломанный UI).
+            if not (ROOT / "data" / rel).exists():
+                log.info("TTS-кеш: файл %s отсутствует — пересинтез (world %s, event %s)",
+                         rel, world_id, event_id)
+                cached = None
+        if cached:
             db.set_event_tts(event_id, 2, rel)
             return {"status": 2, "file": rel, "cached": True}
 
@@ -536,7 +641,7 @@ async def download_piper_voice(voice: str) -> dict:
     def _extract():
         with tarfile.open(archive, "r:bz2") as t:
             t.extractall(dest_dir, filter="data")
-    await asyncio.get_event_loop().run_in_executor(None, _extract)
+    await asyncio.to_thread(_extract)
     # нормализация layout: inner dir "vits-piper-{voice}" → файлы прямо в dest_dir
     inner = dest_dir / f"vits-piper-{voice}"
     if inner.is_dir():

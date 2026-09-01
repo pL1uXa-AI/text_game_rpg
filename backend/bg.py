@@ -4,7 +4,7 @@
 Фоновых проходов к ОДНОЙ модели набралось шесть: карточки сущностей (архивариус),
 судья логики, автономный «мастер», боевой ИИ врагов, динамические события, видения,
  плюс индексация памяти и озвучка. Все они стартовали `create_task(...)` сразу после
-ответа игроку и **битесь** в один слот локального llama.cpp (n_ctx 8192, одна очередь).
+ответа игроку и **конкурируя** за один слот локального llama.cpp (n_ctx 8192, одна очередь).
 Практический эффект: следующий ход игрока вставал в очередь за 3–5 фоновыми запросами —
 «игра думает» именно из-за этого, а не из-за самого ответа.
 
@@ -35,7 +35,7 @@ import heapq
 import itertools
 import time
 from collections import defaultdict
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable
 
 from .logsetup import get_logger, turn_context
 
@@ -330,6 +330,49 @@ def stats() -> dict:
     return _sched.stats()
 
 
+# ── «Выстрелил и забыл» (аудит 38, D6) ────────────────────────────────
+# asyncio хранит задачи СЛАБЫМИ ссылками: `loop.create_task(coro)` без сохранения
+# ссылки — это задача, которую мусорщик может собрать посреди игры. Практический
+# симптом, который так объясняется: «карточка/индекс не появился, в логе ничего».
+# В самом bg.py это написано прямо (воркеры хранятся в self._worker_tasks) —
+# здесь тот же приём для коротких фоновых задач, которым не нужна очередь.
+_stray_tasks: set[asyncio.Task] = set()
+
+
+def spawn(coro, name: str = "") -> asyncio.Task | None:
+    """Поставить корутину фоновой задачей, СОХРАНИВ ссылку до её завершения.
+
+    Возвращает None, если активного цикла событий нет (синхронный вызов из скрипта/теста) —
+    задача просто не заведётся, но и падения не будет (эти задачи — побочные: озвучка,
+    индексация, пересчёт карточек).
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        coro.close()
+        log.debug("bg.spawn(%s): активного цикла нет — задача отменена", name or "?")
+        return None
+    task = loop.create_task(coro, name=name or None)
+    _stray_tasks.add(task)
+    task.add_done_callback(_stray_tasks.discard)
+    task.add_done_callback(lambda t, n=name: _log_stray_error(n, t))
+    return task
+
+
+def _log_stray_error(name: str, task: asyncio.Task) -> None:
+    """Правило 14: «огонь-и-забыл» задача не должна уносить ошибку молча."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning("фоновая задача %s упала: %s", name or "?", exc, exc_info=exc)
+
+
+def stray_count() -> int:
+    """Сколько «одноразовых» фоновых задач сейчас живёт (для диагностики/тестов)."""
+    return len(_stray_tasks)
+
+
 def shutdown_nowait() -> None:
     """Остановить воркеров фоновой очереди (штатное завершение сервера, сессия 36, п.30).
 
@@ -345,6 +388,13 @@ def shutdown_nowait() -> None:
 
 
 def reset() -> None:
-    """Полностью сбросить планировщик (тесты: изолировать очередь и воркеров)."""
+    """Полностью сбросить планировщик (тесты: изолировать очередь и воркеров).
+
+    D7 (аудит 38): раньше не вызывался нигде, в т.ч. в фикстуре `api_client` — при этом
+    планировщик глобален, а `_ensure()` пересоздаёт примитивы при смене цикла, что и было
+    источником потенциальных флейков между тестами. Теперь фикстура вызывает его явно."""
     global _sched
     _sched = _Scheduler()
+    for t in list(_stray_tasks):
+        t.cancel()
+    _stray_tasks.clear()

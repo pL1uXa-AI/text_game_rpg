@@ -392,6 +392,8 @@ input[type="range"]::-moz-range-track { height: 6px; border-radius: 999px; backg
 .msg.summary .body { background: #10241a; border: 1px solid #235a3a; color: var(--good); font-size: 13px; font-style: italic; }
 .msg.divine .body { background: linear-gradient(135deg, #2a2312, #221b0c); border: 1px solid #8a6d2b; color: #ffd98a; font-size: 13.5px; box-shadow: 0 0 14px rgba(255, 200, 60, 0.12); }
 .msg.divine .who { color: #c9a94a; }
+/* E2 (аудит 38): неизвестная роль больше не притворяется рассказчиком — у неё свой вид */
+.msg.unknown .body { background: #1b1b20; border: 1px dashed var(--line); color: var(--muted, #9aa); font-size: 13px; }
 .divine-btn { border-color: #6b5a1e; color: #d4b45a; }
 .divine-btn:hover { border-color: #c9a94a; color: #ffd98a; }
 .msg .actions { display: flex; gap: 6px; margin-top: 4px; }

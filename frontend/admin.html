@@ -73,10 +73,9 @@
     <label>API Key <input type="password" id="a-rerank-api-key" placeholder=""></label>
     <label>Модель <input type="text" id="a-rerank-model" placeholder="voyageai/rerank-2.5"></label>
     <label class="check"><input type="checkbox" id="a-rerank-enabled"> Использовать реранкер</label>
-    <label title="Сколько кандидатов возвращает реранкер (top_n).">
-      Реранкер: сколько вернуть <input type="number" min="1" max="50" id="a-rerank-top-n" placeholder="20">
-    </label>
-    <label title="Порог уверенности реранкера (ниже = строже).">
+    <!-- A17 (аудит 38): поле «сколько вернуть» (RERANK_TOP_N) убрано — настройка не читалась
+         ни одним местом, а размер выдачи и так задаётся RAG_MEMORY_K / LORE_RAG_K. -->
+    <label title="Порог уверенности реранкера (ниже = строже). 0 = фильтр выключен.">
       Реранкер: порог уверенности <input type="number" min="0" max="1" step="0.01" id="a-rerank-threshold" placeholder="0.2">
     </label>
     <label class="check"><input type="checkbox" id="a-bgtasks-enabled"> Фоновые задачи памяти (RAG-индексация, карточки, сводки)</label>
@@ -401,7 +400,6 @@ async function load() {
       ? String(stored.METRICS_MAX_BYTES).trim() !== "0"
       : (pz.metrics_max_bytes ?? 0) > 0;
   }
-  const rtop = $("a-rerank-top-n"); if (rtop) { rtop.value = stored.RERANK_TOP_N !== undefined ? stored.RERANK_TOP_N : (eff.rerank_top_n ?? ""); rtop.placeholder = "" + (eff.rerank_top_n ?? ""); }
   const rthr = $("a-rerank-threshold"); if (rthr) { rthr.value = stored.RERANK_THRESHOLD !== undefined ? stored.RERANK_THRESHOLD : (eff.rerank_threshold ?? ""); rthr.placeholder = "" + (eff.rerank_threshold ?? ""); }
 
   // TTS (озвучка)
@@ -488,8 +486,6 @@ function collect() {
     if (model) payload[`${kind}_model`] = model;
   });
   payload.rerank_enabled = boolOr("a-rerank-enabled");
-  const rtop = valOr("a-rerank-top-n");
-  if (rtop) payload.rerank_top_n = rtop;
   const rthr = valOr("a-rerank-threshold");
   if (rthr) payload.rerank_threshold = rthr;
   payload.background_tasks_enabled = boolOr("a-bgtasks-enabled");
@@ -583,7 +579,7 @@ const ALL_ADMIN_KEYS = [
   "MAIN_BASE_URL", "MAIN_API_KEY", "MAIN_MODEL",
   "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
   "RERANK_BASE_URL", "RERANK_API_KEY", "RERANK_MODEL", "RERANK_ENABLED",
-  "RERANK_TOP_N", "RERANK_THRESHOLD", "HYBRID_WEIGHT_BM25",
+  "RERANK_THRESHOLD", "HYBRID_WEIGHT_BM25",
   "DEFAULT_TEMP", "DEFAULT_TOP_P", "MAX_TOKENS", "CONTEXT_TOKENS",
   "RAG_MEMORY_K", "RAG_MEMORY_MAX", "RAG_CANDIDATES", "RECENT_TOKEN_BUDGET",
   "SUMMARY_TOKEN_BUDGET", "LORE_TOKEN_BUDGET", "LORE_TOKEN_BUDGET_MAX",

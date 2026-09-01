@@ -104,7 +104,7 @@ class AdminSettingsIn(BaseModel):
     rerank_api_key: Optional[str] = None
     rerank_model: Optional[str] = None
     rerank_enabled: Optional[bool] = None
-    rerank_top_n: Optional[str] = None
+    # rerank_top_n удалён (A17): размер выдачи = RAG_MEMORY_K/LORE_RAG_K, вторая ручка избыточна
     rerank_threshold: Optional[str] = None
     # фоновые задачи памяти (индексация RAG, карточки, сводки)
     background_tasks_enabled: Optional[bool] = None
