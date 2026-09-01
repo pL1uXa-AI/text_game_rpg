@@ -1001,6 +1001,7 @@ def test_all_documented_keys_exist_in_config():
 def test_tts_edge_retry_on_transient(monkeypatch, fake_config):
     """429/обрыв от Microsoft-сервиса — не ⚠ у игрока, а автоматический повтор."""
     import types
+    pytest.importorskip("edge_tts", reason="опциональная зависимость (requirements-optional.txt)")
     import edge_tts
     from backend import tts as tts_mod
 
@@ -1026,6 +1027,7 @@ def test_tts_edge_retry_on_transient(monkeypatch, fake_config):
 
 def test_tts_edge_permanent_error_raises(monkeypatch, fake_config):
     """Перманентная ошибка (битый голос) НЕ должна повторяться бесконечно."""
+    pytest.importorskip("edge_tts", reason="опциональная зависимость (requirements-optional.txt)")
     import edge_tts
     from backend import tts as tts_mod
 
@@ -1048,6 +1050,7 @@ def test_tts_edge_permanent_error_raises(monkeypatch, fake_config):
 
 
 def test_edge_transient_predicate_recognizes_edge_errors():
+    pytest.importorskip("edge_tts", reason="опциональная зависимость (requirements-optional.txt)")
     from backend import tts as tts_mod
     import edge_tts.exceptions as ex
     assert tts_mod._edge_transient(ex.NoAudioReceived("x"))
