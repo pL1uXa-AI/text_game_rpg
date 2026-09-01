@@ -483,7 +483,7 @@ async function loadJournal() {
         ` <small>(верни в сюжет, когда уместно)</small>`;
     } else if (chk) { chk.style.display = "none"; chk.innerHTML = ""; }
     list.innerHTML = d.entries.length ? d.entries.map((e) =>
-      `<li class="item-clickable" onclick="scrollToSeq(${numAttr(e.seq)})" title="к ходу ${e.seq}">` +
+      `<li class="item-clickable" data-click="scrollToSeq" data-arg="${numAttr(e.seq)}" title="к ходу ${e.seq}">` +
       `<small class="right">ход ${e.seq}</small>${esc(e.icon)} <b>${esc(e.title)}</b>` +
       (e.text ? `<small>${esc(e.text)}</small>` : ``) + `</li>`
     ).join("") : `<li class="muted">Пока пусто — дневник заполняется значимыми событиями (встречи, квесты, находки, смена роли).</li>`;
@@ -799,7 +799,7 @@ function renderSetting(s) {
           return `${esc(oname)}: ${esc(st2)}`;
         });
         const relTxt = rel.length ? ` <span class="frac-rel">связи: ${rel.join(", ")}</span>` : "";
-        return `<li class="item-clickable" onclick="showFaction(${fi})" title="${esc(f.desc || "")}">🏴 ${esc(n)} <span class="muted">— ${esc(st)}</span>${relTxt}</li>`;
+        return `<li class="item-clickable" data-click="showFaction" data-arg="${numAttr(fi)}" title="${esc(f.desc || "")}">🏴 ${esc(n)} <span class="muted">— ${esc(st)}</span>${relTxt}</li>`;
       }).join("");
       H.push(`<div class="char-row"><span class="char-label">🏴 Фракции</span><ul class="list">${fHtml}</ul></div>`);
     }
@@ -810,9 +810,9 @@ function renderSetting(s) {
       const skHtml = skills.map(([n, sk], si) => {
         if (sk && typeof sk === "object") {
           const d = sk.desc ? trunc(sk.desc, 100) : "";
-          return `<li class="item-clickable" onclick="showSkill(${si})" title="${esc(sk.desc || "")}">${esc(ucfirst(n))} (ранг ${esc(sk.rank || "F")}${sk.kind ? ", " + esc(ucfirst(sk.kind)) : ""})${d ? `<small>${esc(d)}</small>` : ""}</li>`;
+          return `<li class="item-clickable" data-click="showSkill" data-arg="${numAttr(si)}" title="${esc(sk.desc || "")}">${esc(ucfirst(n))} (ранг ${esc(sk.rank || "F")}${sk.kind ? ", " + esc(ucfirst(sk.kind)) : ""})${d ? `<small>${esc(d)}</small>` : ""}</li>`;
         }
-        return `<li class="item-clickable" onclick="showSkill(${si})">${esc(ucfirst(n))} ур.${esc(sk)}</li>`;
+        return `<li class="item-clickable" data-click="showSkill" data-arg="${numAttr(si)}">${esc(ucfirst(n))} ур.${esc(sk)}</li>`;
       }).join("");
       H.push(`<div class="char-row"><span class="char-label">🎖 Навыки / Способности</span><ul class="list">${skHtml}</ul></div>`);
     } else {
@@ -825,7 +825,7 @@ function renderSetting(s) {
         const school = ab.school ? ` [${esc(ab.school)}]` : "";
         const cost = ab.cost ? ` <small>энергия ${ab.cost}</small>` : "";
         const d = ab.desc ? ` — ${trunc(ab.desc, 100)}` : "";
-        return `<li class="item-clickable" onclick="showAbility(${ai})" title="${esc(ab.desc || "")}">${esc(ucfirst(n))}${school}${cost}<small>${d}</small></li>`;
+        return `<li class="item-clickable" data-click="showAbility" data-arg="${numAttr(ai)}" title="${esc(ab.desc || "")}">${esc(ucfirst(n))}${school}${cost}<small>${d}</small></li>`;
       }).join("");
       H.push(`<div class="char-row"><span class="char-label">⚡ Способности</span><ul class="list">${abHtml}</ul></div>`);
     }
@@ -887,10 +887,10 @@ function renderSetting(s) {
     if (Object.keys(mods).length) tick += ` (моды: ${Object.entries(mods).map(([k, v]) => `${esc(k)}${v > 0 ? "+" : ""}${v}`).join(", ")})`;
     const desc = ef.desc ? trunc(ef.desc, 120) : "";
     const cls = (ef.damage || 0) > 0 ? " bad" : (ef.heal || 0) > 0 ? " good" : "";
-    return `<li class="eff${cls} item-clickable" onclick="showEffect(${ei})" title="${esc(ef.desc || "")}">${esc(label)}<small>${desc ? esc(desc) + " " : ""}(${t}${kind}${tick})</small></li>`;
+    return `<li class="eff${cls} item-clickable" data-click="showEffect" data-arg="${numAttr(ei)}" title="${esc(ef.desc || "")}">${esc(label)}<small>${desc ? esc(desc) + " " : ""}(${t}${kind}${tick})</small></li>`;
   }).join("") || `<li>нет</li>`;
   $("inventory").innerHTML = (p.inventory || []).map((i, idx) =>
-    `<li class="item-clickable" onclick="showItem(${idx})" title="${esc(i.desc || "нет описания")}">${esc(i.name)} ×${i.qty || 1}` + (i.desc ? `<small>${trunc(i.desc, 60)}</small>` : ``)
+    `<li class="item-clickable" data-click="showItem" data-arg="${numAttr(idx)}" title="${esc(i.desc || "нет описания")}">${esc(i.name)} ×${i.qty || 1}` + (i.desc ? `<small>${trunc(i.desc, 60)}</small>` : ``)
     + (i.value ? ` <em class="val">🪙${i.value}</em>` : ``)
     + (i.weight ? ` <em class="val">${Number(i.weight)}кг</em>` : ``) + `</li>`).join("") || `<li>пусто</li>`;
   const invSell = (p.inventory || []).reduce((a, i) => a + (Number(i.value) || 0) * (i.qty || 1), 0);
@@ -955,11 +955,11 @@ function renderSetting(s) {
     let tag = `${esc(q.title)}`;
     if (q.progress) tag += ` — <b>${esc(q.progress)}</b>`;
     if (q.chosen) tag += ` <small title="ветка">⎇ ${esc(q.chosen)}</small>`;
-    return `<li class="item-clickable ${q.status === "done" ? "done" : ""}" onclick="showQuest('${jsAttr(k)}')">${q.status === "done" ? "✔ " : ""}${tag}${q.desc ? ` — ${trunc(q.desc, 90)}` : ""}</li>`;
+    return `<li class="item-clickable ${q.status === "done" ? "done" : ""}" data-click="showQuest" data-arg="${attrArg(k)}">${q.status === "done" ? "✔ " : ""}${tag}${q.desc ? ` — ${trunc(q.desc, 90)}` : ""}</li>`;
   }).join("") || `<li>нет</li>`;
   $("shops-list").innerHTML = Object.entries(s.shops || {}).map(([k, sh]) => {
     const items = (sh.items || []).length;
-    return `<li class="item-clickable" onclick="showShop('${jsAttr(k)}')">${sh.desc ? `<small class="right">${trunc(sh.desc, 80)}</small>` : ``}<b>${esc(sh.name || k)}</b>${sh.owner ? ` · ${esc(sh.owner)}` : ""}${sh.faction ? ` <small>${esc(factionName(sh.faction))}</small>` : ``}<small>товаров: ${items}</small></li>`;
+    return `<li class="item-clickable" data-click="showShop" data-arg="${attrArg(k)}">${sh.desc ? `<small class="right">${trunc(sh.desc, 80)}</small>` : ``}<b>${esc(sh.name || k)}</b>${sh.owner ? ` · ${esc(sh.owner)}` : ""}${sh.faction ? ` <small>${esc(factionName(sh.faction))}</small>` : ``}<small>товаров: ${items}</small></li>`;
   }).join("") || `<li>нет</li>`;
   // крафт: помечаем «гот needs» и вовсе недоступные (нет станции/профессии/ингредиентов)
   $("crafts-list").innerHTML = Object.entries(s.crafts || {}).map(([k, c]) => {
@@ -970,10 +970,10 @@ function renderSetting(s) {
     if (c.profession) req += ` <small>⚒ ${esc(c.profession)}</small>`;
     const ready = craftReady(s, c);
     const icon = ready ? `<em class="val">✓</em>` : `<em class="val bad">✗</em>`;
-    return `<li class="item-clickable" onclick="showCraft('${jsAttr(k)}')">${c.desc ? `<small class="desc">${trunc(c.desc, 80)}</small>` : ``}<b>${esc(c.name || k)}</b> → ${esc(res.name || "?")} ×${res.qty || 1} ${icon}${req}<small>${esc(ing || "без вложений")}</small></li>`;
+    return `<li class="item-clickable" data-click="showCraft" data-arg="${attrArg(k)}">${c.desc ? `<small class="desc">${trunc(c.desc, 80)}</small>` : ``}<b>${esc(c.name || k)}</b> → ${esc(res.name || "?")} ×${res.qty || 1} ${icon}${req}<small>${esc(ing || "без вложений")}</small></li>`;
   }).join("") || `<li>нет</li>`;
   $("enemies").innerHTML = Object.entries(s.enemies || {}).map(([k, e]) =>
-    `<li class="item-clickable" onclick="showEnemy('${jsAttr(k)}')">${e.desc ? `<small class="desc">${trunc(e.desc, 80)}</small>` : ``}⚔ ${esc(e.name)} — HP ${e.hp}/${e.max_hp}${e.money ? ` <em class="val">🪙${e.money}</em>` : ``}</li>`).join("") || `<li>нет</li>`;
+    `<li class="item-clickable" data-click="showEnemy" data-arg="${attrArg(k)}">${e.desc ? `<small class="desc">${trunc(e.desc, 80)}</small>` : ``}⚔ ${esc(e.name)} — HP ${e.hp}/${e.max_hp}${e.money ? ` <em class="val">🪙${e.money}</em>` : ``}</li>`).join("") || `<li>нет</li>`;
   $("npc-list").innerHTML = Object.entries(s.npc || {}).map(([k, n]) => {
     let sch = "";
     const schedule = n.schedule;
@@ -984,12 +984,12 @@ function renderSetting(s) {
         if (t.includes(kk) || kk.includes(t)) { sch = ` <small class="sch">⏰ ${esc(act)}</small>`; break; }
       }
     }
-    return `<li class="item-clickable" onclick="showNpc('${jsAttr(k)}')">${n.alive === false ? "🪦 " : "🗣 "}${esc(n.name)} (${trunc(n.mood || n.desc || "", 40)}${n.faction ? ", " + esc(factionName(n.faction)) : ""}${n.money ? ", 🪙" + esc(n.money) : ""})${sch}</li>`;
+    return `<li class="item-clickable" data-click="showNpc" data-arg="${attrArg(k)}">${n.alive === false ? "🪦 " : "🗣 "}${esc(n.name)} (${trunc(n.mood || n.desc || "", 40)}${n.faction ? ", " + esc(factionName(n.faction)) : ""}${n.money ? ", 🪙" + esc(n.money) : ""})${sch}</li>`;
   }).join("") || `<li>нет</li>`;
   $("companions-list").innerHTML = Object.entries(s.companions || {}).map(([k, c]) =>
-    `<li class="item-clickable" onclick="showCompanion('${jsAttr(k)}')">${c.hp <= 0 ? "💀 " : "🤝 "}<b>${esc(c.name || k)}</b> ⚔ ${c.hp}/${c.max_hp || c.hp} Lv${c.level || 1}${c.loyalty ? ` · верность ${esc(c.loyalty)}` : ""}<small>${trunc(c.desc, 80)}</small></li>`).join("") || `<li>нет</li>`;
+    `<li class="item-clickable" data-click="showCompanion" data-arg="${attrArg(k)}">${c.hp <= 0 ? "💀 " : "🤝 "}<b>${esc(c.name || k)}</b> ⚔ ${c.hp}/${c.max_hp || c.hp} Lv${c.level || 1}${c.loyalty ? ` · верность ${esc(c.loyalty)}` : ""}<small>${trunc(c.desc, 80)}</small></li>`).join("") || `<li>нет</li>`;
   $("flags").innerHTML = Object.entries(s.flags || {}).map(([k, v], fi) =>
-    `<span class="item-clickable flag-pill" onclick="showFlag(${fi})" title="${esc(k)}=${esc(JSON.stringify(v))}">🚩 ${esc(flagLabel(k))}: ${flagWord(v)}</span>`).join("") || `<span class="flags-none">нет</span>`;
+    `<span class="item-clickable flag-pill" data-click="showFlag" data-arg="${numAttr(fi)}" title="${esc(k)}=${esc(JSON.stringify(v))}">🚩 ${esc(flagLabel(k))}: ${flagWord(v)}</span>`).join("") || `<span class="flags-none">нет</span>`;
   // E8 (аудит 38): у подсказки про флаги теперь есть смысл — она прячется, когда флагов
   // нет (раньше id был объявлен в разметке и не упоминался ни в JS, ни в CSS).
   const fh = $("flags-hint");
@@ -2772,20 +2772,14 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
-// Значение для JS-строки ВНУТРИ HTML-атрибута: onclick="showQuest('…')".
-// Обычного esc() тут мало (сессия 36, п.25): ключ сущности приходит от LLM и может
-// содержать апостроф (id «don't») — esc(') не трогает, кавычка закрывала JS-строку
-// раньше времени, атрибут ломался и модалка просто не открывалась. Сначала экранируем
-// для строкового литерала (' " \ переводы строк), затем — для HTML-атрибута.
-function jsAttr(s) {
-  const raw = String(s ?? "")
-    .replace(/\\/g, "\\\\")
-    .replace(/'/g, "\\'")
-    .replace(/"/g, '\\"')
-    .replace(/\r/g, "")
-    .replace(/\n/g, "\\n")
-    .replace(/\t/g, "\\t");
-  return esc(raw);
+// Значение для HTML-атрибута data-arg="…" (E1, хвосты сессии 38). Ключ сущности приходит
+// от LLM и может содержать апостроф («don't»), кавычку, перевод строки. Раньше такие ключи
+// вставлялись прямо в JS-литерал внутри onclick="showQuest('…')" и требовали двойного
+// экранирования (jsAttr, сессия 36, п.25). Теперь JS-литералов в разметке нет: обработчик
+// вешается делегатом ниже, а из атрибута читается ГОТАЯ СТРОКА — значит достаточно
+// экранирования самого HTML-атрибута (esc). Браузер сам раскодировит сущности обратно.
+function attrArg(s) {
+  return esc(String(s ?? "").replace(/\r/g, ""));
 }
 
 // Число для JS-аргумента в атрибуте: гарантируем, что туда не попадёт не-число.
@@ -2793,6 +2787,32 @@ function numAttr(v) {
   const n = Number(v);
   return Number.isFinite(n) ? String(n) : "0";
 }
+
+/* ─────────── E1: единый делегат кликов по карточкам состояния ───────────
+   Вместо 15 `onclick="fn('${jsAttr(k)}')"`: разметка несёт только имя действия и аргумент,
+   а вызов живёт здесь. Новый обработчик больше не может забыть про экранирование —
+   ему нечего экранировать, рисковый класс снят целиком (законы нейтральны: только UI).
+   Реестр замыкается на function-декларации (они всплывают), поэтому объявлен здесь. */
+const CLICK_ACTIONS = {
+  scrollToSeq, showFaction, showSkill, showAbility, showEffect, showItem, showFlag,
+  showQuest, showShop, showCraft, showEnemy, showNpc, showCompanion,
+};
+// Ключи словарей мира (квест/магазин/рецепт/враг/NPC/спутник) — СТРОКИ, даже если LLM
+// дала id «123»; индексы списков и номер хода — числа. Разделяем явно, вместо прежнего
+// «на глаз» в шаблоне (numAttr для чисел, jsAttr для строк).
+const CLICK_NUMERIC = new Set(["scrollToSeq", "showFaction", "showSkill", "showAbility",
+                               "showEffect", "showItem", "showFlag"]);
+document.addEventListener("click", (e) => {
+  const t = e.target;
+  const el = t && t.closest ? t.closest("[data-click]") : null;
+  if (!el) return;
+  const name = el.dataset.click || "";
+  const fn = CLICK_ACTIONS[name];
+  if (!fn) { console.warn("неизвестный data-click:", name); return; }
+  const raw = el.dataset.arg;
+  if (raw === undefined) { fn(); return; }
+  fn(CLICK_NUMERIC.has(name) ? Number(raw) : raw);
+});
 
 async function refreshStatus() {
   const el = $("sys-status");
@@ -2821,6 +2841,29 @@ document.addEventListener("DOMContentLoaded", () => {
   const rbtn = $("btn-reload-plots"); if (rbtn) rbtn.onclick = reloadPlots;
   $("btn-add-plot").onclick = () => plotModal(null);
   $("btn-menu").onclick = goMenu;
+  // E6 (хвосты 38): на телефоне панель мира — выдвижная; переключатель и закрытие по фону.
+  const sg = $("screen-game");
+  const sideToggle = $("btn-sidebar");
+  const setSidebar = (open) => {
+    sg.classList.toggle("side-open", open);
+    if (sideToggle) sideToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  };
+  if (sideToggle) sideToggle.onclick = () => setSidebar(!sg.classList.contains("side-open"));
+  const scrim = $("sidebar-scrim");
+  if (scrim) scrim.onclick = () => setSidebar(false);
+  // клик по карточке состояния (открытая модалка/панель) на узком экране закрывает панель
+  document.addEventListener("click", (e) => {
+    if (window.innerWidth > 900) return;
+    if (!sg.classList.contains("side-open")) return;
+    const t = e.target;
+    if (t && t.closest && (t.closest(".sidebar") || t.closest("#btn-sidebar"))) return;
+    setSidebar(false);
+  }, true);
+  //Esc всегда убирает панель — на телефоне это единственный способ вернуться в чат,
+  //когда панель открылась случайно (например после перехода на вкладку «Состояние»)
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && sg.classList.contains("side-open")) setSidebar(false);
+  });
 
   $("btn-send").onclick = sendAction;
   $("cmd").addEventListener("keydown", (e) => { if (e.key === "Enter") sendAction(); });

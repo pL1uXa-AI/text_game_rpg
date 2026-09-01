@@ -172,6 +172,32 @@ async def _db() -> aiosqlite.Connection:
     return await _open()
 
 
+
+async def _one_row(cur) -> "sqlite3.Row":
+    """fetchone() с честной ошибкой вместо TypeError на None (mypy, D5).
+
+    Нужен там, где строка ОБЯЗАНА быть: COUNT/MAX всегда возвращают строку, а SELECT
+    сразу после записи — только если запись не потерялась. None тут значит баг схемы,
+    и молча приводить его к 0/'' нельзя."""
+    row = await cur.fetchone()
+    if row is None:
+        raise LookupError("БД: нет строки там, где она обязана быть (COUNT/SELECT после записи)")
+    return row
+
+
+async def _as_dict(cur) -> dict:
+    """Первая строка запроса как dict (см. _one_row про None)."""
+    return dict(await _one_row(cur))
+
+
+def _rowid(cur) -> int:
+    """lastrowid после INSERT: None бывает только на запросе без вставки — это баг вызова."""
+    rid = cur.lastrowid
+    if rid is None:
+        raise LookupError("БД: lastrowid пуст после INSERT (запрос не вставлял строку)")
+    return int(rid)
+
+
 async def _maybe_commit() -> None:
     """Коммит операции, если мы НЕ внутри обёртки db.transaction() (иначе транзакция
     потеряла бы атомарность — commit из середины закрыл бы всю группу).
@@ -470,7 +496,7 @@ async def _create_world(name: str, theme: str, genre: str, difficulty: str, pers
          json.dumps(provider_settings or {}, ensure_ascii=False), time.time(), time.time()),
     )
     await _maybe_commit()
-    return int(cur.lastrowid)  # type: ignore
+    return _rowid(cur)
 
 
 def list_worlds() -> list[dict]:
@@ -650,7 +676,7 @@ async def _add_event(world_id: int, role: str, content: str, seq: int | None,
     if seq is None:
         cur0 = await conn.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM events WHERE world_id = ?",
                                   (world_id,))
-        row = await cur0.fetchone()
+        row = await _one_row(cur0)
         seq = int(row["m"]) + 1
     meta_json = json.dumps(meta or {}, ensure_ascii=False)
     cur = await conn.execute(
@@ -658,7 +684,7 @@ async def _add_event(world_id: int, role: str, content: str, seq: int | None,
         (world_id, seq, role, content, meta_json, time.time()),
     )
     await _maybe_commit()
-    ev = {"id": int(cur.lastrowid), "world_id": world_id, "seq": seq, "role": role,
+    ev = {"id": _rowid(cur), "world_id": world_id, "seq": seq, "role": role,
           "content": content, "folded": 0, "feedback": 0, "tts_status": 0, "tts_file": "",
           "meta": meta or {}}
     _notify_event(ev)
@@ -794,7 +820,7 @@ async def _latest_seq(world_id: int) -> int:
     conn = await _open()
     cur = await conn.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM events WHERE world_id = ?",
                              (world_id,))
-    row = await cur.fetchone()
+    row = await _one_row(cur)
     return int(row["m"])
 
 
@@ -1183,7 +1209,7 @@ def count_tts_cache() -> int:
 async def _count_tts_cache() -> int:
     conn = await _open()
     cur = await conn.execute("SELECT COUNT(*) AS c FROM tts_cache")
-    row = await cur.fetchone()
+    row = await _one_row(cur)
     return int(row["c"])
 
 
@@ -1281,7 +1307,7 @@ async def _upsert_entity(world_id: int, kind: str, entity_key: str, *,
         )
         await _maybe_commit()
         cur2 = await conn.execute("SELECT * FROM entities WHERE id = ?", (row["id"],))
-        return dict(await cur2.fetchone())
+        return await _as_dict(cur2)
     ent = {
         "world_id": world_id, "kind": kind, "entity_key": entity_key,
         "name": name or entity_key,
@@ -1297,7 +1323,7 @@ async def _upsert_entity(world_id: int, kind: str, entity_key: str, *,
          ent["relationship"], ent["bio"], ent["meta"], ent["seq"], ent["created_at"], ent["updated_at"]),
     )
     await _maybe_commit()
-    ent["id"] = int(cur3.lastrowid)
+    ent["id"] = _rowid(cur3)
     return ent
 
 
@@ -1369,7 +1395,7 @@ async def _create_save(world_id: int, name: str, setting: dict, seq: int) -> int
         (world_id, name, seq, json.dumps(setting, ensure_ascii=False), time.time()),
     )
     await _maybe_commit()
-    return int(cur.lastrowid)  # type: ignore
+    return _rowid(cur)
 
 
 def upsert_auto_save(world_id: int, setting: dict, seq: int) -> Optional[int]:
@@ -1388,7 +1414,7 @@ async def _upsert_auto_save(world_id: int, setting: dict, seq: int) -> Optional[
         (world_id, "auto", seq, json.dumps(setting, ensure_ascii=False), time.time()),
     )
     await _maybe_commit()
-    return int(cur.lastrowid)  # type: ignore
+    return _rowid(cur)
 
 
 def list_saves(world_id: int) -> list[dict]:
@@ -1894,8 +1920,8 @@ async def _create_narrator(name: str, prompt: str, desc: str) -> dict:
         await _maybe_commit()
     except sqlite3.IntegrityError:
         raise ValueError(f"Рассказчик с именем «{name}» уже существует")
-    cur2 = await conn.execute("SELECT * FROM narrators WHERE id = ?", (int(cur.lastrowid),))
-    return dict(await cur2.fetchone())
+    cur2 = await conn.execute("SELECT * FROM narrators WHERE id = ?", (_rowid(cur),))
+    return await _as_dict(cur2)
 
 
 def update_narrator(narrator_id: int, *, name: Optional[str] = None,
@@ -1922,7 +1948,7 @@ async def _update_narrator(narrator_id: int, *, name: Optional[str],
     except sqlite3.IntegrityError:
         raise ValueError(f"Рассказчик с именем «{new_name}» уже существует")
     cur1 = await conn.execute("SELECT * FROM narrators WHERE id = ?", (narrator_id,))
-    return dict(await cur1.fetchone())
+    return await _as_dict(cur1)
 
 
 def narrators_in_use(narrator_id: int) -> int:
@@ -1935,7 +1961,7 @@ async def _narrators_in_use(narrator_id: int) -> int:
     conn = await _open()
     cur = await conn.execute("SELECT COUNT(*) AS c FROM worlds WHERE narrator_id = ?",
                              (narrator_id,))
-    row = await cur.fetchone()
+    row = await _one_row(cur)
     return int(row["c"])
 
 
@@ -1993,8 +2019,8 @@ async def _create_plot(name: str, plot: str, lore: str) -> dict:
         (name, plot, lore, time.time(), time.time()),
     )
     await _maybe_commit()
-    cur2 = await conn.execute("SELECT * FROM story_plots WHERE id = ?", (int(cur.lastrowid),))
-    return dict(await cur2.fetchone())
+    cur2 = await conn.execute("SELECT * FROM story_plots WHERE id = ?", (_rowid(cur),))
+    return await _as_dict(cur2)
 
 
 def update_plot(plot_id: int, name: str | None = None, plot: str | None = None,
@@ -2019,7 +2045,7 @@ async def _update_plot(plot_id: int, name: str | None, plot: str | None,
                        (new_name, new_plot, (new_lore or "").strip(), time.time(), plot_id))
     await _maybe_commit()
     cur1 = await conn.execute("SELECT * FROM story_plots WHERE id = ?", (plot_id,))
-    return dict(await cur1.fetchone())
+    return await _as_dict(cur1)
 
 
 def delete_plot(plot_id: int) -> None:
@@ -2079,9 +2105,9 @@ async def _create_lore(world_id: int, title: str, content: str, tags: str,
          source, time.time(), time.time()),
     )
     await _maybe_commit()
-    lid = int(cur.lastrowid)
+    lid = _rowid(cur)
     cur2 = await conn.execute("SELECT * FROM lore WHERE id = ?", (lid,))
-    return dict(await cur2.fetchone())  # type: ignore
+    return await _as_dict(cur2)
 
 
 def update_lore(lore_id: int, *, title: str | None = None, content: str | None = None,
@@ -2108,7 +2134,7 @@ async def _update_lore(lore_id: int, *, title: str | None, content: str | None,
     )
     await _maybe_commit()
     cur2 = await conn.execute("SELECT * FROM lore WHERE id = ?", (lore_id,))
-    return dict(await cur2.fetchone())
+    return await _as_dict(cur2)
 
 
 def delete_lore(lore_id: int) -> None:

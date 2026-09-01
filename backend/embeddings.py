@@ -213,7 +213,16 @@ async def embed_batch(texts: list[str], is_query: bool = False,
                 cached[i] = vec
                 _cache_put(_cache_key(prov, p), vec)
 
-    return [cached.get(i) for i in range(len(prepared))]
+    # D5: пустой вектор = провайдер не вернул ответ по индексу (сетевой сбой после 5 попыток).
+    # Молча отдать [] хуже, чем упасть: тишина превращается в «поиск не нашёл ничего».
+    out: list[list[float]] = []
+    for i in range(len(prepared)):
+        v = cached.get(i)
+        if not v:
+            raise RuntimeError(f"Эмбеддинги: нет вектора для запроса #{i} «{texts[i][:40]}…» "
+                               f"(провайдер {prov['id']} не вернул data[{i}])")
+        out.append(v)
+    return out
 
 
 async def embed_documents(texts: list[str], provider: dict | None = None) -> list[list[float]]:

@@ -761,14 +761,22 @@ def test_admin_settings_logs_once_on_failure(tmp_path, monkeypatch, caplog):
 # ══════════════════════════════════════════════════════════════════════
 
 def test_frontend_jsattr_defined_and_used():
-    """app.js: jsAttr существует, а в onclick-литералах нет «голого» esc()."""
+    """E1 (хвосты 38): onclick-литералы вынесены в data-click — проверяем обратное.
+
+    Исторический смысл теста (сессия 36, п.25) — «ключ от LLM не должен ломать модалку».
+    Теперь он закрыт сильнее: в разметке вообще нет JS-литералов, поэтому вспомогательная
+    функция jsAttr() удалена, а экранирование HTML-атрибута (attrArg → esc) проверяется
+    roundtrip-полигоном в scripts/check_frontend.py.
+    """
     import re
+    import sys
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from check_frontend import _strip_js
     js = io.open(ROOT / "frontend" / "app.js", encoding="utf-8").read()
-    assert "function jsAttr" in js
-    subs = re.findall(r"""onclick="[A-Za-z]+\([^)"]*'\$\{([^}]+)\}'""", js)
-    assert subs, "структура onclick-подстановок изменилась — обнови проверку"
-    bad = [s for s in subs if not re.match(r"^(jsAttr|numAttr)\(", s.strip())]
-    assert not bad, f"в onclick подставлено без экранирования JS-литерала: {bad}"
+    assert 'onclick="' not in _strip_js(js), "вернулся inline-onclick"
+    assert "CLICK_ACTIONS" in js and "attrArg" in js
+    assert set(re.findall(r"""data-click="([A-Za-z]+)""", js)) <= \
+        set(re.findall(r"""function ([A-Za-z]+)\(""", js)), "data-click без функции"
 
 
 def test_esc_alone_breaks_on_apostrophe():
@@ -919,6 +927,14 @@ def test_dedupe_known_compromise_documented():
 # ══════════════════════════════════════════════════════════════════════
 # п.14 — start_game.bat: 401 от llama.cpp ≠ «сервер мёртв»
 # ══════════════════════════════════════════════════════════════════════
+
+# D11 (хвосты сессии 38): два теста ниже — ЧЕСТНЫЙ SMOKE ПО ТЕКСТУ .bat (они так и
+# названы в докстринге): cmd здесь не исполняется, регрессий поведения они не дают.
+# Структурные инварианты батников переехали в scripts/check_start_bat.py (он проверяет
+# и это же, и больше), а в pytest из блока осталась проверяемое: чекер зелёный + ловит
+# возврат к плохому (degradation-пробы) — tests/test_session38_tails.py::test_d11_*.
+# Живой `cmd /c` харнесс с подменённым портом остался открытой задачей (ROADMAP, D11).
+
 
 def test_start_bat_tolerates_401():
     """401 от llama.cpp (--api-key) ≠ «сервер мёртв»: игра обязана стартовать.

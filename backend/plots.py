@@ -83,7 +83,8 @@ def _slug_id(filename: str) -> str:
 def _parse_lore_text(text: str) -> list[dict]:
     """Разбор lore_text ('## Заголовок' + текст) в статьи (если нет lore_articles)."""
     entries: list[dict] = []
-    cur_title, cur = "Лор мира", []
+    cur: list[str] = []
+    cur_title = "Лор мира"
     for ln in (text or "").splitlines():
         m = re.match(r"^#{1,4}\s+(.+?)\s*#*\s*$", ln.strip())
         if m:

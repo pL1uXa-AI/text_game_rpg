@@ -109,10 +109,14 @@
 
   <!-- Экран игры -->
   <div id="screen-game" style="display:none">
+    <!-- E6: затемнение под выдвижной панелью мира (на широком экране скрыто) -->
+    <div id="sidebar-scrim" class="sidebar-scrim"></div>
     <aside class="sidebar">
       <div class="world-head">
         <div class="head-row">
           <h2 id="world-name">—</h2>
+          <button id="btn-sidebar" class="btn small sidebar-toggle" aria-expanded="false"
+                  title="Показать/скрыть панель мира (на телефоне — единств. способ вернуть чат)">☰</button>
           <button id="btn-menu" class="btn small" title="Вернуться в меню миров">← Меню</button>
         </div>
         <div class="world-meta" id="world-meta"></div>

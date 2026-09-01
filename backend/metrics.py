@@ -292,7 +292,8 @@ def _agents_report(limit: int = 20) -> dict:
 
 
 def _aggregate(samples: list[dict]) -> dict:
-    llm_ms = [s.get("llm_ms") for s in samples if s.get("llm_ms") is not None]
+    llm_ms = [float(s["llm_ms"]) for s in samples
+              if isinstance(s.get("llm_ms"), (int, float))]
     ct = [s.get("completion_tokens") or 0 for s in samples]
     pt = [s.get("prompt_tokens") or 0 for s in samples]
     mem = [s.get("memory_tokens") for s in samples if s.get("memory_tokens") is not None]
@@ -312,7 +313,7 @@ def _aggregate(samples: list[dict]) -> dict:
     mids = [s for s in samples if s.get("cut_mid")]
     n = len(samples)
     trimmed = [s for s in samples if s.get("prompt_trimmed")]
-    scores = [s.get("rag_score_avg") for s in samples
+    scores = [float(s["rag_score_avg"]) for s in samples
               if isinstance(s.get("rag_score_avg"), (int, float))]
     return {
         "llm_ms_avg": _avg(llm_ms),

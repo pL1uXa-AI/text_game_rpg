@@ -1042,7 +1042,7 @@ def _apply_skill(p: dict, sk: dict, source: str = "skill_add") -> str | None:
     name = str((sk.get("name") if isinstance(sk, dict) else sk) or "").strip()[:60]
     if not name:
         return None
-    r = norm_rank(sk.get("rank") if isinstance(sk, dict) else "F")
+    r = norm_rank(str(sk.get("rank") or "F") if isinstance(sk, dict) else "F")
     kind = (sk.get("kind") if isinstance(sk, dict) else "") or "универсальное"
     desc = (sk.get("desc") if isinstance(sk, dict) else "") or ""
     mp = int(sk.get("mp_cost", 0)) if isinstance(sk, dict) else 0
@@ -1365,10 +1365,9 @@ class EffectHandler(DirectiveHandler):
                 # постоянный эффект (-1), а «0»/"5"/8 парсятся как числа. Мёртвый
                 # тернарник ниже («turns if turns != -1 else -1») свёрнут к turns.
                 _turns_raw = ea.get("turns", ea.get("duration", -1))
-                try:
-                    turns = int(_turns_raw)
-                except (TypeError, ValueError):
-                    turns = -1
+                # D5: то же поведение через _safe_int — он и ловил None/мусор в except ниже,
+                # но теперь типы сходятся без type: ignore (None → -1, "5" → 5, 0 → 0).
+                turns = _safe_int(_turns_raw, -1)
                 new_ef = {
                     "turns": turns,
                     "damage": int(ea.get("damage", 0) or 0),
@@ -1464,7 +1463,7 @@ class EconomyHandler(DirectiveHandler):
             msgs.append(f"🏪 Магазин «{s.get('name', sid)}» открыт лавкой {s.get('owner', '') or 'хозяином'}.")
         if "shop_remove" in d:
             sr = d["shop_remove"]
-            sid = sr.get("id") if isinstance(sr, dict) else sr
+            sid = str(sr.get("id") or "") if isinstance(sr, dict) else str(sr or "")
             if sid and str(sid) in shops:
                 msgs.append(f"🏪 Магазин «{shops.pop(str(sid)).get('name', sid)}» закрыл двери.")
         if "shop_update" in d and isinstance(d["shop_update"], dict) and (d["shop_update"].get("id") or "").strip():
@@ -1676,7 +1675,7 @@ class CompanionHandler(DirectiveHandler):
             msgs.append(f"🤝 К отряду присоединился спутник: {ca.get('name', cid)} (⚔ HP {hp})")
         if "companion_remove" in d:
             cr = d["companion_remove"]
-            cid = cr.get("id") if isinstance(cr, dict) else cr
+            cid = str(cr.get("id") or "") if isinstance(cr, dict) else str(cr or "")
             if cid and str(cid) in companions:
                 msgs.append(f"💔 Спутник {companions.pop(str(cid)).get('name', cid)} покинул отряд.")
         if "companion_update" in d and isinstance(d["companion_update"], dict) and (d["companion_update"].get("id") or "").strip():

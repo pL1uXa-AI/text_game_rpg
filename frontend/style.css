@@ -498,6 +498,65 @@ input[type="range"]::-moz-range-track { height: 6px; border-radius: 999px; backg
   border-radius: 8px; color: var(--text); font-size: 13px; background: var(--bg2); }
 .journal-list li { display: flex; flex-direction: column; gap: 2px; }
 .journal-list .right { color: var(--muted); font-size: 11px; }
+/* ─── E6 (хвосты сессии 38): мобильная адаптивность ────────────────────────────
+   Три брейкпоинта, минимум по пункту: на ≤900px панель мира становится ВЫДВИЖНОЙ
+   (иначе чат на телефоне просто не влезал бы рядом с 360px сайдбара), цели нажатия
+   поднимаются до 44px (правило Apple HIG / Material), шрифт поля ввода и тела сообщений
+   — 16px (iOS Safari зумит страницу при фокусе на поле с меньким шрифтом), карта
+   занимает почти всю высоту. Кольца карты на 375px: узлы рисуются в viewBox SVG и
+   масштабируются «подгонкой всего» (fitAll) — отдельной правки не потребовали.
+   Десктоп (>900px) не меняется вообще: кнопка-переключатель скрыта, позиционирование прежнее. */
+.sidebar-toggle { display: none; }
+.sidebar-scrim { display: none; }
+
+@media (max-width: 900px) {
+  #screen-game { flex-direction: column; }
+  .sidebar {
+    position: fixed; left: 0; top: 0; z-index: 40;
+    width: min(88vw, 380px); max-height: 100vh; height: 100vh;
+    border-right: 1px solid var(--line); box-shadow: 6px 0 24px rgba(0, 0, 0, .45);
+    transform: translateX(-102%); transition: transform .22s ease;
+  }
+  #screen-game.side-open .sidebar { transform: none; }
+  #screen-game.side-open .sidebar-scrim {
+    display: block; position: fixed; inset: 0; z-index: 35; background: rgba(5, 6, 12, .6); }
+  .sidebar-toggle { display: inline-block; min-width: 44px; min-height: 44px; font-size: 16px; }
+  .chat { max-height: 100vh; height: 100vh; }
+  .msg { max-width: 94%; }
+  .msg .body { font-size: 16px; }
+  .input-row { padding: 10px 12px; gap: 6px; }
+  .input-row input { font-size: 16px; min-height: 46px; }
+  .btn { min-height: 40px; }
+  .btn.small { min-height: 44px; padding: 8px 12px; font-size: 14px; }
+  .tab { min-height: 44px; font-size: 14px; padding: 10px 12px; }
+  .item-clickable { padding: 8px 6px; }
+  .msg .actions button { min-height: 44px; padding: 8px 12px; font-size: 14px; }
+  .modal-box { width: 96vw; max-height: 92vh; padding: 14px; }
+  .map-wrap { height: 62vh; min-height: 280px; }
+  #btn-divine { right: 10px; top: 8px; }
+  .suggestion-bar { gap: 6px; }
+  /* строки состояния и карточки — не разъезжаются по горизонтали */
+  .panel-body, .world-head { overflow-wrap: anywhere; }
+}
+
+@media (max-width: 420px) {
+  .msg .body { font-size: 15.5px; padding: 10px 12px; }
+  .map-wrap { height: 54vh; min-height: 240px; }
+  .world-head h2 { font-size: 16px; }
+  .topbar { top: 8px; right: 8px; }
+  .legend { gap: 8px; font-size: 11px; }
+}
+
+/* меньше 560px: панель занимает всю ширину (на 360px иначе обрезаются счётчики) */
+@media (max-width: 560px) {
+  .sidebar { width: 100vw; }
+}
+
+/* уважаем системный отказ от анимаций (у выдвижной панели тогда не «плывёт» transform) */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001s !important; transition-duration: .001s !important; }
+}
+
 .rewind-list { max-height: 240px; overflow-y: auto; }
 .rewind-list li { display: flex; gap: 8px; align-items: center; }
 .risk-pre { white-space: pre-wrap; font-family: inherit; font-size: 13px; line-height: 1.5; }

@@ -105,19 +105,19 @@ def notable_diff(prev: dict, now: dict, action: str = "", sys_msgs: Optional[lis
     for nid in nn:
         v = _as_dict(nn[nid])
         name = str(v.get("name") or nid)[:60]
-        old = pn.get(nid)
-        if old is None:
+        old_npc: dict | None = pn.get(nid)
+        if old_npc is None:
             note = f" ({v['desc'][:90]})" if v.get("desc") else ""
             out.append({"cat": CAT_NPC, "title": f"Новое знакомство: {name}{note}",
                         "text": str(v.get("mood") or "")[:80], "subject": name})
-        elif _as_dict(old).get("alive", True) and v.get("alive") is False:
+        elif _as_dict(old_npc).get("alive", True) and v.get("alive") is False:
             out.append({"cat": CAT_NPC, "title": f"{name} мёртв", "text": "",
                         "subject": name})
         elif (v.get("notes") or {}) and isinstance(v.get("notes"), dict) and \
-                (v["notes"] != _as_dict(old).get("notes")):
+                (v["notes"] != _as_dict(old_npc).get("notes")):
             # заметки мастера изменились — значит NPC что-то знает/скрыл/раскрыл
             changed = [k for k, val in v["notes"].items()
-                       if _as_dict(old).get("notes", {}).get(k) != val]
+                       if _as_dict(old_npc).get("notes", {}).get(k) != val]
             if changed:
                 out.append({"cat": CAT_NPC, "title": f"{name}: открылось новое",
                             "text": ", ".join(str(c) for c in changed[:3])[:120]})
@@ -164,7 +164,7 @@ def notable_diff(prev: dict, now: dict, action: str = "", sys_msgs: Optional[lis
         if t not in (_as_list(pp.get("titles")) or []):
             out.append({"cat": CAT_ROLE, "title": f"Титул: {t}", "text": ""})
     for a in (_as_list(np_.get("achievements")) or []):
-        name = a.get("name") if isinstance(a, dict) else str(a)
+        name = str(a.get("name") or "") if isinstance(a, dict) else str(a)
         old_names = [(x.get("name") if isinstance(x, dict) else str(x))
                      for x in (_as_list(pp.get("achievements")) or [])]
         if name and name not in old_names:
@@ -334,7 +334,7 @@ def chekhov_update(setting: dict, prev: dict, now: dict, reply: str = "",
 
     alive: list[dict] = []
     for g in guns:
-        if _mentioned(low, g.get("subject")):
+        if _mentioned(low, str(g.get("subject") or "")):
             continue                        # ружьё прозвучало — снимаем со «стены»
         g["age"] = int(g.get("age") or 0) + 1
         if g["age"] <= _CHEKHOV_TTL:

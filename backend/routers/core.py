@@ -354,7 +354,7 @@ def _world_persona(world: dict | None) -> str | None:
             log.warning("персона рассказчика пуста (world %s, narrator_id %s) — мир играется "
                         "со стандартным голосом", world.get("id"), nid)
             return None
-        return str(nr["prompt"])
+        return str((nr or {}).get("prompt") or "")
     except Exception as e:
         # A19 (аудит 38, правило 14): раньше это был голый `except: return None` — мир тихо
         # терял выбранную персону, и «почему рассказчик снова безликий» приходилось гадать.

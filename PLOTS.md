@@ -384,6 +384,7 @@
 - [ ] **Цепочки `next_quest_id` связны**: каждая часть (фрагмент/ключ/артефакт), упомянутая в акте, покрыта квестом с явным способом получения; нет дыр и зацикливаний.
 - [ ] **В тексте `steps`/`branches` нет латинских id** (квестов/локаций/NPC) — ссылки на другие квесты через `next_quest_id` или словами, призрачных «ветка <id>» нет.
 - [ ] Сюжет можно прогнать через `scripts/check_plot.py` — он выдаёт «✓ все проверки пройдены» (или список нарушений, которые нужно исправить).
+- [ ] **Структура по схеме** (строгая проверка с сессии 39, `check_plot.PLOT_SCHEMA`): все обязательные поля на месте и имеют правильный тип — `metadata` (9 полей, включая `start_location_id`), `lore_articles[{title,content}]`, `lore_text`, `factions[{id,name,desc}]`, `starting_state` (`gold` — целое, `inventory[{name,qty}]`, `locations[{id,name,desc}]`, `npcs[{id,name}]`, `shops[{id,name,items[{name,price}]}]`), `story` (`opening`, `quest_chains[{id,title,desc,status}]`, `acts[].chapters[{id,title}]`), `plot_text`, `handoff_directives`. Свои поля добавлять можно — схема их не трогает; `next_quest_id` допускается `null`.
 
 **Соответствие движку:**
 **Соответствие движку:**

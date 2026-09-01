@@ -122,7 +122,8 @@ async def ensure_collection(name: str | None = None) -> str:
     cid = str(created.get("id") or "") if created else ""
     if not cid:
         cols = await _raw("GET", _collections_url()) or []
-        cid = str(next((c for c in cols if c.get("name") == name), {}).get("id", ""))
+        found = next((c for c in cols if isinstance(c, dict) and c.get("name") == name), None)
+        cid = str((found or {}).get("id") or "")
     if cid:
         _collections[name] = cid
     return cid

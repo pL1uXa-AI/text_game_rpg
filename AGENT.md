@@ -422,14 +422,20 @@ python -X utf8 -m pytest
 #    test_session34_* (перемотка/фичи), test_session35_bugfixes (баг-хант 34),
 #    test_session36_bugfixes (аудит 36: реестр хода и барьер регена, split_engine/стрим без протечек,
 #      divine (кулдаун/промпт/лог выдач), импорт и схема игрока, маска ключей в дампе и в ошибке LLM,
-#      лимитированные выборки, ротация метрик, _run-таймаут, lifespan, jsAttr, BM25-кламп, Edge-ретраи)
+#      лимитированные выборки, ротация метрик, _run-таймаут, lifespan, экранирование ключей
+#      (с с39 — делегат data-click вместо onclick/jsAttr), BM25-кламп, Edge-ретраи)
 
 # 4. Регрессия механики (чистый Python, без сервера)
 python -X utf8 scripts/test_directives.py               # 35+ мусорных директив, снапшот-тик, кубы, db.transaction()
 
 # 4a. Проверка фронтенда без браузера (node --check + сверка id-ссылок с разметкой
-#     + экранирование ключей в onclick (jsAttr roundtrip в node) + скан CJK-мусора)
+#     + E1: запрет inline-onclick, сверка data-click↔CLICK_ACTIONS, roundtrip attrArg в node
+#     + E6: адаптивность (@media, выдвижная панель, 44px, 16px) + скан CJK/омоглифов)
 python -X utf8 scripts/check_frontend.py
+
+# 4a2. Проверка батников (D11): переносимость python/PY, только 127.0.0.1, health-check
+#      по HTTP-коду, port 8002 согласован с фронтом
+python -X utf8 scripts/check_start_bat.py
 
 # 4b. Проверка сюжетов-миров (plots/*.js) по правилам PLOTS.md
 python -X utf8 scripts/check_plot.py plots/system/*.js plots/user/*.js  # призрачные id, дубли new_locations, false-флаги, статусы, лор
@@ -549,17 +555,26 @@ git status --short | grep -E "^A.*\.env($|\b)"        # пусто (.env не в
 
 ### Контроль качества (актуально)
 
-- `python -X utf8 -m pytest` → **495 тестов** (было 388 до сессии 38): +
-  `test_session38_bugfixes.py` (баги игрока/API/конфига/доков) и
-  `test_session38_layers.py` (инварианты слоёв: A9, D6–D10).
+- `python -X utf8 -m pytest` → **523 теста** (было 495 на конец сессии 38; +28 в
+  сессии 39, из них 27 — новый файл):
+  `test_session38_bugfixes.py` (баги игрока/API/конфига/доков),
+  `test_session38_layers.py` (инварианты слоёв: A9, D6–D10) и
+  `test_session38_tails.py` (27 тестов закрытия хвостов 38: E1-делегат, E6-адаптивность,
+  E7-динамические id, D5-типы, D11-bat-чекер, D15-схема, B1-мусор вне git — с
+  degradation-пробами «вернули плохое → поймали»).
 - `ruff check backend scripts tests` — 0. `F401` больше НЕ заглушён глобально: у фасада
   `narrator.py` явный `__all__`, ruff сам различает реэкспорт и мёртвый импорт (D2).
 - `mypy -p backend` — **только так**: `mypy backend` в проекте не работает (нет
   `backend/__init__.py`, implicit namespace packages) и ровно поэтому шаг CI с сессии 34
   ничего не проверял (D4). `__init__.py` не заводим — он меняет запуск
-  `python -m uvicorn backend.app:app`. Строгость (`check_untyped_defs`) сознательно выключена;
-  остатки замечаний — Optional-цепочки aiosqlite `Row|None` в старых модулях (D5).
-- `scripts/test_directives.py` (4/4), `check_plot.py`, `check_frontend.py`, `check_typos.py`.
+  `python -m uvicorn backend.app:app`. **С сессии 39 `check_untyped_defs = true` и прогон чист**
+  (хвост D5): Optional-цепочки aiosqlite `Row|None` разобраны через помощники
+  `db._one_row/_as_dict/_rowid`, которые валят `LookupError` вместо тихого `int(None)`;
+  `# type: ignore` — 3 осознанных места, их число сторожит тест.
+- `scripts/test_directives.py` (4/4), `check_plot.py` (в т.ч. строгая `PLOT_SCHEMA`),
+  `check_frontend.py` (id-ссылки + E1-делегат + E6-адаптивность + CJK/омоглифы),
+  `check_start_bat.py` (D11: bat-переносимость, bind, health-check по HTTP-коду),
+  `check_typos.py`.
 - CI: `ruff check backend scripts tests`, `mypy -p backend`, скан секретов по правилу 15
   (`sk-[A-Za-z0-9]{12,}`, по индексу + запрет `.env*` в `git ls-files`).
 
@@ -574,6 +589,14 @@ data-атрибуты), E6 (мобильная адаптивность), E7 (я
 check_frontend), B1/B3 (удаление `.env.bak*` и мусора рабочей копии — нужно твоё разрешение;
 в git они никогда не были), D5 (остатки mypy в старых модулях — сигнальные разобраны),
 D15 (строгая JSON-схема в check_plot — реестр битых файлов и плашка в UI сделаны).**
+
+> **Состояние хвостов на сегодня (сессия 39):** закрыты E1, E6 (минимум по формулировке
+> пункта), E7, D5 (mypy чист при `check_untyped_defs = true`), D13-хвост (`setup_tts.bat`),
+> D15-хвост (строгая `PLOT_SCHEMA`) и структурная часть D11 (`scripts/check_start_bat.py`).
+> Открыты три: остаток D11 (живой `cmd /c`-харнесс — исполнять bat в CI нельзя: он поднимает
+> сервер и жмёт `pause`), B1/B3 (удаление мусора — нужен ответ владельца) и живой сюжет в
+> `plots/user/`. Подробности и приёмы — в ROADMAP (секция «Сводка сессии 39»); проверки —
+> `tests/test_session38_tails.py` (включая деградационные пробы).
 
 Файл `ISSUES_AUDIT_SESSION38.md` (доказательства по пунктам) удалён по указанию владельца
 после переноса выводов: свёрнутый разбор — ниже в этом разделе, хронология сессий 4–37 —
@@ -611,13 +634,17 @@ D15 (строгая JSON-схема в check_plot — реестр битых ф
   мёртвые тернарники, `chroma add()` перестал плодить коллекции, `bus` — импорт из горячего
   except и протечка ключей, `.bat` переносимы и health-check сведён к коду ответа,
   соглашение `plots/*.js` документировано; битые файлы видны в UI (SCAN_ERRORS + /api/plots/errors),
-  но строгая JSON-схема полей — открытый хвост (ROADMAP).
+  строгая JSON-схема полей — закрыта в сессии 39 (`check_plot.PLOT_SCHEMA` + рекурсивный
+  `_tcheck`, без внешних зависимостей: битый по полям, но валидный JSON не проходит и уходит
+  в ту же плашку `plots_errors`).
 - **Фронтенд (E2, E3, E4, E5, E8)**: экранирование подстановок из пользовательских файлов и
   импортированных дампов (XSS-поверхность, E2), дедюп сообщений по `id` (раньше второе
   служебное терялось, E3), поллинг как фолбэк — не долбит API при живой ленте (E4), удаление
-  мёртвого поля с ключами (E5), разбор мёртвых id в разметке (E8). **E1/E6/E7 — открыты**
-  (см. список выше и ROADMAP): 15 `onclick`-литералов сейчас корректны, но держатся на
-  дисциплине и regex-чекере, а не на делегате с data-атрибутами.
+  мёртвого поля с ключами (E5), разбор мёртвых id в разметке (E8). **E1/E6/E7 закрыты в
+  сессии 39**: 15 `onclick`-литералов вынесены в `data-click`/`data-arg` с одним делегатом на
+  `document` (реестр `CLICK_ACTIONS`, тип аргумента — по `CLICK_NUMERIC`), `jsAttr()` удалена;
+  whitelist динамических id стал словарём с обоснованием и проверяется в обе стороны;
+  появилась минимальная адаптивность (4 `@media`, выдвижная панель мира).
 
 
 ---

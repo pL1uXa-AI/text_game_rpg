@@ -474,13 +474,13 @@ def ensure_knowledge_cards(world_id: int, setting: dict, seq: int = 0,
                 continue
             built_c = next((c for c in CLASSES if c["name"].lower() == key.lower()), None)
             out.append(_upsert_knowledge(world_id, "class", key, origins, seq, name=key,
-                                         summary=(built_c.get("desc") if built_c else "")[:200],
+                                         summary=(str(built_c.get("desc") or "") if built_c else "")[:200],
                                          meta={"rank": rank, "stat": built_c.get("stat") if built_c else ""}))
         if prof:
             built_p = next((pf for pf in PROFESSIONS if pf["name"].lower() == prof.lower()), None)
             buff = p.get("profession_buff") or (built_p.get("buff") if built_p else None) or {}
             out.append(_upsert_knowledge(world_id, "profession", prof, origins, seq, name=prof,
-                                         summary=(built_p.get("desc") if built_p else "")[:200],
+                                         summary=(str(built_p.get("desc") or "") if built_p else "")[:200],
                                          meta={"buff": buff or {}}))
         for name, sk in (p.get("skills") or {}).items():
             if isinstance(sk, dict):

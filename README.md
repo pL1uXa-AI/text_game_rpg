@@ -228,7 +228,8 @@ text_game/
 ├── data/                    # ЛОКАЛЬНЫЕ данные (вся папка в .gitignore): game.db, chroma/, chroma-venv/,
 │                            #   tts/, fastembed/, backups/ (снимки game.db), metrics.jsonl
 └── scripts/                 # setup_env.bat (окружение с нуля), setup_tts.bat, start_chroma.bat,
-                             #   check_plot.py (валидатор сюжета), check_frontend.py (фронт без браузера),
+                             #   check_plot.py (валидатор сюжета + строгая схема полей), check_frontend.py (фронт без
+                             #   браузера: id-ссылки, делегат data-click, адаптивность), check_start_bat.py (батники),
                              #   test_directives.py (регрессия механики), smoke_tts.py,
                              #   smoke_session36.py (живой smoke фиксов сессии 36 на порту 8002)
 ```

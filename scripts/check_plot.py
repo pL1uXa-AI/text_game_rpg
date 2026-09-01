@@ -19,6 +19,9 @@
   [11] faction у NPC/магазинов — определена в factions;
   [12] lore_articles и lore_text согласованы по заголовкам (warning);
   [13] narrator (рекомендуемый рассказчик сюжета) — имя существует в plots/narrators/*.js (warning).
+  [14] D15-хвост (сессия 38): СТРОГАЯ СТРУКТУРА — типы и обязательные поля каждого блока
+       (метаданные, лор, фракции, стартовое состояние, главы, квесты). Битый по полям,
+       но валидный JSON раньше проходил молча: движок просто не получал сущностей.
 
 Возвращает код 0 при полном соответствии, 1 при нарушениях (выводит список),
 2 при неверном вызове.
@@ -39,6 +42,115 @@ REQUIRED_TOP = {"metadata", "lore_articles", "lore_text", "factions",
 def _ids(items, key: str) -> set:
     return {str(x.get("id") or "").strip() for x in items
             if isinstance(x, dict) and str(x.get("id") or "").strip()}
+
+
+# ── [14] декларативная схема сюжета (D15-хвост) ────────────────────────────────────────
+# Обозначения: str/int/num/bool/dict/list — тип; список вида [..] проверяет ЭЛЕМЕНТЫ;
+# "?" в имени поля = необязательное. Всё, чего нет в этой таблице, — не ошибка
+# (сюжет может нести свои поля, закон 1: код не диктует автору содержание).
+_S = str
+_I = int
+
+
+def _type_name(t) -> str:
+    return {str: "строка", int: "целое", float: "число", bool: "true/false",
+            dict: "объект {}", list: "список []"}.get(t, type(t).__name__)
+
+
+def _tcheck(val, spec, path: str, bad) -> None:
+    """Рекурсивно сверяет значение с элементом схемы, собирая тексты нарушений."""
+    if isinstance(spec, tuple):                 # (тип, ...) — разрешено несколько типов
+        if not isinstance(val, spec):
+            bad(f"{path}: должно быть {' или '.join(_type_name(s) for s in spec)}, "
+                f"а там {_type_name(type(val))}")
+            return
+    if isinstance(spec, list):                   # список элементов по одному образцу
+        if not isinstance(val, list):
+            bad(f"{path}: должно быть списком, а там {_type_name(type(val))}")
+            return
+        if len(spec) != 1:
+            bad(f"{path}: схема списка должна содержать ровно один образец")
+            return
+        for i, item in enumerate(val):
+            _tcheck(item, spec[0], f"{path}[{i}]", bad)
+        return
+    if isinstance(spec, dict):                   # объект с обязательными полями
+        if not isinstance(val, dict):
+            bad(f"{path}: должно быть объектом, а там {_type_name(type(val))}")
+            return
+        for key, sub in spec.items():
+            opt = key.endswith("?")
+            k = key.rstrip("?")
+            if k not in val:
+                if not opt:
+                    bad(f"{path}: нет обязательного поля «{k}» (в сюжете возможны свои поля, "
+                        f"эти читает движок)")
+                continue
+            _tcheck(val[k], sub, f"{path}.{k}", bad)
+        return
+    if spec is _S:
+        if not isinstance(val, str) or not val.strip():
+            bad(f"{path}: ожидается непустая строка, а там {_type_name(type(val))} "
+                f"{val!r:.60}")
+    elif spec is _I:
+        if isinstance(val, bool) or not isinstance(val, int):
+            bad(f"{path}: ожидается целое, а там {_type_name(type(val))}")
+    elif spec == "num":
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            bad(f"{path}: ожидается число, а там {_type_name(type(val))}")
+    elif spec == "str_or_null":       # строка либо null (конец цепочки — легальное значение)
+        if val is not None and (not isinstance(val, str) or not val.strip()):
+            bad(f"{path}: ожидается строка или null, а там {_type_name(type(val))}")
+    elif spec == "any":
+        return
+    elif not isinstance(val, spec):
+        bad(f"{path}: ожидается {_type_name(spec)}, а там {_type_name(type(val))}")
+
+
+PLOT_SCHEMA: dict = {
+    "metadata": {
+        "name": _S, "genres": [_S], "difficulty": _S, "perspective": _S,
+        "language": _S, "logline": _S, "global_goal": _S, "unique_features": _S,
+        "start_location_id": _S,
+    },
+    "narrator?": _S,
+    "lore_articles": [{"title": _S, "content": _S, "core?": bool, "tags?": _S}],
+    "lore_text": _S,
+    "factions": [{"id": _S, "name": _S, "desc": _S, "alignment?": _S, "relations?": dict}],
+    "starting_state": {
+        "gold": _I,
+        "inventory": [{"name": _S, "qty": _I, "desc?": _S, "weight?": "num"}],
+        "start_time?": _S, "start_weather?": _S,
+        "locations": [{"id": _S, "name": _S, "desc": _S, "connections?": [_S],
+                       "stations?": [_S]}],
+        "npcs": [{"id": _S, "name": _S, "mood?": _S, "desc?": _S, "faction?": _S,
+                  "money?": _I, "schedule?": dict}],
+        "shops?": [{"id": _S, "name": _S, "owner?": _S, "faction?": _S, "location?": _S,
+                    "items": [{"name": _S, "price": "num", "qty?": _I, "value?": "num",
+                               "weight?": "num", "desc?": _S}]}],
+        "flags?": dict,
+    },
+    "story": {
+        "opening": _S,
+        "quest_chains": [{"id": _S, "title": _S, "desc": _S, "status": _S,
+                          "steps?": [_S], "branches?": dict,
+                          "next_quest_id?": "str_or_null"}],
+        "acts": [{"id": _S, "title": _S, "summary?": _S,
+                  "chapters": [{"id": _S, "title": _S, "summary?": _S,
+                                "key_quests?": [_S], "key_npcs?": [_S],
+                                "new_locations?": [_S], "key_flags_to_set?": dict,
+                                "suggested_directives?": "any"}]}],
+        "difficulty_and_scaling?": {"note?": _S},
+    },
+    "plot_text": _S,
+    "handoff_directives": "any",
+    "id?": _S,
+}
+
+
+def schema_check(d, bad) -> None:
+    """[14] сверка структуры файла сюжета с PLOT_SCHEMA (без внешних библиотек)."""
+    _tcheck(d, PLOT_SCHEMA, "plot", bad)
 
 
 def check(path: Path) -> int:
@@ -207,6 +319,9 @@ def check(path: Path) -> int:
         if rec_narr not in known:
             warns.append(f"narrator '{rec_narr}' не найден среди пресетов plots/narrators/*.js — "
                          f"поле не подставится при выборе сюжета (известные: {sorted(known)[:8]})")
+
+    # [14] строгая структура (D15-хвост): битый по полям, но валидный JSON больше не проходит
+    schema_check(d, bad)
 
     # ── вывод ──
     if errs:

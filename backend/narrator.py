@@ -646,7 +646,9 @@ def format_state(setting: dict) -> str:
         lines.append("Статистика пути: " + "; ".join(f"{k} {v}" for k, v in list(progress.items())[:12]))
     achievements = p.get("achievements") or []
     if achievements:
-        lines.append("🏆 Достижения: " + "; ".join((a.get("name") if isinstance(a, dict) else str(a)) for a in achievements[:10]))
+        lines.append("🏆 Достижения: " + "; ".join(
+            str(a.get("name") or a) if isinstance(a, dict) else str(a)
+            for a in achievements[:10]))
     titles = p.get("titles") or []
     if titles:
         lines.append("Титулы: " + ", ".join(str(t) for t in titles[:8]))
@@ -683,9 +685,11 @@ def format_state(setting: dict) -> str:
             mods = ef.get("mods") or {}
             if mods and isinstance(mods, dict):
                 tick_txt += ", моды: " + ", ".join(f"{k}{v:+}" for k, v in mods.items())
-            kind = (ef.get("kind") or "").strip()
-            dsc = str(ef.get("desc") or "").strip()
-            desc_txt = f" — {dsc[:70]}" if dsc else ""
+            kind = str(ef.get("kind") or "").strip()
+            # D5: НЕ dsc — выше по функции под этим именем живёт dict масштабирования
+            # сложности; прежнее затирание имени мюпи ловил как «str в dict».
+            edesc = str(ef.get("desc") or "").strip()
+            desc_txt = f" — {edesc[:70]}" if edesc else ""
             base = f"{label}{desc_txt}"
             parts.append(f"{base} ({kind}, {dur}{tick_txt})" if kind else f"{base} ({dur}{tick_txt})")
         lines.append("Эффекты: " + "; ".join(parts))
@@ -2235,9 +2239,14 @@ GAME_ENGINE_TOOL = [{"type": "function", "function": {
 }}]
 
 
-def use_tools_for_provider(prov: dict) -> bool:
-    """Включаем tool-calling только для надёжных OpenAI-совместимых провайдеров."""
-    return bool(prov) and prov.get("enabled", True) and prov.get("id") == "openai_compat"
+def use_tools_for_provider(prov: dict | None) -> bool:
+    """Включаем tool-calling только для надёжных OpenAI-совместимых провайдеров.
+
+    D5: параметр допускает None — вызовы идут из мест, где снимок провайдера мог не
+    заполниться (per-world настройки старых миров), и `bool(prov)` уже это обрабатывает."""
+    if not prov:
+        return False
+    return bool(prov.get("enabled", True)) and prov.get("id") == "openai_compat"
 
 
 async def llm_json_tool(messages: list[dict], tool_name: str, tool_desc: str,

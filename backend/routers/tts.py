@@ -56,7 +56,8 @@ async def world_tts_settings_set(world_id: int, body: TtsSettingsIn):
     if body.auto_play is not None:
         ov["auto_play"] = body.auto_play
     db.update_world(world_id, tts_settings=ov)
-    return {"ok": True, "effective": tts.tts_effective(db.get_world(world_id)), "overrides": ov}
+    w = db.get_world(world_id) or {}   # D5: мир мог уйти между проверкой и ответом
+    return {"ok": True, "effective": tts.tts_effective(w), "overrides": ov}
 
 
 @router.post("/api/tts/test")
