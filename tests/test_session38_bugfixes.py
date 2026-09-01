@@ -847,3 +847,36 @@ def test_check_frontend_passes():
                         str(ROOT / "scripts" / "check_frontend.py")],
                        cwd=str(ROOT), capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-500:]
+
+
+def test_prompt_rules_numbering(fake_config):
+    """C1: нумерация правил рассказчика обязана быть без дырок и без «уезжающих» номеров.
+
+    Дефект был двусторонний: (а) правило 29 выдавалось только при canon_note → «…28, 30…»,
+    (б) части одного правила склеивались через запятую и каждое получало свой номер
+    («30. …, 31. срок)»). Ярусы промпта (_GATED_RULES/trim_prompt) ключуются НОМЕРАМИ,
+    поэтому любая дырка/сдвиг = молчаливое вырезание не того правила."""
+    import re
+    # Ярусы промпта ВЫКЛЮЧЕНЫ: они легально вырезают правила мёртвых
+    # подсистем (инвариант 10 в AGENT.md) — «дырка» в этом случае не дефект.
+    fake_config(prompt_tiers_enabled=False)
+    st = {"player": {"hp": 50, "max_hp": 50, "mp": 10, "max_mp": 10, "gold": 0, "level": 1,
+                     "stats": {}, "inventory": [], "race": "человек", "class": "Воин",
+                     "profession": "Кузнец", "skills": {"меч": {"rank": "D"}}},
+          "locations": {}, "npc": {}, "quests": {}, "flags": {}}
+    for canon in ("", "Город N под договором."):
+        w = {"id": 1, "name": "t", "language": "ru", "genre": "фэнтези",
+             "difficulty": "normal", "perspective": "second",
+             "theme": {"name": "T", "genre": "фэнтези", "canon_note": canon},
+             "setting": json.dumps(st), "gen_settings": json.dumps({"max_tokens": 2000})}
+        for tools in (False, True):
+            p = narrator_mod.build_system_prompt(w, st, use_tools=tools, action="")
+            nums = [m.group(1) for m in re.finditer(r"^(\d+[а-я]?)\.\s", p, re.M)]
+            plain = sorted(int(x) for x in nums if x[-1].isdigit())
+            assert plain == list(range(1, max(plain) + 1)), \
+                f"номера правил с дыркой (canon={bool(canon)}, tools={tools}): {plain}"
+            assert max(plain) == 36, f"хвост правил уехал (canon={bool(canon)}): {max(plain)}"
+            # подстроки правил не должны дублировать заголовки других правил (trim режет
+            # строку по номеру — дубль заголовка вернул бы вырезанное правило обратно)
+            assert p.count("ФРАКЦИИ → ПУТЬ ИГРОКА") == 1, \
+                "маркер правила 26 продублирован в другом правиле"
