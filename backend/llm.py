@@ -38,6 +38,23 @@ def _bg_retries() -> int:
     return _retry_conf()[0]
 
 
+# Тело ответа провайдера попадает в текст ошибки (и дальше в лог/UI). Редко, но провайдер
+# может вернуть эхо заголовка/ключа — наружу он обязан уйти замаскированным (правило 3).
+_KEY_TOKEN_RE = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
+_BEARER_RE = re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._\-]{6,})")
+
+
+def _safe_body(body, limit: int = 400) -> str:
+    """Короткий фрагмент тела ответа без секретов (маска вместо ключей)."""
+    try:
+        text = body if isinstance(body, str) else str(body, "utf-8", "replace")
+    except Exception:
+        return "<не разбирается>"
+    text = _KEY_TOKEN_RE.sub("***", text)
+    text = _BEARER_RE.sub(lambda m: m.group(1) + "***", text)
+    return text[:limit]
+
+
 def _backoff_delay(attempt: int) -> float:
     import random
     base = _retry_conf()[1]
@@ -255,7 +272,7 @@ async def complete(messages: list[dict], temperature: float = 0.8, max_tokens: i
     async def _attempt():
         resp = await _get_client().post(url, json=payload, headers=headers)
         if resp.status_code >= 400:
-            raise RuntimeError(f"LLM HTTP {resp.status_code} ({prov['id']}): {resp.text[:400]}")
+            raise RuntimeError(f"LLM HTTP {resp.status_code} ({prov['id']}): {_safe_body(resp.text)}")
         return resp
 
     resp = await with_retries(_attempt, what=f"LLM complete ({prov['id']})")
@@ -311,7 +328,7 @@ async def stream_chat(messages: list[dict], temperature: float = 0.8, max_tokens
             async with _get_client().stream("POST", url, json=payload, headers=headers) as resp:
                 if resp.status_code >= 400:
                     body = await resp.aread()
-                    raise RuntimeError(f"LLM HTTP {resp.status_code} ({prov['id']}): {body[:400]}")
+                    raise RuntimeError(f"LLM HTTP {resp.status_code} ({prov['id']}): {_safe_body(body)}")
                 async for line in resp.aiter_lines():
                     if not line or not line.startswith("data:"):
                         continue

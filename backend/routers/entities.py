@@ -7,7 +7,10 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 
 from .. import chroma_client, db, narrator
+from ..logsetup import get_logger
 from ..schemas import EntityIn
+
+log = get_logger(__name__)
 
 router = APIRouter(tags=["Карточки сущностей"])
 

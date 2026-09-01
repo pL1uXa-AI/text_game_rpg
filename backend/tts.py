@@ -330,14 +330,10 @@ def _synth_kokoro(text: str, voice: str, speed: float) -> bytes:
 
 # ═══════════ Движок: Edge (облако, edge-tts) ═══════════
 
-async def _synth_edge(text: str, voice: str, rate: str) -> bytes:
+async def _synth_edge_once(text: str, voice: str, rate: str) -> bytes:
     import edge_tts
-    if voice not in EDGE_VOICES:
-        # разрешаем любой голос edge (например, свои ru-RU-… Neural)
-        pass
     # Сервис Microsoft требует явный знак в rate («+0%», а не «0%») — иначе «Invalid rate '0%'»
-    rate = _norm_rate(rate)
-    comm = edge_tts.Communicate(text, voice, rate=rate)
+    comm = edge_tts.Communicate(text, voice, rate=_norm_rate(rate))
     out = b""
     async for chunk in comm.stream():
         if chunk["type"] == "audio":
@@ -345,6 +341,37 @@ async def _synth_edge(text: str, voice: str, rate: str) -> bytes:
     if not out:
         raise RuntimeError("Edge TTS вернул пустой аудио-поток")
     return out
+
+
+def _edge_transient(err: BaseException) -> bool:
+    """Edge-TTS бросает СВОИ исключения (edge_tts.exceptions.*): «нет аудио», неожиданный
+    ответ веб-сокета, обрыв — всё это лечится повтором (сессия 36, п.28), но в общих
+    текстовых признаках is_transient не опознаётся. Дополняем, а не подменяем."""
+    from .retry import is_transient
+    try:
+        import edge_tts.exceptions as _ex
+        names = tuple(getattr(_ex, n) for n in
+                      ("NoAudioReceived", "UnexpectedResponse", "WebSocketError",
+                       "UnknownResponse", "SkewAdjustmentError")
+                      if isinstance(getattr(_ex, n, None), type))
+        if names and isinstance(err, names):
+            return True
+    except Exception:
+        pass
+    return is_transient(err)
+
+
+async def _synth_edge(text: str, voice: str, rate: str) -> bytes:
+    """Облачный Edge-синтез с повторами (сессия 36, п.28).
+
+    Microsoft-сервис периодически отдаёт 429/5xx/обрыв соединения — раньше это превращалось
+    в `tts_status=-1` и кнопку «⚠» у игрока, хотя обычный ретрай решаает проблему.
+    Локальные движки (Piper/Kokoro) не повторяем: у них нет сети.
+    """
+    from .retry import with_retries
+    return await with_retries(lambda: _synth_edge_once(text, voice, rate),
+                              what=f"Edge TTS ({voice})",
+                              transient_fn=_edge_transient)
 
 
 # ═══════════ Общий синтез ═══════════

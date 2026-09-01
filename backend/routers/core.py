@@ -42,12 +42,96 @@ _enemy_ai_busy: set[int] = set()
 # Фоновое разыгрывание видений/снов (сессия 32): один процесс на мир
 _vision_busy: set[int] = set()
 
-# Реестр событий последнего сыгранного хода (миров: список id). При перегенерации ↻ эти события
+# Реестр событий последнего сыгранного хода (мир: список id). При перегенерации ↻ эти события
 # удаляются и заменяются новыми — в истории не накапливаются «копии одного ответа». Хранится в
-# памяти (single-process uvicorn); после рестарта реген просто работает по-старому (append).
+# памяти, НО восстанавливается из БД при промахе (сессия 36, п.3B): раньше после рестарта
+# сервера реестр был пуст и ↻ работало «append» — в чате оставался второй комплект того же
+# хода, а состояние откатывалось к снапшоту → задвоение механики.
 # Фоновые события мира (динамические/судья) сюда НЕ попадают и перегенерацией не стираются.
 _turn_events: dict[int, list[int]] = {}
 _turn_seq: dict[int, int] = {}
+
+# «Барьер перегенерации» (сессия 36, п.3A) живёт в bg.py (`bg.regen_block` /
+# `bg.is_regenerating`): о нём должен помнить не только этот модуль, но и слой памяти
+# (memory.update_entity_cards пишет setting), а импорт core из memory создал бы цикл.
+# Здесь — тонкие обёртки: существующие места чтения и тесты обращаются к ним.
+
+
+def _regen_active(world_id: int) -> bool:
+    """Идёт ли для мира перегенерация (фоновым агентам писать нельзя)."""
+    return bg.is_regenerating(world_id)
+
+
+def _turn_registry(world_id: int, idx_seq: int) -> list[int]:
+    """id событий хода `idx_seq`, ПОДЛЕЖАЩИХ замене при перегенерации.
+
+    Быстрый путь — in-memory реестр, сформированный тем же процессом, что писал ход.
+    Если его нет/он промахнулся (рестарт сервера) — набор собирается из БД по метке
+    `meta.turn` (= seq действия игрока): события одного хода лежат в нескольких seq
+    (действие → кубы → ответ → системки), а рядом с ними — фоновые события мира,
+    поэтому диапазон seq не различает «свои» и «чужие», а метка различает.
+    Раньше после рестарта реестр был пуст и ↻ работало «append»: в чате оставался
+    второй комплект того же хода, а состояние откатывалось к снапшоту → задвоение
+    механики.
+
+    Метку носят только НОВЫЕ ходы. Для миров, записанных до неё (живые сохранения),
+    — консервативный фолбэк: нарратив/кубы в пределах нескольких seq после действия,
+    без системок (среди них фоновые события мира) и без 🌙-видений. Худший исход
+    такого случая — осевшие в чате старые системные сообщения хода, но не затирание
+    чужих событий.
+    """
+    cached = _turn_events.get(world_id)
+    if _turn_seq.get(world_id) == idx_seq and cached is not None:
+        return list(cached)
+    try:
+        evs = db.get_turn_events(world_id, idx_seq, None,
+                                 roles=("narrator", "dice", "system"), unfolded_only=False)
+    except Exception as e:
+        log.warning("реестр хода из БД (world %s, seq %s): %s", world_id, idx_seq, e)
+        return []
+    ids = [e["id"] for e in evs
+           if isinstance(e.get("meta"), dict) and e["meta"].get("turn") == idx_seq]
+    if not ids:
+        # Консервативный фолбэк для миров, записанных ДО меты (живые сохранения
+        # пользователя): берём нарратив и кубы сразу за ходом, но СИСТЕМКИ не трогаем —
+        # среди них фоновые события мира, которые ↻ стирать нельзя. 🌙-видение тоже
+        # роль narrator, и оно фоновое — исключаем по префиксу.
+        lo, hi = idx_seq, idx_seq + 4        # действие + кубы + ответ + пара системок
+        ids = [e["id"] for e in evs
+               if lo < e["seq"] <= hi
+               and e["role"] in ("narrator", "dice")
+               and not str(e.get("content") or "").startswith("\U0001f319")]
+    if ids:
+        _turn_events[world_id] = ids
+        _turn_seq[world_id] = idx_seq
+    return ids
+
+
+def invalidate_turn_registry(world_id: int) -> None:
+    """Сбросить in-memory реестр хода (после перемотки/загрузки сохранения: те id событий
+    уже удалены или сокрыты, а следующий ↻ не должен опираться на устаревший набор)."""
+    _turn_events.pop(int(world_id), None)
+    _turn_seq.pop(int(world_id), None)
+
+
+def _bg_may_write(world_id: int, fresh: dict, marker: str, last: int, base_turns: int) -> bool:
+    """Может ли фоновый агент записать результат в мир (сессия 36, п.3A/п.17).
+
+    Три условия: не идёт перегенерация этого мира; его собственный маркер хода ещё не
+    обновлён другим процессом; и с момента, когда агент снял состояние, игрок не успел
+    сходить (иначе агент «дописал» бы мир поверх нового хода несвежими дельтами).
+    Проверяется СРАЗУ ПЕРЕД записью, между проверкой и записью await нет — в одном
+    цикле событий это атомарно.
+    """
+    if _regen_active(world_id):
+        log.debug("фон %s (world %s): идёт перегенерация — пропуск", marker or "agent", world_id)
+        return False
+    if int(fresh.get(marker, 0) or 0) > int(last or 0):
+        return False
+    if int(fresh.get("_player_turns", 0) or 0) > int(base_turns or 0):
+        return False
+    return True
+
 
 # Максимальная длина действия игрока (символов) — защита от многотысячного ввода,
 # который ломает токен-бюджет контекста. Эвристика: len/3.2 ≈ 200 токенов при 640.
@@ -230,8 +314,14 @@ def _gen_params(world: dict) -> dict:
 
 def _repetition_score(text: str) -> float:
     """Метрика качества (ИИ-качество): доля слов, повторяющихся внутри одного ответа.
-    Признак «деталей» рассказчика — если рассказчик зациклился/зациклился на одних фразах,
-    доля дубликатов растёт. 0..1, 0 = без повторов, >=0.4 ≈ заметная цикличность."""
+    Признак деградации рассказчика — если он зациклился на одних фразах, доля
+    дубликатов растёт. 0..1, 0 = без повторов, >=0.4 ≈ заметная цикличность.
+
+    ⚠ ИНВАРИАНТ (сессия 36, п.31): это МЕТРИКА для дашборда, а не цензор — на текст
+    ответа она не влияет. Завышается у стилистически повторяющихся моделей (короткие
+    предложения, рефрены, «ты/тебя» в каждом) — это ожидаемо, лечить порогами нельзя:
+    мера должна оставаться дешёвой и детерминированной.
+    """
     try:
         tokens = re.findall(r"[а-яА-Яa-zA-ZёЁ0-9]{3,}", (text or "").lower())
         if len(tokens) < 8:
@@ -297,7 +387,17 @@ _FINISH_CHARS = (".", "!", "?", "…", "\"", "»", "'", "”", "\n")
 def _looks_finished(text: str) -> bool:
     """Закончен ли ответ рассказчика (не оборван на полуслове/незакрытой мысли).
     Модель в tools-режиме иногда прерывает текст на вызове game_engine (roll) —
-    хвост остаётся оборванным («Ты идёшь к груде кам»)."""
+    хвост остаётся оборванным («Ты идёшь к груде кам»).
+
+    ⚠ ИНВАРИАНТ (сессия 36, п.31): решение по ПОСЛЕДНЕМУ символу — сознательная
+    эвристика, а не синтаксический анализ. Следствия, которые нельзя считать багами:
+      * ответ, обрезанный на `)`/`»` без точки, считается незаконченным → один лишний
+        LLM-проход `_finish_cut_reply` (дороже, но честнее, чем показать оборванный текст);
+      * короткие (<20 символов) ответы не трогаем вовсе — там обрыв вероятен меньше,
+        чем намеренная реплика.
+    Если «лишние проходы дописывания» станут заметны в метрике cut_mid — пороги правятся
+    ЗДЕСЬ, а не отключением механизма.
+    """
     t = (text or "").strip()
     if not t:
         return True
@@ -312,18 +412,49 @@ def _looks_finished(text: str) -> bool:
 
 def _dedupe_repeats(text: str) -> str:
     """Убирает ПОДРЯД идущие точные дубликаты абзацев/предложений (модель «зациклилась»:
-    один и тот же кусок написан дважды). Не трогает намеренные повторы (короткие фразы)."""
+    один и тот же кусок написан дважды). Не трогает намеренные повторы (короткие фразы).
+
+    ⚠ ИЗВЕСТНЫЕ КОМПРОМИССЫ (сессия 36, п.31) — это защита от деградации ответа, а не
+    лингвистический анализ, и «чинить» их агрессивно нельзя:
+      * сравнение строго соседнее (`b == out[-1]`), поэтому рефрен «A B A» сохраняется —
+        вырезается только дословный повтор подряд;
+      * порог len(b) >= 30: короткий рефрен («И всё замерло.») не трогается никогда, а
+        ДЛИННАЯ намеренная повторная фраза (рефрен-абзац ≥30 символов подряд) будет
+        вырезана. Это осознанная цена: ложный позитив здесь — cosmetic, а пропущенный
+        цикл модели игрок читает как сломанный вывод;
+      * блоки склеиваются разделителем: абзацы (разделитель — перевод строки) сохраняются
+        как абзацы, а предложения внутри абзаца склеиваются через пробел.
+    Если появится жалоба «рассказчик повторил фразу намеренно, а система её съела» —
+    пересматривать порог 30 или требовать точного совпадения всей ПАРЫ соседних абзацев,
+    а не молча отключать дедуп (иначе цикл модели вернётся в чат).
+    """
     t = (text or "").strip()
     if len(t) < 80:
         return text or ""
-    # блоки = абзацы или предложения
-    blocks = [b.strip() for b in re.split(r"(?<=\n)\s*|(?<=[.!?…])\s+", t) if b.strip()]
+    # split с сохраняющей группой даёт НЕ строгую чередёшку (между абзацами попадает
+    # несколько пустых совпадений), поэтому идём по кускам токен-проходом: кусок без
+    # непробельных символов — разделитель, остальное — блок.
+    pieces = re.split(r"((?<=\n)\s*|(?<=[.!?…])\s+)", t)
+    blocks: list[str] = []
+    seps: list[str] = []          # seps[i] — разделитель ПЕРЕД blocks[i]
+    pending = ""
+    for piece in pieces:
+        if not piece.strip():
+            pending += piece
+            continue
+        seps.append(pending)
+        blocks.append(piece.strip())
+        pending = ""
     out: list[str] = []
-    for b in blocks:
-        if out and len(b) >= 30 and b == out[-1]:
-            continue  # точный дубликат подряд — пропускаем повтор
-        out.append(b)
-    res = " ".join(out).strip()
+    dropped = 0
+    for i, b in enumerate(blocks):
+        if out and len(b) >= 30 and b == out[-1][1]:
+            dropped += 1
+            continue              # точный дубликат подряд — пропускаем и блок, и разделитель
+        out.append((seps[i], b))
+    if not dropped:
+        return text or ""         # ничего не убрали — не трогаем исходный текст
+    res = "".join(s + b for s, b in out).strip()
     return res if res else text or ""
 
 
@@ -334,6 +465,14 @@ async def _finish_cut_reply(world: dict, setting: dict, persona: str | None,
     При сбое возвращает исходный текст (ход не роняем)."""
     try:
         prov_main = providers["main"]
+        # Страховка (сессия 36, п.4): если в «оборванном» тексте всё ещё остался хвост
+        # механики (<<ENGINE>>/game_engine, в т.ч. недописанный), дописывать к нему нельзя —
+        # иначе служебный блок приклеится к прозе и уйдёт в чат. Режем от маркера до конца.
+        cut = narrator.find_engine_start(text)
+        if cut >= 0:
+            text = text[:cut].rstrip()
+        if not text.strip():
+            return text
         mech = "\n".join(sys_msgs).strip() if sys_msgs else ""
         tail = "\n\nПрименённая механика хода: " + mech if mech else ""
         msgs = [
@@ -365,7 +504,20 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
     B3 (сессия 34): тело оборачивается в `bg.player_turn()` — пока идёт ход, фоновые
     агенты (карточки/судья/мастер/боевой ИИ/события/видения) в очередь к модели не лезут.
     Раньше их пять-шесть стартовало сразу после ответа и «съедали» следующий ход игрока:
-    локальная llama.cpp обслуживает запросы по одному."""
+    локальная llama.cpp обслуживает запросы по одному.
+
+    Сессия 36, п.3A: на время перегенерации мир ставится в барьер `bg.regen_block` —
+    фоновые агенты старого хода (их директивы уже могли лечь в setting) не пишут в мир,
+    пока состояние откатано к снапшоту и пересчитывается заново. Иначе ↻ теряло/двоило
+    их механику."""
+    if regenerate:
+        with bg.regen_block(world_id) as acquired:
+            # мир уже под перегенерацией (задвоенный клик/ретрай) — не лезем вторым проходом
+            if not acquired:
+                raise HTTPException(409, "Перегенерация этого хода уже выполняется. Подожди.")
+            with bg.player_turn():
+                return await _process_action_inner(world_id, text, stream_emit=stream_emit,
+                                                   regenerate=regenerate)
     with bg.player_turn():
         return await _process_action_inner(world_id, text, stream_emit=stream_emit,
                                            regenerate=regenerate)
@@ -434,17 +586,14 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
     action_ctx = text
     if tick_msgs:
         action_ctx = "[Начало хода]\n" + "\n".join(tick_msgs) + "\n\n" + text
-    tmp = re.search(r"<<ENGINE>>", text, re.DOTALL)
     player_ev = None
     if regenerate:
         # ищем последнее действие игрока — под него индексируем новую версию ответа в памяти
         prev_player = db.get_latest_by_role(world_id, "player")
         idx_seq = prev_player["seq"] if prev_player else db.latest_seq(world_id)
-        # заменяем события прошлого хода (только если регенерируем именно последний ход)
-        if _turn_seq.get(world_id) == idx_seq:
-            replaced_ids = _turn_events.pop(world_id, [])
-        else:
-            replaced_ids = []
+        # заменяем события прошлого хода — по реестру, а при его отсутствии (после рестарта
+        # сервера) по БД: тот же ход обязан быть заменён, а не задвоен (сессия 36, п.3B)
+        replaced_ids = _turn_registry(world_id, idx_seq)
     else:
         player_ev = db.add_event(world_id, "player", text.replace("<<ENGINE>>", ""))
         idx_seq = player_ev["seq"]
@@ -499,22 +648,31 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
     llm_finish: dict = {}
     _t0 = time.monotonic()
     if stream_emit:
-        stopped = False
-        safe = ""
+        safe = ""                        # сколько текста уже отдано игроку
+        decided = False                  # служебный блок найден → текст больше не отдаём
         async for delta in llm.stream_chat(messages, provider=prov_main, tools=game_tools,
                                            tool_calls_out=tool_calls_out,
                                            finish_out=llm_finish, **params):
             full += delta
-            if not stopped:
-                idx = narrator.find_engine_start(full)
-                if idx >= 0:
-                    safe_part = full[: idx]
-                    if len(safe_part) > len(safe):
-                        await stream_emit(safe_part[len(safe):])
-                    safe = safe_part
-                    stopped = True
-                else:
-                    await stream_emit(delta)
+            if decided:
+                continue
+            idx = narrator.find_engine_start(full)
+            if idx >= 0:
+                # начало механики: дописываем прозу перед маркером и закрываем стрим текста
+                if idx > len(safe):
+                    await stream_emit(full[len(safe):idx])
+                safe = full[:idx]
+                decided = True
+                continue
+            # неразобранный хвост держим в буфере: «…идём к <» или «…game_eng» ещё может
+            # оказаться маркером, а показывать половину служебного блока нельзя (п.4)
+            cut = len(full) - narrator.engine_tail_hold(full)
+            if cut > len(safe):
+                await stream_emit(full[len(safe):cut])
+                safe = full[:cut]
+        # стрим закончился, а маркера не было — отдаём накопленный хвост целиком
+        if not decided and len(full) > len(safe):
+            await stream_emit(full[len(safe):])
     else:
         full = await llm.complete(messages, provider=prov_main, tools=game_tools,
                                 tool_calls_out=tool_calls_out, finish_out=llm_finish, **params)
@@ -548,7 +706,7 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
             if audit_out and audit_out[0].get("arguments"):
                 d2 = narrator.parse_tool_args(audit_out[0]["arguments"]) or {}
                 if d2:
-                    # Аудит авторитетен: если он вернул меx/директивы — используем их как основу,
+                    # Аудит авторитетен: если он вернул мех/директивы — используем их как основу,
                     # сохраняя только roll (брошенный рассказчиком) поверх.
                     kept = {k: v for k, v in (directives or {}).items() if k == "roll"}
                     kept.update(d2)
@@ -604,7 +762,8 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
             dice_ev = db.add_event(world_id, "dice",
                                    f"🎲 Проверка «{label}»\nКуб: {expr}" + (f" +{mod}" if mod else "")
                                    + f" → {' '.join(map(str, res['rolls']))} = {total}\nСложность: {dc}\n"
-                                   + f"Итог: {emoji} {outcome}")
+                                   + f"Итог: {emoji} {outcome}",
+                                   meta={"turn": idx_seq})
             dice_events.append(dice_ev)
             roll_desc = await narrator.narrate_roll(world_id, label, expr, mod, dc, total,
                                                     outcome, world.get("language", "ru"),
@@ -654,7 +813,8 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
         if replaced_ids:
             db.delete_events_by_id(world_id, replaced_ids)
         narrator_ev = db.add_event(world_id, "narrator", final_text,
-                                   meta={"memory_used": memory_used} if memory_used else None)
+                                   meta={"memory_used": memory_used, "turn": idx_seq}
+                                   if memory_used else {"turn": idx_seq})
 
         # ── Озвучка (TTS): фоновый синтез, не блокирует ответ. Статус 1 = «в работе» ──
         try:
@@ -667,11 +827,15 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
             log.warning("TTS-задача (world %s, seq %s): %s", world_id, idx_seq, e)
 
         # Системные сообщения (урон/предметы/квесты...)
-        system_events = [db.add_event(world_id, "system", m) for m in tick_msgs + sys_msgs]
+        # meta.turn — метка хода: по ней перегенерация находит СВОИ события после рестарта
+        # сервера (in-memory реестр к тому моменту пуст), не задевая фоновые системки мира.
+        system_events = [db.add_event(world_id, "system", m, meta={"turn": idx_seq})
+                         for m in tick_msgs + sys_msgs]
 
         db.update_world(world_id, setting=setting)
         if setting.get("game_over"):
-            db.add_event(world_id, "system", "💀 Игра окончена. Используй «сохранить слот» или создай новый мир.")
+            db.add_event(world_id, "system", "💀 Игра окончена. Используй «сохранить слот» или создай новый мир.",
+                         meta={"turn": idx_seq})
 
         # 🌐 Графовая БД: синхронизируем карту мира с актуальным состоянием локаций
         # (рёбра/connections) — атомарно, в той же транзакции хода. best-effort:
@@ -828,8 +992,6 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
         )
     except Exception as e:
         log.warning("метрики хода (world %s): %s", world_id, e)
-    except Exception as e:
-        log.warning("метрики хода (world %s): %s", world_id, e)
 
     return {
         "world_id": world_id,
@@ -889,9 +1051,13 @@ async def _maybe_logic_judge(world_id: int, setting: dict, action: str, reply: s
                                          provider=providers["main"])
         if not res:
             return
-        # свежее состояние: игрок мог успеть походить; не дублируем при активной игре
+        # свежее состояние: игрок мог успеть походить; не дублируем при активной игре.
+        # п.17/п.3A: отказ от записи и если идёт перегенерация того же хода, и если
+        # _player_turns сдвинулся (иначе судья перезаписал бы setting состоянием на
+        # момент своего чтения и «съел» ход игрока).
         s2 = json.loads(db.get_world(world_id)["setting"])
-        if (s2.get("_judge_last_turn", 0) or 0) > last:
+        if not _bg_may_write(world_id, s2, "_judge_last_turn", last, turns):
+            log.debug("судья (world %s): запись пропущена (перегенерация/новый ход)", world_id)
             return
         s2["_judge_last_turn"] = turns
         db.update_world(world_id, setting=s2)
@@ -902,12 +1068,16 @@ async def _maybe_logic_judge(world_id: int, setting: dict, action: str, reply: s
         corr_msgs: list[str] = []
         if res.get("corrections"):
             s3 = json.loads(db.get_world(world_id)["setting"])
-            try:
-                corr_msgs = narrator._apply_judge_corrections(s3, res["corrections"])
-                if corr_msgs:
-                    db.update_world(world_id, setting=s3)
-            except Exception as e:
-                log.warning("применение корректировок судьи (world %s): %s", world_id, e)
+            # перечитали состояние — снова сверяемся: за время индекса игрок мог сходить
+            if not _bg_may_write(world_id, s3, "_judge_last_turn", turns, turns):
+                log.debug("судья (world %s): корректировки отложены (мир изменился)", world_id)
+            else:
+                try:
+                    corr_msgs = narrator._apply_judge_corrections(s3, res["corrections"])
+                    if corr_msgs:
+                        db.update_world(world_id, setting=s3)
+                except Exception as e:
+                    log.warning("применение корректировок судьи (world %s): %s", world_id, e)
         # индексируем искажение/поправку в память
         try:
             seq = db.latest_seq(world_id)
@@ -1005,7 +1175,9 @@ async def _maybe_dynamic_event(world_id: int) -> None:
         # свежее состояние: игрок мог успеть походить, пока генерировали; не задваиваем событие
         world2 = db.get_world(world_id)
         setting2 = json.loads(world2["setting"])
-        if (setting2.get("_event_last_turn", 0) or 0) != last_turn:
+        if not _bg_may_write(world_id, setting2, "_event_last_turn", last_turn, turns):
+            log.debug("событие мира (world %s): запись пропущена (перегенерация/новый ход)",
+                      world_id)
             return
         msgs = narrator.apply_directives(setting2, directives) if directives else []
         setting2["_event_last_turn"] = turns
@@ -1060,10 +1232,20 @@ async def _maybe_trigger_vision(world_id: int, setting: dict) -> None:
         if not txt:
             pv.insert(0, vision)  # не теряем видение при сбое
             return
+        # с момента чтения s прошло два LLM-прохода: перечитаем состояние и не затираем
+        # собой ход игрока/перегенерацию (сессия 36, п.17)
+        fresh = json.loads(db.get_world(world_id)["setting"])
+        if _regen_active(world_id) or int(fresh.get("_player_turns", 0) or 0) > \
+                int(s.get("_player_turns", 0) or 0):
+            log.debug("видение (world %s): запись пропущена (перегенерация/новый ход)", world_id)
+            return
+        fpv = fresh.get("pending_visions")
+        if isinstance(fpv, list) and fpv:
+            fpv.pop(0)
         content = f"🌙 Видение:\n{txt}"
         with db.transaction():
-            vis_ev = db.add_event(world_id, "narrator", content)
-            db.update_world(world_id, setting=s)
+            db.add_event(world_id, "narrator", content)
+            db.update_world(world_id, setting=fresh)
         try:
             seq = db.latest_seq(world_id)
             embed = _world_providers(db.get_world(world_id)).get("embedding")
@@ -1121,7 +1303,9 @@ async def _maybe_autonomous_master(world_id: int, setting: dict, action: str, re
         event_text, directives = res
         # свежее состояние: игрок мог успеть походить/мастер уже вмешался
         s2 = json.loads(db.get_world(world_id)["setting"])
-        if (s2.get("_master_last_turn", 0) or 0) > last:
+        if not _bg_may_write(world_id, s2, "_master_last_turn", last, turns):
+            log.debug("автономный мастер (world %s): запись пропущена (перегенерация/новый ход)",
+                      world_id)
             return
         s2["_master_last_turn"] = turns
         msgs = narrator.apply_directives(s2, directives) if directives else []
@@ -1141,10 +1325,8 @@ async def _maybe_autonomous_master(world_id: int, setting: dict, action: str, re
     except Exception as e:
         log.warning("_maybe_autonomous_master (world %s): %s", world_id, e)
         metrics.record_agent("master", (time.monotonic() - _t0) * 1000, world_id, ok=False)
-        _master_busy.discard(world_id)
-        return
     finally:
-        pass
+        _master_busy.discard(world_id)
 
 
 async def _maybe_enemy_ai(world_id: int, setting: dict, action: str, reply: str) -> None:
@@ -1183,7 +1365,9 @@ async def _maybe_enemy_ai(world_id: int, setting: dict, action: str, reply: str)
         eid, etext, mode, directives = res
         # свежее состояние: игрок мог добить/увести врагов; не вмешиваемся, если врагов уж нет
         s2 = json.loads(db.get_world(world_id)["setting"])
-        if (s2.get("_enemy_ai_last_turn", 0) or 0) > last:
+        if not _bg_may_write(world_id, s2, "_enemy_ai_last_turn", last, turns):
+            log.debug("боевой ИИ (world %s): запись пропущена (перегенерация/новый ход)",
+                      world_id)
             return
         if not narrator._living_enemies(s2):
             return

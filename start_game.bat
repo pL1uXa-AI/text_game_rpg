@@ -17,13 +17,22 @@ if %errorlevel% equ 0 (
 )
 
 REM 1. Проверка llama.cpp
-curl -s http://127.0.0.1:8080/v1/models >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [WARN] llama.cpp не отвечает на 127.0.0.1:8080 — игра без рассказа не поедет!
-    echo        Запусти сервер модели и повтори запуск.
-    pause
-    exit /b 1
-)
+REM Сервер модели может быть запущен с --api-key: тогда /v1/models без ключа отвечает 401,
+REM и «не нулевой errorlevel от curl» означал бы «llama.cpp мёртв» — игра отказывалась
+REM стартовать при живом сервере (сессия 36, п.14). Поэтому проверяем сам ФАКТ ответа:
+REM любой код меньше 500 (включая 401/404) = сервис отвечает, он живой.
+set "LLAMA_CODE=000"
+for /f "usebackq delims=" %%c in (`curl -s -o nul --max-time 5 -w "%%{http_code}" http://127.0.0.1:8080/v1/models`) do set "LLAMA_CODE=%%c"
+if "%LLAMA_CODE:~0,1%"=="5" goto llama_dead
+if "%LLAMA_CODE%"=="000" goto llama_dead
+echo [OK] llama.cpp отвечает на 127.0.0.1:8080 (HTTP %LLAMA_CODE%)
+goto llama_ok
+:llama_dead
+echo [WARN] llama.cpp не отвечает на 127.0.0.1:8080 — игра без рассказа не поедет!
+echo        Запусти сервер модели и повтори запуск.
+pause
+exit /b 1
+:llama_ok
 
 REM 2. Проверка своей ChromaDB (порт 8001)
 curl -s http://127.0.0.1:8001/api/v1/heartbeat >nul 2>&1

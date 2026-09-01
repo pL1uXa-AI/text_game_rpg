@@ -241,6 +241,35 @@ class _Scheduler:
 
 _sched = _Scheduler()
 
+# ── Барьер перегенерации (сессия 36, п.3A) ────────────────────────────
+# Пока для мира выполняется ↻, его setting ОТКАТЫВАЕТСЯ к снапшоту и пересчитывается
+# заново. Фоновые агенты (судья/мастер/боевой ИИ/события/видения/архивариус карточек),
+# начатые по состоянию ДО отката, в это окно писать в setting не должны — иначе их
+# директивы либо потеряются (их сотрёт откат), либо применятся дважды (откат + новый
+# ответ). Живёт здесь, а не в routers/core: про этот барьер должен помнить и слой
+# памяти (memory.py), а импорт core создал бы цикл импортов.
+_regen: set[int] = set()
+
+
+def is_regenerating(world_id: int) -> bool:
+    """Идёт ли сейчас перегенерация мира (фону писать в setting нельзя)."""
+    return int(world_id) in _regen
+
+
+@contextlib.contextmanager
+def regen_block(world_id: int):
+    """Занять барьер перегенерации. yield False, если мир уже перегенерируется
+    (двойной клик/ретрай) — вызывающий обязан выйти, ничего не трогая."""
+    wid = int(world_id)
+    if wid in _regen:
+        yield False
+        return
+    _regen.add(wid)
+    try:
+        yield True
+    finally:
+        _regen.discard(wid)
+
 
 def _as_factory(op):
     """Приводит аргумент к фабрике корутины.
@@ -299,6 +328,20 @@ def player_turn() -> Any:
 
 def stats() -> dict:
     return _sched.stats()
+
+
+def shutdown_nowait() -> None:
+    """Остановить воркеров фоновой очереди (штатное завершение сервера, сессия 36, п.30).
+
+    Незавершённые задачи отменяются: после закрытия БД/HTTP-клиентов они всё равно
+    упали бы, а так завершаются сразу и без «Task was destroyed but it is pending».
+    """
+    sched = _sched
+    for t in list(sched._worker_tasks):
+        t.cancel()
+    sched._worker_tasks.clear()
+    sched._workers = 0
+    sched.heap.clear()
 
 
 def reset() -> None:

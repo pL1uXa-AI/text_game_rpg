@@ -454,7 +454,7 @@ async function loadJournal() {
         ` <small>(верни в сюжет, когда уместно)</small>`;
     } else if (chk) { chk.style.display = "none"; chk.innerHTML = ""; }
     list.innerHTML = d.entries.length ? d.entries.map((e) =>
-      `<li class="item-clickable" onclick="scrollToSeq(${e.seq})" title="к ходу ${e.seq}">` +
+      `<li class="item-clickable" onclick="scrollToSeq(${numAttr(e.seq)})" title="к ходу ${e.seq}">` +
       `<small class="right">ход ${e.seq}</small>${esc(e.icon)} <b>${esc(e.title)}</b>` +
       (e.text ? `<small>${esc(e.text)}</small>` : ``) + `</li>`
     ).join("") : `<li class="muted">Пока пусто — дневник заполняется значимыми событиями (встречи, квесты, находки, смена роли).</li>`;
@@ -904,11 +904,11 @@ function renderSetting(s) {
     let tag = `${esc(q.title)}`;
     if (q.progress) tag += ` — <b>${esc(q.progress)}</b>`;
     if (q.chosen) tag += ` <small title="ветка">⎇ ${esc(q.chosen)}</small>`;
-    return `<li class="item-clickable ${q.status === "done" ? "done" : ""}" onclick="showQuest('${esc(k)}')">${q.status === "done" ? "✔ " : ""}${tag}${q.desc ? ` — ${trunc(q.desc, 90)}` : ""}</li>`;
+    return `<li class="item-clickable ${q.status === "done" ? "done" : ""}" onclick="showQuest('${jsAttr(k)}')">${q.status === "done" ? "✔ " : ""}${tag}${q.desc ? ` — ${trunc(q.desc, 90)}` : ""}</li>`;
   }).join("") || `<li>нет</li>`;
   $("shops-list").innerHTML = Object.entries(s.shops || {}).map(([k, sh]) => {
     const items = (sh.items || []).length;
-    return `<li class="item-clickable" onclick="showShop('${esc(k)}')">${sh.desc ? `<small class="right">${trunc(sh.desc, 80)}</small>` : ``}<b>${esc(sh.name || k)}</b>${sh.owner ? ` · ${esc(sh.owner)}` : ""}${sh.faction ? ` <small>${esc(factionName(sh.faction))}</small>` : ``}<small>товаров: ${items}</small></li>`;
+    return `<li class="item-clickable" onclick="showShop('${jsAttr(k)}')">${sh.desc ? `<small class="right">${trunc(sh.desc, 80)}</small>` : ``}<b>${esc(sh.name || k)}</b>${sh.owner ? ` · ${esc(sh.owner)}` : ""}${sh.faction ? ` <small>${esc(factionName(sh.faction))}</small>` : ``}<small>товаров: ${items}</small></li>`;
   }).join("") || `<li>нет</li>`;
   // крафт: помечаем «гот needs» и вовсе недоступные (нет станции/профессии/ингредиентов)
   $("crafts-list").innerHTML = Object.entries(s.crafts || {}).map(([k, c]) => {
@@ -919,10 +919,10 @@ function renderSetting(s) {
     if (c.profession) req += ` <small>⚒ ${esc(c.profession)}</small>`;
     const ready = craftReady(s, c);
     const icon = ready ? `<em class="val">✓</em>` : `<em class="val bad">✗</em>`;
-    return `<li class="item-clickable" onclick="showCraft('${esc(k)}')">${c.desc ? `<small class="desc">${trunc(c.desc, 80)}</small>` : ``}<b>${esc(c.name || k)}</b> → ${esc(res.name || "?")} ×${res.qty || 1} ${icon}${req}<small>${esc(ing || "без вложений")}</small></li>`;
+    return `<li class="item-clickable" onclick="showCraft('${jsAttr(k)}')">${c.desc ? `<small class="desc">${trunc(c.desc, 80)}</small>` : ``}<b>${esc(c.name || k)}</b> → ${esc(res.name || "?")} ×${res.qty || 1} ${icon}${req}<small>${esc(ing || "без вложений")}</small></li>`;
   }).join("") || `<li>нет</li>`;
   $("enemies").innerHTML = Object.entries(s.enemies || {}).map(([k, e]) =>
-    `<li class="item-clickable" onclick="showEnemy('${esc(k)}')">${e.desc ? `<small class="desc">${trunc(e.desc, 80)}</small>` : ``}⚔ ${esc(e.name)} — HP ${e.hp}/${e.max_hp}${e.money ? ` <em class="val">🪙${e.money}</em>` : ``}</li>`).join("") || `<li>нет</li>`;
+    `<li class="item-clickable" onclick="showEnemy('${jsAttr(k)}')">${e.desc ? `<small class="desc">${trunc(e.desc, 80)}</small>` : ``}⚔ ${esc(e.name)} — HP ${e.hp}/${e.max_hp}${e.money ? ` <em class="val">🪙${e.money}</em>` : ``}</li>`).join("") || `<li>нет</li>`;
   $("npc-list").innerHTML = Object.entries(s.npc || {}).map(([k, n]) => {
     let sch = "";
     const schedule = n.schedule;
@@ -933,10 +933,10 @@ function renderSetting(s) {
         if (t.includes(kk) || kk.includes(t)) { sch = ` <small class="sch">⏰ ${esc(act)}</small>`; break; }
       }
     }
-    return `<li class="item-clickable" onclick="showNpc('${esc(k)}')">${n.alive === false ? "🪦 " : "🗣 "}${esc(n.name)} (${trunc(n.mood || n.desc || "", 40)}${n.faction ? ", " + esc(factionName(n.faction)) : ""}${n.money ? ", 🪙" + esc(n.money) : ""})${sch}</li>`;
+    return `<li class="item-clickable" onclick="showNpc('${jsAttr(k)}')">${n.alive === false ? "🪦 " : "🗣 "}${esc(n.name)} (${trunc(n.mood || n.desc || "", 40)}${n.faction ? ", " + esc(factionName(n.faction)) : ""}${n.money ? ", 🪙" + esc(n.money) : ""})${sch}</li>`;
   }).join("") || `<li>нет</li>`;
   $("companions-list").innerHTML = Object.entries(s.companions || {}).map(([k, c]) =>
-    `<li class="item-clickable" onclick="showCompanion('${esc(k)}')">${c.hp <= 0 ? "💀 " : "🤝 "}<b>${esc(c.name || k)}</b> ⚔ ${c.hp}/${c.max_hp || c.hp} Lv${c.level || 1}${c.loyalty ? ` · верность ${esc(c.loyalty)}` : ""}<small>${trunc(c.desc, 80)}</small></li>`).join("") || `<li>нет</li>`;
+    `<li class="item-clickable" onclick="showCompanion('${jsAttr(k)}')">${c.hp <= 0 ? "💀 " : "🤝 "}<b>${esc(c.name || k)}</b> ⚔ ${c.hp}/${c.max_hp || c.hp} Lv${c.level || 1}${c.loyalty ? ` · верность ${esc(c.loyalty)}` : ""}<small>${trunc(c.desc, 80)}</small></li>`).join("") || `<li>нет</li>`;
   $("flags").innerHTML = Object.entries(s.flags || {}).map(([k, v], fi) =>
     `<span class="item-clickable flag-pill" onclick="showFlag(${fi})" title="${esc(k)}=${esc(JSON.stringify(v))}">🚩 ${esc(flagLabel(k))}: ${flagWord(v)}</span>`).join("") || `<span class="flags-none">нет</span>`;
   renderMap();
@@ -1253,9 +1253,21 @@ function renderMap() {
 }
 
 /* ─────────────── Варианты действий (кнопки) ─────────────── */
+let _sugReqInFlight = false;      // один запрос пересчёта подсказок за раз
+let _sugReqAt = 0;                // когда был последний (защита от шторма при ↻ подряд)
+const _SUG_MIN_INTERVAL_MS = 4000;
+
 async function loadSuggestionRefresh(worldId) {
   // Свежие варианты действий по текущей сцене (вместо устаревших из localStorage).
   // Сервер перегенерит подсказки по последнему ответу рассказчика (best-effort, не блокирует).
+  // Ограничение по времени (сессия 36, п.15): теперь этот вызов идёт и при пустом ответе
+  // сервера на каждом ходу, поэтому не допускаем параллельных/частых повторок — /suggest
+  // сам по себе дорогой LLM-проход.
+  if (!worldId || _sugReqInFlight) return;
+  const now = Date.now();
+  if (now - _sugReqAt < _SUG_MIN_INTERVAL_MS) return;
+  _sugReqInFlight = true;
+  _sugReqAt = now;
   try {
     const r = await API(`/api/worlds/${worldId}/suggest`, { method: "POST" });
     if (Array.isArray(r.suggestions) && r.suggestions.length) {
@@ -1264,6 +1276,7 @@ async function loadSuggestionRefresh(worldId) {
       renderSuggestionBar();
     }
   } catch (_) { /* best-effort: остаются текущие варианты */ }
+  finally { _sugReqInFlight = false; }
 }
 
 function renderSuggestionBar() {
@@ -1905,27 +1918,34 @@ function pollTtsStatus(eid, btn, autoPlay) {
   // Опрос фонового синтеза: ⟳ → 🔊 / ⚠  (статус события 1 → 2 | -1)
   let tries = 0;
   btn.classList.add("tts-pending");
+  // Один таймер на кнопку (сессия 36, п.16): интервал создавался на каждый вызов, а
+  // снимался только внутри колбэка на терминальном статусе. При повторном открытии мира,
+  // перезагрузке страницы или автопроигрывании (buildMsg + sendAction зовут pollTtsStatus
+  // по одному событию дважды) старые интервалы оставались висеть и долбили /tts/status
+  // вечно. Храним id на самой кнопке и снимаем предыдущий перед новым.
+  if (btn._ttsTimer) { clearInterval(btn._ttsTimer); btn._ttsTimer = null; }
+  const stop = () => { if (btn._ttsTimer) { clearInterval(btn._ttsTimer); btn._ttsTimer = null; } };
   const timer = setInterval(async () => {
     tries++;
     try {
       const r = await API(`/api/worlds/${state.currentWorld}/events/${eid}/tts/status`);
       const s = +r.tts_status;
       if (s === 2) {
-        clearInterval(timer);
+        stop();
         btn.classList.remove("tts-pending");
         btn.innerHTML = "🔊";
         btn.title = "Озвучить";
         btn.onclick = () => playTtsAudio(eid, btn);
         if (autoPlay || btn.dataset.autoPlay === "1") setTimeout(() => { btn.onclick && btn.onclick(); }, 300);
       } else if (s === -1) {
-        clearInterval(timer);
+        stop();
         btn.classList.remove("tts-pending");
         btn.classList.add("tts-err");
         btn.innerHTML = "⚠";
         btn.title = "Ошибка синтеза — повторить";
         btn.onclick = () => retryTts(eid, btn);
       } else if (tries > 90) {  // ~3 минуты — сдаёмся
-        clearInterval(timer);
+        stop();
         btn.classList.remove("tts-pending");
         btn.innerHTML = "🔊";
         btn.title = "Озвучить";
@@ -1933,8 +1953,11 @@ function pollTtsStatus(eid, btn, autoPlay) {
       }
     } catch (_) {
       btn.classList.remove("tts-pending");
+      // мир закрыт/переключён — опрашивать смысла нет: иначе таймер остался бы висеть
+      if (state.currentWorld == null || !document.body.contains(btn)) stop();
     }
   }, 2000);
+  btn._ttsTimer = timer;
 }
 
 async function playTtsAudio(eid, btn) {
@@ -2266,17 +2289,20 @@ function handleActionResult(res, typerDiv, skipPlayer = false) {
     else appendMsg({ role: "narrator", content: res.reply });
     rendered = true;
   }
-  // ВАЖНО: синхронизация вариантов и состояния идёт всегда, без раннего return.
-  // Быстрые действия: обновляем ВСЕГДА (даже пустой результат → фолбэк от состояния ниже),
-  // чтобы варианты не «залипали» на одних и тех же (иначе после каждого хода кнопки одни и те же).
-  // НО: пустой список от сервера (сбой/таймаут генератора) НЕ стирает прошлые ИИ-предложения —
-  // иначе после 2-го ответа кнопки «сбрасываются» на бытовые. При пустом — оставляем старые
-  // и асинхронно просим сервер обновить их по новой сцене (loadSuggestionRefresh).
+  // ── Быстрые действия ──
+  // Пустой список от сервера (сбой/таймаут генератора) НЕ стирает прошлые ИИ-предложения —
+  // иначе после 2-го ответа кнопки «сбрасываются» на бытовые заготовки. Но и оставлять
+  // старые без обновления нельзя: после смены сцены они устаревают и «залипают» (сессия 36,
+  // п.15) — раньше асинхронный запрос свежих уходил только если старых предложений тоже не
+  // было, что противоречило комментарию выше. Теперь при пустом ответе ВСЕГДА просим
+  // сервер пересчитать подсказки по новой сцене; сами кнопки остаются до прихода новых.
+  // Страховка от шторма запросов (например, при перегенерации подряд) — within
+  // Страховка от шторма запросов (например, при перегенерации подряд) — внутри
+  // loadSuggestionRefresh по таймеру последнего запроса к этой сцене.
   if (Array.isArray(res.suggestions) && res.suggestions.length) {
     state.suggestions = res.suggestions.filter(Boolean);
     try { localStorage.setItem(`textgame.suggestions.${state.currentWorld}`, JSON.stringify(state.suggestions)); } catch (_) {}
-  } else if (Array.isArray(res.suggestions) && !res.suggestions.length && !(state.suggestions && state.suggestions.length)) {
-    // нет ни новых, ни старых ИИ-предложений — сервер обновит по текущей сцене
+  } else if (state.currentWorld) {
     loadSuggestionRefresh(state.currentWorld);
   }
   if (res.state) {
@@ -2587,7 +2613,7 @@ function updateGenUI() {
   const mtok = +$("set-mtok").value;
   $("ctx-val").textContent = ctx.toLocaleString("ru-RU");
   $("mtok-val").textContent = mtok;
-  $("ctx-budget-val").textContent = Math.max(400, ctx - 2600 - mtok - 16384).toLocaleString("ru-RU");
+  $("ctx-budget-val").textContent = Math.max(400, ctx - (2600 + mtok) - Math.max(512, Math.min(16384, Math.floor(ctx * 0.2)))).toLocaleString("ru-RU");
   // Реальный лимит контекста модели (авто-детект). Если окно мира выше — сервер сам
   // снизит его при сохранении, поэтому предупреждаем ещё до «применить».
   const note = $("ctx-limit-note");
@@ -2629,7 +2655,13 @@ async function saveProviders() {
     state.providerSettings = res.provider_settings || {};
     state.providersEffective = res.providers_effective || null;
     syncProvidersUI();
-    alert("Провайдеры сохранены");
+    // сессия 36, п.19: сервер может принять настройки и предупредить, что модель не
+    // отвечает. Молча сохранить «ok» — значит оставить игрока один на один с будущей
+    // лавиной ошибок хода, поэтому предупреждение показываем сразу.
+    const warns = Array.isArray(res.warnings) ? res.warnings.filter(Boolean) : [];
+    alert(warns.length
+      ? "Провайдеры сохранены, но:\n\n" + warns.join("\n\n")
+      : "Провайдеры сохранены");
   } catch (e) { alert("Ошибка: " + e.message); }
 }
 
@@ -2655,6 +2687,28 @@ function closeModal() { $("modal").style.display = "none"; }
 function esc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+// Значение для JS-строки ВНУТРИ HTML-атрибута: onclick="showQuest('…')".
+// Обычного esc() тут мало (сессия 36, п.25): ключ сущности приходит от LLM и может
+// содержать апостроф (id «don't») — esc(') не трогает, кавычка закрывала JS-строку
+// раньше времени, атрибут ломался и модалка просто не открывалась. Сначала экранируем
+// для строкового литерала (' " \ переводы строк), затем — для HTML-атрибута.
+function jsAttr(s) {
+  const raw = String(s ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, "")
+    .replace(/\n/g, "\\n")
+    .replace(/\t/g, "\\t");
+  return esc(raw);
+}
+
+// Число для JS-аргумента в атрибуте: гарантируем, что туда не попадёт не-число.
+function numAttr(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? String(n) : "0";
 }
 
 async function refreshStatus() {

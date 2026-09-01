@@ -437,6 +437,44 @@ def test_npc_and_kill(setting):
     assert setting["npc"]["n1"]["alive"] is False
 
 
+def test_npc_notes_non_scalar_values(setting):
+    """Регрессии на `npc_set.notes` (сессия 37, блок C5).
+
+    1) ruff F821 / живой NameError: значения notes могут быть не строкой
+       (список/число/вложенный dict) — ветка сериализует их через `json`,
+       которого в mechanics.py не было импортировано.
+    2) тихая потеря данных: `existing.update()` в начале обработчика перезаписывал
+       прежние notes новыми, и «слияние» читало уже НОВЫЕ заметки — второй вызов
+       npc_set с другим ключом стирал всё, что мастер заводил раньше.
+    Оба проверяются на одном и том же месте, поэтому тест должен падать при
+    откате любого из двух фиксов.
+    """
+    apply_directives(setting, {"npc_set": {"id": "n1", "name": "Купец",
+                                          "notes": {"тайна": "шпион", "долг": ["мех", "3 монеты"],
+                                                    "знает": 7}}})
+    notes = setting["npc"]["n1"]["notes"]
+    assert notes["тайна"] == "шпион", "строка хранится как есть"
+    assert notes["долг"] == '["мех", "3 монеты"]', "список — JSON-строкой (кириллица не экранируется)"
+    assert notes["знает"] == "7", "скаляр не-строка тоже сериализуется"
+
+    # накопление: второй вызов не должен стирать ключи первого
+    apply_directives(setting, {"npc_set": {"id": "n1", "notes": {"хочет": "вернуть долг"}}})
+    notes = setting["npc"]["n1"]["notes"]
+    assert notes["хочет"] == "вернуть долг", "новый ключ добавился"
+    assert notes["тайна"] == "шпион", "прежний ключ НЕ потерян (баг слияния)"
+    assert notes["долг"] == '["мех", "3 монеты"]', "нескалярный прежний ключ НЕ потерян"
+
+    # None удаляет ключ (правка «стереть заметку»), а не пишет "null"
+    apply_directives(setting, {"npc_set": {"id": "n1", "notes": {"тайна": None}}})
+    notes = setting["npc"]["n1"]["notes"]
+    assert "тайна" not in notes, "None снимает ключ"
+    assert notes.get("хочет") == "вернуть долг" and notes.get("долг"), "остальное сохранено"
+
+    # выдача в промпт не должна падать на таких значениях
+    txt = narrator._notes_text(notes)
+    assert "мех" in txt and "вернуть долг" in txt
+
+
 def test_economy_trade(setting):
     # магазин с товарами и фракцией
     apply_directives(setting, {"shop_add": {"id": "bazaar", "name": "Лавка", "owner": "Трактирщик",

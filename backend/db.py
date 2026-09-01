@@ -33,6 +33,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
+from concurrent.futures import TimeoutError as FuturesTimeout
 import aiosqlite
 
 from .config import get_config
@@ -52,6 +53,12 @@ _conn: Optional[aiosqlite.Connection] = None
 # функции (add_event/update_world/...) снова берут `with _lock:` в том же потоке — не дедлок.
 # Глобально сериализует доступ к БД между потоками (как и раньше).
 _lock = threading.RLock()
+
+# Потолок ожидания ответа от БД (секунды). Зависание соединения раньше означало вечный
+# стоп вызывающего потока (ход игрока/фоновая задача) без единой строчки в логе.
+_RUN_TIMEOUT = 120.0
+_stuck_lock = threading.Lock()
+_stuck_count = 0
 
 # Атомарные группы записей: пока _tx_depth > 0, внутренние _maybe_commit() ничего не коммитят,
 # финальный COMMIT/ROLLBACK делает верхний уровень db.transaction().
@@ -82,10 +89,32 @@ def _ensure_loop() -> None:
 
 def _run(factory: Callable[[], Any]) -> Any:
     """Выполняет корутину (созданную `factory()`) на фоновом цикле и блокирует вызывающий
-    поток до получения результата. Исключения из БД (sqlite3.*) пробрасываются как есть."""
+    поток до получения результата. Исключения из БД (sqlite3.*) пробрасываются как есть.
+
+    Защиты (сессия 36, п.11):
+      * вызов ИЗ потока фонового цикла — гарантированный само-дедлок (fut ждёт того же
+        цикла, который заблокирован этим же потоком). Раньше такое зависало молча и
+        навечно; теперь — явная ошибка с контекстом (правило 14).
+      * потолок ожидания: «БД не отвечает» превращается в понятное исключение с логом,
+        а не в вечный стоп хода/задач."""
     _ensure_loop()
+    if _loop_thread is not None and threading.current_thread() is _loop_thread:
+        # рекурсивный вызов с собственного цикла: выполнить нельзя, зависнем навсегда
+        raise RuntimeError(
+            "db._run() вызван из потока фонового цикла БД — это взаимоблокировка. "
+            "Фоновые задачи должны обращаться к БД из своего цикла (asyncio), а не из "
+            "корутины, поставленной на цикл db.py.")
     fut = asyncio.run_coroutine_threadsafe(factory(), _loop)  # type: ignore[arg-type]
-    return fut.result()
+    try:
+        return fut.result(timeout=_RUN_TIMEOUT)
+    except FuturesTimeout:
+        fut.cancel()
+        with _stuck_lock:
+            global _stuck_count
+            _stuck_count += 1
+        log.error("БД не ответила за %s с (одновременных зависаний: %d) — запрос отменён",  # noqa: E501
+                  _RUN_TIMEOUT, _stuck_count, exc_info=True)
+        raise RuntimeError(f"База данных не отвечает (ждём >{_RUN_TIMEOUT}с)")
 
 
 async def _shutdown() -> None:
@@ -420,10 +449,15 @@ def list_worlds() -> list[dict]:
 
 async def _list_worlds() -> list[dict]:
     conn = await _open()
+    # Сессия 36, п.10: счётчик ходов одним GROUP BY-подзапросом вместо correlated COUNT(*)
+    # на каждую строку (на каждом GET /api/worlds). На больших базах это был самый
+    # горячий запрос меню.
     cur = await conn.execute(
         "SELECT id, name, theme, genre, difficulty, perspective, language, "
-        "(SELECT COUNT(*) FROM events e WHERE e.world_id = worlds.id AND e.role = 'player') AS events, updated_at "
-        "FROM worlds ORDER BY updated_at DESC"
+        "COALESCE(ev.c, 0) AS events, updated_at "
+        "FROM worlds LEFT JOIN (SELECT world_id, COUNT(*) AS c FROM events "
+        "WHERE role = 'player' GROUP BY world_id) ev ON ev.world_id = worlds.id "
+        "ORDER BY updated_at DESC"
     )
     rows = await cur.fetchall()
     return [dict(r) for r in rows]
@@ -502,7 +536,7 @@ def add_event(world_id: int, role: str, content: str, seq: int | None = None,
 # (backend/bus.py) навешивается из app.py при старте. Нужен, чтобы фоновые системки
 # доходили до вкладки мгновенно, а не через поллинг раз в 15 секунд.
 _event_listeners: list = []
-# Внутри db.transaction() события копятcя и рассылаются ТОЛЬКО после успешного COMMIT:
+# Внутри db.transaction() события копятся и рассылаются ТОЛЬКО после успешного COMMIT:
 # иначе при откате половины хода клиент получил бы «фantomные» сообщения, которых в БД нет.
 _pending_events: list[dict] = []
 
@@ -596,13 +630,31 @@ def get_events(world_id: int, limit: int | None = None, since_seq: int = 0) -> l
         return _run(lambda: _get_events(world_id, limit, since_seq))
 
 
+def get_events_after(world_id: int, after_seq: int = 0, limit: int = 500) -> list[dict]:
+    """ПЕРВЫЕ `limit` событий с seq > after_seq (хронологическом порядке) — для
+    постранинного обхода лога вперёд (сессия 36, п.8).
+
+    Отличие от get_events(limit=...): там лимит режет ХВОСТ (последние N), что для
+    «пройти весь лог страницами» не годилось бы — страницы перекрывались бы хвостом."""
+    with _lock:
+        return _run(lambda: _get_events_after(world_id, after_seq, limit))
+
+
+async def _get_events_after(world_id: int, after_seq: int, limit: int) -> list[dict]:
+    conn = await _open()
+    cur = await conn.execute(
+        "SELECT * FROM events WHERE world_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+        (world_id, int(after_seq), max(1, int(limit))))
+    return [_event_obj(r) for r in await cur.fetchall()]
+
+
 async def _get_events(world_id: int, limit: int | None, since_seq: int) -> list[dict]:
     conn = await _open()
     q = "SELECT * FROM events WHERE world_id = ? AND seq > ? ORDER BY seq"
     args: list = [world_id, since_seq]
     if limit:
-        q = (f"SELECT * FROM (SELECT * FROM events WHERE world_id = ? AND seq > ? ORDER BY seq DESC "
-             f"LIMIT ?) ORDER BY seq ASC")
+        q = ("SELECT * FROM (SELECT * FROM events WHERE world_id = ? AND seq > ? ORDER BY seq DESC "
+             "LIMIT ?) ORDER BY seq ASC")
         args = [world_id, since_seq, limit]
     cur = await conn.execute(q, args)
     rows = await cur.fetchall()
@@ -937,21 +989,30 @@ def get_last_exchange(world_id: int) -> tuple[str, str]:
     return (ev_p["content"] if ev_p else ""), reply
 
 
-def get_summary_events(world_id: int, limit: int = 10) -> list[dict]:
-    """Последние `limit` сводок (роль summary) хронологически. limit=0 — все сводки."""
+def get_summary_events(world_id: int, limit: int = 10, unfolded_only: bool = True) -> list[dict]:
+    """Последние `limit` сводок (роль summary) хронологически. limit=0 — все сводки.
+
+    unfolded_only (сессия 35, баг 2): по умолчанию отдаём ТОЛЬКО живые сводки (folded=0).
+    Сводки, сокрытые перемоткой/загрузкой сохранения (folded=FOLD_HIDDEN), в промпт не
+    должны попадать — иначе рассказчик «помнит» отменённое. Старые вызовы (rewind, тесты)
+    явно передают unfolded_only=False, когда им нужны все строки для анализа/чистки.
+    """
     with _lock:
-        return _run(lambda: _get_summary_events(world_id, limit))
+        return _run(lambda: _get_summary_events(world_id, limit, unfolded_only))
 
 
-async def _get_summary_events(world_id: int, limit: int) -> list[dict]:
+async def _get_summary_events(world_id: int, limit: int, unfolded_only: bool) -> list[dict]:
     conn = await _open()
+    fold_sql = " AND folded = 0" if unfolded_only else ""
     if limit:
         cur = await conn.execute(
             "SELECT * FROM (SELECT * FROM events WHERE world_id = ? AND role = 'summary'"
-            " ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC", (world_id, int(limit)))
+            + fold_sql
+            + " ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC", (world_id, int(limit)))
     else:
         cur = await conn.execute(
-            "SELECT * FROM events WHERE world_id = ? AND role = 'summary' ORDER BY seq",
+            "SELECT * FROM events WHERE world_id = ? AND role = 'summary'" + fold_sql
+            + " ORDER BY seq",
             (world_id,))
     return [_event_obj(r) for r in await cur.fetchall()]
 
@@ -976,6 +1037,26 @@ async def _delete_summaries_after(world_id: int, from_seq: int) -> list[int]:
         (world_id, int(from_seq)))
     await _maybe_commit()
     return [int(r["seq"]) for r in rows]
+
+
+def delete_events_by_seq(world_id: int, seqs: list[int]) -> int:
+    """Удалить события по их seq (перемотка: недостоверные сводки с seq < точки отката,
+    покрывающие откатываемый диапазон). Возвращает число удалённых."""
+    seqs = sorted({int(s) for s in seqs})
+    if not seqs:
+        return 0
+    with _lock:
+        return _run(lambda: _delete_events_by_seq(world_id, seqs))
+
+
+async def _delete_events_by_seq(world_id: int, seqs: list[int]) -> int:
+    conn = await _open()
+    marks = ",".join("?" * len(seqs))
+    cur = await conn.execute(
+        f"DELETE FROM events WHERE world_id = ? AND seq IN ({marks})",
+        (world_id, *seqs))
+    await _maybe_commit()
+    return cur.rowcount
 
 
 # ─────────────────────────── озвучка (TTS) ───────────────────────────
@@ -1132,23 +1213,29 @@ async def _upsert_entity(world_id: int, kind: str, entity_key: str, *,
     return ent
 
 
-def list_entities(world_id: int, kind: Optional[str] = None) -> list[dict]:
+def list_entities(world_id: int, kind: Optional[str] = None,
+                  limit: Optional[int] = None) -> list[dict]:
+    """Карточки мира. `limit` — максимум последних (по updated_at) карточек; нужен
+    горячим путям на длинных играх (сессия 36, п.9): полная выдача тысяч карточек
+    каждый ход раздувал CPU/память. Без limit — все (UI, экспорт, индексация)."""
     with _lock:
-        return _run(lambda: _list_entities(world_id, kind))
+        return _run(lambda: _list_entities(world_id, kind, limit))
 
 
-async def _list_entities(world_id: int, kind: Optional[str]) -> list[dict]:
+async def _list_entities(world_id: int, kind: Optional[str],
+                         limit: Optional[int]) -> list[dict]:
     conn = await _open()
+    n = int(limit) if limit and int(limit) > 0 else None
     if kind:
-        cur = await conn.execute(
-            "SELECT * FROM entities WHERE world_id = ? AND kind = ? ORDER BY updated_at DESC",
-            (world_id, kind),
-        )
+        q = ("SELECT * FROM entities WHERE world_id = ? AND kind = ? ORDER BY updated_at DESC")
+        args: list = [world_id, kind]
     else:
-        cur = await conn.execute(
-            "SELECT * FROM entities WHERE world_id = ? ORDER BY updated_at DESC",
-            (world_id,),
-        )
+        q = ("SELECT * FROM entities WHERE world_id = ? ORDER BY updated_at DESC")
+        args = [world_id]
+    if n:
+        q += " LIMIT ?"
+        args.append(n)
+    cur = await conn.execute(q, args)
     rows = await cur.fetchall()
     return [dict(r) for r in rows]
 
@@ -1284,10 +1371,11 @@ def export_data(world_id: int) -> tuple[Optional[dict], list[dict]]:
 
     Форматирование в текст идёт в бизнес-слое (routers/worlds.py::render_export_history),
     чтобы db.py оставался чисто слоем доступа к данным."""
-    w = get_world(world_id)
-    if not w:
-        return None, []
-    return w, get_events(world_id)
+    with _lock:      # мир и его события — один согласованный снимок (см. world_dump)
+        w = get_world(world_id)
+        if not w:
+            return None, []
+        return w, get_events(world_id)
 
 
 # ─────────────────────────── дамп мира (переносимость) ───────────────────────────
@@ -1344,6 +1432,49 @@ def backup_database(keep: int = 10) -> Optional[str]:
         return None
 
 
+DUMP_SECRET_KEYS = ("api_key", "apikey")
+
+
+def _dump_strip_secrets(obj: Any) -> Any:
+    """Рекурсивно вырезает из дамп-структуры поля-секреты (api_key и т.п.).
+
+    Обходит dict/list, а также JSON-строки (setting/saves/turn_snapshots хранятся
+    как текст): если строка разбирается в JSON-структуру с секретным ключом —
+    пересобирается без него. Иначе возвращается как есть (обычный текст не трогаем)."""
+    if isinstance(obj, dict):
+        return {k: _dump_strip_secrets(v) for k, v in obj.items()
+                if not any(h in str(k).lower() for h in DUMP_SECRET_KEYS)}
+    if isinstance(obj, list):
+        return [_dump_strip_secrets(x) for x in obj]
+    if isinstance(obj, str) and len(obj) > 1 and obj.lstrip()[:1] in ("{", "["):
+        try:
+            parsed = json.loads(obj)
+        except Exception:
+            return obj
+        if isinstance(parsed, (dict, list)) and _dump_has_secrets(parsed):
+            return json.dumps(_dump_strip_secrets(parsed), ensure_ascii=False)
+        return obj
+    return obj
+
+
+def _dump_has_secrets(obj: Any) -> bool:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if any(h in str(k).lower() for h in DUMP_SECRET_KEYS):
+                return True
+            if _dump_has_secrets(v):
+                return True
+        return False
+    if isinstance(obj, list):
+        return any(_dump_has_secrets(x) for x in obj)
+    if isinstance(obj, str) and len(obj) > 1 and obj.lstrip()[:1] in ("{", "["):
+        try:
+            return _dump_has_secrets(json.loads(obj))
+        except Exception:
+            return False
+    return False
+
+
 def world_dump(world_id: int) -> Optional[dict]:
     """Собирает ПОЛНЫЙ JSON-дамп мира: состояние, все события (включая свёрнутые),
     карточки сущностей и знаний, лор, слоты сохранений, граф карты, настройки.
@@ -1353,6 +1484,15 @@ def world_dump(world_id: int) -> Optional[dict]:
     после импорта резолвятся заново из глобального .env/админки.
 
     Возвращает None, если мира нет."""
+    # Весь снимок берётся ПОД _lock (сессия 36, п.11): дамп читает семь таблиц отдельными
+    # запросами, и без блокировки между ними мог вклиниться чужой `db.transaction()` —
+    # наружу ушёл бы мир «наполовину из хода» (события есть, состояния нет).
+    # _lock — RLock, вложенные get_world/get_narrator его же и берут (реентерно, ок).
+    with _lock:
+        return _world_dump_locked(world_id)
+
+
+def _world_dump_locked(world_id: int) -> Optional[dict]:
     w = get_world(world_id)
     if not w:
         return None
@@ -1385,7 +1525,7 @@ def world_dump(world_id: int) -> Optional[dict]:
         except Exception:
             narrator_name = ""
 
-    return {
+    dump = {
         "format": DUMP_FORMAT,
         "version": DUMP_VERSION,
         "exported_at": time.time(),
@@ -1415,6 +1555,11 @@ def world_dump(world_id: int) -> Optional[dict]:
         "counts": {"events": len(events), "entities": len(entities), "lore": len(lore_rows),
                    "saves": len(saves), "graph_nodes": len(nodes), "turn_snapshots": len(snaps)},
     }
+    # Правило 3/15 (страховка, сессия 36, п.18): рекурсивно вырезаем ЛЮБЫЕ поля api_key
+    # во всём дампе, а не только в provider_settings. Дамп уходит наружу файлом и может
+    # содержать вложенные JSON-строки (setting/saves/turn_snapshots) — если когда-нибудь
+    # ключ туда и попадёт (старые сохранения, чужая правка), он всё равно не утечёт.
+    return _dump_strip_secrets(dump)
 
 
 async def _dump_events(world_id: int):
@@ -1484,6 +1629,20 @@ def restore_world(data: dict) -> int:
             narrator_id = None
 
     setting = w["setting"]
+    # Валидация/само-исцеление структуры состояния (сессия 36, п.5): импорт может прийти
+    # из дампа старой/битой версии. Без player/статов ход падал бы с KeyError где-то в
+    # движке уже ПОСЛЕ создания мира. Правки идемпотентны и только досылают недостающее
+    # (ensure_player_schema / normalize_setting_ranks) — чужие данные не переписываются.
+    try:
+        from .mechanics import ensure_player_schema, normalize_setting_ranks
+        if not isinstance(setting.get("player"), dict):
+            log.warning("restore_world: в дампе нет player — достраивается дефолтный")
+            setting["player"] = {}
+        ensure_player_schema(setting["player"])
+        normalize_setting_ranks(setting)
+    except Exception as e:
+        log.warning("restore_world: схема состояния не доведена (%s): %s",
+                    w.get("name") or "?", e)
     # снапшот хода/перегенерации — из дампа, он относится именно к этому состоянию
     new_id = create_world(
         name=w.get("name") or "Восстановленный мир",
@@ -1509,8 +1668,23 @@ def restore_world(data: dict) -> int:
 
 async def _restore_world(new_id: int, data: dict) -> None:
     conn = await _open()
+    # Битые строки пропускаем с логом (сессия 36, п.5): одна мусорная запись в дампе
+    # не должна ронять весь импорт (иначе транзакция откатится и мир останется пустым).
     for e in data.get("events") or []:
         if not isinstance(e, dict) or "seq" not in e or "role" not in e:
+            log.warning("restore_world (world %s): событие без seq/role пропущено: %r",
+                        new_id, str(e)[:120])
+            continue
+        try:
+            seq_i = int(e["seq"])
+        except (TypeError, ValueError):
+            log.warning("restore_world (world %s): событие с нечисловым seq пропущено: %r",
+                        new_id, e.get("seq"))
+            continue
+        role = str(e["role"])
+        if not role.strip():
+            log.warning("restore_world (world %s): событие seq=%s с пустой ролью пропущено",
+                        new_id, seq_i)
             continue
         meta = e.get("meta")
         if isinstance(meta, str):
@@ -1521,7 +1695,7 @@ async def _restore_world(new_id: int, data: dict) -> None:
         await conn.execute(
             "INSERT INTO events (world_id, seq, role, content, folded, feedback, ts, tts_status, tts_file, meta) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (new_id, int(e["seq"]), str(e["role"]), str(e.get("content") or ""),
+            (new_id, seq_i, role, str(e.get("content") or ""),
              int(e.get("folded") or 0), int(e.get("feedback") or 0), e.get("ts"),
              int(e.get("tts_status") or 0), str(e.get("tts_file") or ""),
              json.dumps(meta or {}, ensure_ascii=False)),

@@ -145,6 +145,7 @@ class AdminSettingsIn(BaseModel):
     backup_keep: Optional[str] = None
     metrics_persist: Optional[bool] = None
     metrics_tail: Optional[str] = None
+    metrics_max_bytes: Optional[str] = None   # порог ротации журнала (0 = выкл.), сессия 36 п.7
     # Явный сброс конкретных ключей админки (имена env в верхнем регистре) → значения
     # возвращаются к .env. Нужно потому, что булев тумблер не может выразить «не задано»
     # (пустая строка в Optional[bool] = 422), а без этого кнопка «сбросить к .env»

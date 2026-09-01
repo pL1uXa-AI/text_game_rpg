@@ -198,7 +198,7 @@ async def embed_batch(texts: list[str], is_query: bool = False,
                                 )
                             result[sub[int(idx)]] = [float(v) for v in vec]
                     break
-                except (RuntimeError, httpx.HTTPError, ConnectionError, TimeoutError) as e:
+                except (RuntimeError, httpx.HTTPError, ConnectionError, TimeoutError):
                     if attempt == 5:
                         raise
                     time.sleep(2 * attempt)
@@ -292,6 +292,18 @@ def bm25_scores(query_tokens: list[str], corpus_texts: list[str], k1: float = 1.
 def hybrid_rerank(query: str, candidates: list[dict], weight_bm25: float = 0.4) -> list[dict]:
     if not candidates:
         return candidates
+    # Сессия 36, п.29: HYBRID_WEIGHT_BM25 приходит из .env/админки и может оказаться
+    # бессмысленным (2, −1, «abc» от кривого сохранения). Формула (1−w)·cos + w·bm при
+    # w∉[0,1] даёт score вне диапазона и перекос сортировки (при w>1 косинус уходит с
+    # ОТРИЦАТЕЛЬНЫМ весом — память начинает топить релевантное). Клампим здесь, у
+    # точки применения, а не только во валидации админки: конфиг — внешний вход.
+    try:
+        w = float(weight_bm25)
+    except (TypeError, ValueError):
+        w = 0.4
+    if math.isnan(w):      # NaN прошёл бы мимо min/max и обнулил бы оба слагаемых
+        w = 0.4
+    w = min(1.0, max(0.0, w))
     q_tokens = _tokenize(query)
     texts = [c.get("content", "") for c in candidates]
     bm = bm25_scores(q_tokens, texts)
@@ -300,7 +312,7 @@ def hybrid_rerank(query: str, candidates: list[dict], weight_bm25: float = 0.4) 
     for c, b in zip(candidates, bm):
         cos_n = c.get("similarity", 0.0) / max_cos
         bm_n = b / max_bm if max_bm else 0.0
-        c["_hybrid"] = (1 - weight_bm25) * cos_n + weight_bm25 * bm_n
+        c["_hybrid"] = (1 - w) * cos_n + w * bm_n
     candidates.sort(key=lambda c: c.get("_hybrid", 0), reverse=True)
     return candidates
 

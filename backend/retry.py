@@ -79,21 +79,26 @@ def _backoff() -> float:
 async def with_retries(factory: Callable[[], Awaitable[Any]], *, what: str = "запрос",
                        retries: int | None = None, backoff: float | None = None,
                        config_key: str = "llm_retries",
+                       transient_fn: Optional[Callable[[BaseException], bool]] = None,
                        on_retry: Optional[Callable[[int, BaseException], Any]] = None) -> Any:
     """Выполняет асинхронную операцию, повторяя временные сбои.
 
     factory — функция без аргументов, возвращающая корутину (лямбда достаточно важна:
     корутина не должна создаваться до попытки, иначе «coroutine never awaited»).
+    transient_fn — своя функция «повторять ли этот сбой» (по умолчанию is_transient);
+    нужна для клиентов со своими классами ошибок (например Edge TTS), которые в
+    общих текстовых признаках не опознаются.
     Последнее исключение пробрасывается вызывающему (повторы не прячут беду).
     """
     n = _retries(config_key) if retries is None else max(0, int(retries))
     base = _backoff() if backoff is None else max(0.0, float(backoff))
+    is_trans = transient_fn or is_transient
     attempt = 0
     while True:
         try:
             return await factory()
         except Exception as e:
-            if attempt >= n or not is_transient(e):
+            if attempt >= n or not is_trans(e):
                 raise
             delay = base * (2 ** attempt) * (1.0 + random.random() * 0.25)  # экспонента + джиттер
             attempt += 1

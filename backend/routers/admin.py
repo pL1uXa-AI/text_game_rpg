@@ -63,6 +63,7 @@ async def admin_settings_get():
                         "backup_keep": cfg.backup_keep,
                         "metrics_persist": bool(cfg.metrics_persist),
                         "metrics_tail": cfg.metrics_tail,
+                        "metrics_max_bytes": cfg.metrics_max_bytes,
                         "metrics_file": cfg.metrics_file},
             "tts": {"provider": cfg.tts_provider, "enabled": bool(cfg.tts_enabled),
                      "voice": cfg.tts_voice, "rate": cfg.tts_rate,
@@ -104,7 +105,18 @@ async def admin_settings_save(body: AdminSettingsIn):
         payload["BACKGROUND_TASKS_ENABLED"] = "true" if body.background_tasks_enabled else "false"
     if body.hybrid_weight_bm25 is not None:
         v = str(body.hybrid_weight_bm25).strip()
-        payload["HYBRID_WEIGHT_BM25"] = "" if v == "" else v
+        # Сессия 36, п.29: вес BM25 обязан попасть в [0,1] — иначе гибрид выдаёт score
+        # вне диапазона и RAG начинает сортировать память наперевос (косинус с
+        # отрицательным весом при w>1). Не валидировалось нигде, кроме клампа в
+        # embeddings.hybrid_rerank; здесь — понятный отказ вместо тихой правки.
+        if v:
+            try:
+                w = float(v)
+            except ValueError:
+                raise HTTPException(400, "Вес BM25 должен быть числом от 0 до 1")
+            if not (0.0 <= w <= 1.0):
+                raise HTTPException(400, f"Вес BM25 вне диапазона [0, 1]: {v}")
+        payload["HYBRID_WEIGHT_BM25"] = v
     # выключатели фоновых агентов и мира
     for f, env in (("logic_judge_enabled", "LOGIC_JUDGE_ENABLED"),
                    ("dynamic_events_enabled", "DYNAMIC_EVENTS_ENABLED"),
@@ -126,11 +138,19 @@ async def admin_settings_save(body: AdminSettingsIn):
               "cosine_threshold", "cosine_threshold_local", "logic_judge_interval",
               "event_every_turns", "autonomous_master_interval", "enemy_ai_interval",
               "divine_cooldown_turns", "max_action_chars", "tts_cache_ttl_days", "tts_max_chars",
-              "backup_keep", "metrics_tail"):
+              "backup_keep", "metrics_tail", "metrics_max_bytes"):
         v = getattr(body, f, None)
         if v is None:
             continue
         v = str(v).strip()
+        # размер журнала обязан оставаться неотрицательным (0 = ротация выключена);
+        # отрицательный порог молча ломал бы ротацию (файл не ротируется никогда)
+        if f == "metrics_max_bytes" and v:
+            try:
+                if int(v) < 0:
+                    raise HTTPException(400, "METRICS_MAX_BYTES не может быть отрицательным")
+            except ValueError:
+                raise HTTPException(400, "METRICS_MAX_BYTES должен быть целым числом байт")
         payload[f.upper()] = "" if v == "" else v
     # TTS: булевы + строки
     if body.tts_enabled is not None:

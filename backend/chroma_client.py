@@ -114,7 +114,6 @@ def _effective_collection_name() -> str:
 async def ensure_collection(name: str | None = None) -> str:
     """get_or_create коллекции по имени (default — глобальная). Возвращает id. Кэшируется."""
     global _collections
-    cfg = get_config()
     if name is None:
         name = _effective_collection_name()
     if name in _collections:

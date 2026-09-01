@@ -17,15 +17,17 @@ app.py — FastAPI-бэкенд текстовой RPG с ИИ-рассказч�
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import bus, db, narrator, tts
+from . import bg, bus, chroma_client, db, embeddings, llm, narrator, tts
 from .config import get_config
 from .routers import admin, catalog, entities, lore, system, tts as tts_router, worlds
 from .routers.core import FRONTEND_DIR
@@ -35,9 +37,47 @@ from .logsetup import configure as _configure_logs, get_logger
 _configure_logs()          # JSON-лог data/logs/game.log + контекст хода (сессия 34, правило 14)
 log = get_logger(__name__)
 
+# ── Жизненный цикл приложения (lifespan; сессия 36, п.30) ──
+# startup: шина живого чата запоминает цикл событий + одна строка диагностики.
+# shutdown: поток `aiosqlite-loop` — daemon, без явного close() соединение SQLite
+# оставалось открытым, пока жив процесс, и на Windows файл game.db мог
+# оказаться залочен при рестарте («database is locked»). Закрываем по
+# порядку: сетевые httpx-клиенты → очередь фоновых агентов → цикл БД.
+# Каждый шаг в своёй страховке: падение одного не мешает закрыть остальные.
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    bus.attach_loop(asyncio.get_running_loop())   # синхронный код БД публикует через него
+    cfg = get_config()
+    log.info("старт: модель=%s контекст_стандарт=%d фон=%s судья=%s мастер=%s враж_ии=%s "
+             "события=%s озвучка=%s фоновые_LLM_параллельно=%d", cfg.main_provider,
+             cfg.context_tokens, cfg.background_tasks_enabled, cfg.logic_judge_enabled,
+             cfg.autonomous_master_enabled, cfg.enemy_ai_enabled, cfg.dynamic_events_enabled,
+             cfg.tts_provider, cfg.llm_bg_concurrency)
+    try:
+        yield
+    finally:
+        for name, fn in (("chroma_client", chroma_client.close),
+                         ("embeddings", embeddings.close),
+                         ("llm", llm.close)):
+            try:
+                await fn()
+            except Exception as e:
+                log.warning("shutdown: %s не закрылся: %s", name, e)
+        try:
+            bg.shutdown_nowait()
+        except Exception as e:
+            log.warning("shutdown: фоновая очередь не остановлена: %s", e)
+        try:
+            await asyncio.to_thread(db.close)   # синхронный close ждёт завершения цикла БД
+            log.info("shutdown: соединение БД и цикл aiosqlite закрыты")
+        except Exception as e:
+            log.warning("shutdown: БД не закрыта корректно (файл может остаться залоченным): %s", e)
+
+
 app = FastAPI(
     title="Text Game RPG",
     version="1.0",
+    lifespan=_lifespan,
     description=(
         "Живая текстовая RPG с ИИ-рассказчиком (llama.cpp / Ollama / OpenAI-совместимый) и "
         "гибридной долгосрочной памятью (сводки + ChromaDB RAG + реранкер) и персональными "
@@ -106,25 +146,6 @@ app.include_router(system.router)
 # Живой чат (сессия 34, D3): шина событий мира получает каждое записанное событие БД
 # и мгновенно раздаёт открытым вкладкам вместо поллинга раз в 15 секунд.
 db.add_event_listener(bus.listener())
-
-
-@app.on_event("startup")
-async def _bus_attach_loop() -> None:
-    """Запомнить цикл приложения: синхронный код БД публикует через call_soon_threadsafe."""
-    import asyncio
-
-    bus.attach_loop(asyncio.get_running_loop())
-
-
-@app.on_event("startup")
-async def _startup_summary() -> None:
-    """Одна строка в логе о том, в каком режиме стартует игра (диагностика, правило 14)."""
-    cfg = get_config()
-    log.info("старт: модель=%s контекст_стандарт=%d фон=%s судья=%s мастер=%s враж_ии=%s "
-             "события=%s озвучка=%s фонов_LLM_параллельно=%d", cfg.main_provider,
-             cfg.context_tokens, cfg.background_tasks_enabled, cfg.logic_judge_enabled,
-             cfg.autonomous_master_enabled, cfg.enemy_ai_enabled, cfg.dynamic_events_enabled,
-             cfg.tts_provider, cfg.llm_bg_concurrency)
 
 
 # Предустановленные рассказчики записываются в БД при первом старте (идемпотентно).

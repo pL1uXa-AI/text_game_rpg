@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Optional
 
@@ -26,6 +27,17 @@ from . import db
 from .logsetup import get_logger
 
 log = get_logger(__name__)
+
+
+def _stable_key(*parts: str) -> str:
+    """Детерминированный ключ из частей (сессия 35, баг 3).
+
+    Раньше здесь был `abs(hash(title))` — а `hash()` рандомизирован (PYTHONHASHSEED),
+    поэтому после рестарта сервера тот же ход/заголовок давал ДРУГОЙ ключ: дубликаты
+    записей дневника и сломанный дедуп перегенерации. md5 от строки стабилен между
+    процессами и машинами.
+    """
+    return hashlib.md5("\x1f".join(parts).encode("utf-8")).hexdigest()[:12]
 
 KIND = "journal"
 # категории (для иконки/фильтра в UI). note — заметка самого игрока (/journal note …)
@@ -212,7 +224,7 @@ def record_turn(world_id: int, prev: dict, now: dict, seq: int, action: str = ""
                 continue
             # ключ стабилен по (ход, категория, заголовок): перегенерация того же хода
             # перезапишет свою запись, а не заведёт вторую
-            key = f"t{seq}-{cat}-{abs(hash(title)) % 10_000_000}"
+            key = f"t{seq}-{cat}-{_stable_key(title)}"
             ent = db.upsert_entity(world_id, KIND, key, name=title,
                                    summary=str(item.get("text") or "")[:220],
                                    meta={"seq": seq, "cat": cat, "icon": _ICON.get(cat, "•"),
@@ -231,7 +243,7 @@ def add_player_note(world_id: int, note: str) -> Optional[dict]:
     if not note:
         return None
     seq = db.latest_seq(world_id)
-    return db.upsert_entity(world_id, KIND, f"t{seq}-note-{abs(hash(note)) % 100000}",
+    return db.upsert_entity(world_id, KIND, f"t{seq}-note-{_stable_key(note)}",
                             name=note, summary="", seq=seq,
                             meta={"seq": seq, "cat": CAT_NOTE, "icon": _ICON[CAT_NOTE]})
 

@@ -16,6 +16,7 @@ normalize_directives / tick_effects / check_profession_advance, чтобы ро�
 """
 from __future__ import annotations
 
+import json
 import logging
 
 import re
@@ -206,7 +207,24 @@ def normalize_setting_ranks(setting: dict) -> bool:
 
 
 def ensure_player_schema(p: dict) -> None:
-    """Достраивает новые RPG-поля игрока в старых сохранениях."""
+    """Достраивает новые RPG-поля игрока в старых сохранениях.
+
+    Гарантирует и БАЗОВЫЕ числовые оси (hp/mp/gold/level/inventory): `apply_directives`
+    в финале читает `p["hp"]` напрямую, и неполный player (кривой импорт, битый дамп,
+    ручная правка в режиме мастера) ронял не только первый ход, а каждый (сессия 36, п.5).
+    Только setdefault — существующие значения не трогаем.
+    """
+    p.setdefault("name", "Путник")
+    p.setdefault("identity", "")
+    p.setdefault("hp", 100)
+    p.setdefault("max_hp", max(1, int(p.get("hp") or 100)))
+    p.setdefault("mp", 50)
+    p.setdefault("max_mp", max(0, int(p.get("mp") or 50)))
+    p.setdefault("level", 1)
+    p.setdefault("xp", 0)
+    p.setdefault("gold", 0)
+    inv = p.get("inventory")
+    p["inventory"] = inv if isinstance(inv, list) else []
     st = p.get("stats")
     if not isinstance(st, dict):
         st = {}
@@ -1483,7 +1501,7 @@ class EconomyHandler(DirectiveHandler):
                         if stock["qty"] <= 0:
                             sh["items"].remove(stock)
                         _give_item(setting, item, qty, stock.get("desc", ""), float(stock.get("weight", 0) or 0))
-                        # пересh: предмет в руках наследует ценность покупки (для продажи)
+                        # покупка: предмет в руках наследует ценность покупки (для продажи)
                         _bought = next((x for x in setting["player"]["inventory"] if x.get("name") == item), None)
                         if _bought is not None and stock.get("value"):
                             _bought["value"] = _safe_int(stock.get("value"), 0)
@@ -2003,6 +2021,10 @@ class NpcHandler(DirectiveHandler):
         if "npc_set" in d and isinstance(d["npc_set"], dict) and (d["npc_set"].get("id") or "").strip():
             ns = d["npc_set"]
             existing = setting["npc"].get(ns["id"])
+            # ВАЖНО (сессия 37): прежние notes снимаем ДО bulk-update — ниже `existing.update(...)`
+            # перезаписал бы их целиком, и «слияние» под notes читало бы уже НОВЫЕ заметки
+            # вместо накопленных (ключи мастера терялись молча).
+            _prev_notes = (existing or {}).get("notes")
             if existing:
                 existing.update({k: v for k, v in ns.items() if k != "id"})
             else:
@@ -2022,7 +2044,7 @@ class NpcHandler(DirectiveHandler):
             notes = ns.get("notes")
             if notes is not None:
                 if isinstance(notes, dict):
-                    merged = dict(_npc.get("notes") or {})
+                    merged = dict(_prev_notes or {})
                     for k, v in notes.items():
                         if v is None:
                             merged.pop(str(k), None)
@@ -2477,8 +2499,9 @@ def apply_directives(setting: dict, d: dict) -> list[str]:
                 log.warning("DirectiveHandler %r упал на %s: %s",
                             type(handler).__name__, sorted(handler.keys & d.keys()), e,
                             exc_info=True)
-    # смерть игрока
-    if p["hp"] <= 0 and not setting.get("game_over"):
+    # смерть игрока — через .get(): схема достроена выше, но проверка на 0 не должна
+    # превращаться в KeyError, если caller прислал «сырой» dict минуя ensure_player_schema
+    if int(p.get("hp", 1) or 0) <= 0 and not setting.get("game_over"):
         setting["game_over"] = True
         msgs.append("💀 Игрок погиб. Мир замирает…")
     return msgs

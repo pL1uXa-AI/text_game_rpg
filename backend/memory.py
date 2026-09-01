@@ -26,7 +26,7 @@ import logging
 import re
 from typing import Any, Optional
 
-from . import chroma_client, db, embeddings, llm
+from . import bg, chroma_client, db, embeddings, llm
 from .config import est_tokens, get_config
 
 from .logsetup import get_logger
@@ -304,6 +304,29 @@ def compact_entity(e: dict) -> str:
     return "\n".join(parts)
 
 
+# Сколько последних карточек мира загрушает в память «окна сцены» на один ход
+# (select_relevant_entities / update_entity_cards). Значение с запасом: столько живых
+# сущностей в одном мире практически не бывает, но на многомесячных играх оно
+# ограничивает выборку БД (сессия 36, п.9).
+_SCENE_CARDS_WINDOW = 400
+
+
+def _merge_cards(cards: list[dict], fresh: list[dict]) -> list[dict]:
+    """Обновляет окно карточек мира свежезаписанными (по уникальному ключу
+    kind+entity_key) вместо второго запроса к БД (сессия 36, п.12)."""
+    if not fresh:
+        return cards
+    idx = {(c.get("kind"), c.get("entity_key")): i for i, c in enumerate(cards)}
+    out = list(cards)
+    for c in fresh:
+        key = (c.get("kind"), c.get("entity_key"))
+        if key in idx:
+            out[idx[key]] = c
+        else:
+            out.append(c)
+    return out
+
+
 def format_entity_cards(cards: list[dict]) -> str:
     return "\n\n".join(compact_entity(c) for c in cards)
 
@@ -312,8 +335,15 @@ def select_relevant_entities(world_id: int, setting: dict, action: str, limit: i
     """Выбирает карточки, важные для текущего хода:
     живые NPC и фракции, текущая локация, активные квесты, знания (раса/класс/навыки/эффекты)
     + явные упоминания в действии.
+
+    Сессия 36, п.9: вызывается СИНХРОННО на каждый ход, поэтому карточки берутся
+    ограниченной выдачей (последние по updated_at), а не все до единой: на длинной игре
+    с тысячами карточек полная выборка жрёт память и держит БД. Приоритетная сортировка
+    работает по этому окну (самые свежие карточки и есть самые вероятные релевантные).
     """
-    all_cards = db.list_entities(world_id)
+    # выдача идёт от самых свежих (updated_at DESC) — при равных приоритетах
+    # sorted() сохраняет именно этот порядок: в контекст попадают недавние карточки
+    all_cards = db.list_entities(world_id, limit=_SCENE_CARDS_WINDOW)
     if not all_cards:
         return []
     cur_loc = setting.get("current_location", "")
@@ -509,9 +539,12 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
     if not world:
         return []
     provider = provider or world_main_provider(world)
-    current = db.list_entities(world_id)
-    current_text = "\n\n".join(compact_entity(c) for c in current[-25:]) or "(карточек пока нет)"
+    # Сессия 36, п.9/п.12: ОДНА ограниченная выборка карточек на вызов (было 4 полных
+    # db.list_entities — каждая тянула все карточки мира в память на каждый ход).
+    all_cards = db.list_entities(world_id, limit=_SCENE_CARDS_WINDOW)
+    current = all_cards[-25:]
     lang = world.get("language", "ru")
+    current_text = "\n\n".join(compact_entity(c) for c in current) or "(карточек пока нет)"
     lang_instr = (
         "Используй ключи и язык: русский. " if lang == "ru"
         else "Use keys and language: English. "
@@ -589,81 +622,42 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
             await index_entities(world_id, saved)
         except Exception as e:
             log.warning("индексация карточек (world %s): %s", world_id, e)
-    # Карточки квестов должны быть видны и во вкладке «Состояние» (секция «Квесты» читает
-    # setting.quests). Синхронизируем ВСЕ карточки-квесты мира в механическое состояние, чтобы
-    # квест, заведённый архивом в Карточках, не «терялся» между вкладками (в т.ч. уже существующие).
+    # ── Синхронизация карточек архивариуса в механическое состояние setting ──
+    # Карточки, заведённые архивариусом (квест/NPC/магазин/враг/спутник/рецепт), должны
+    # быть видны и в своих разделах вкладки «Состояние», а не только во вкладке
+    # «Карточки» — иначе сущность «теряется» между вкладками.
+    #
+    # Сессия 36, п.12 (и найденный при проверке РЕАЛЬНЫЙ дефект): раньше это были три
+    # независимых блока, каждый из которых заново парсил ОДНУ И ТУ ЖЕ строку
+    # world["setting"] и в конце писал db.update_world(setting=...). Поздний блок затирая
+    # правки раннего: квест, синхронизированным первым, исчезал, стоило второму блоку
+    # записать свой «свежераспарсенный» setting. Теперь состояние парсится ОДИН раз,
+    # все правки накапливаются в одном объекте, и запись в БД — одна в конце.
+    #
+    # Окно карточек = снятое в начале вызова + обновлённые этим прогоном (один список,
+    # без повторных выборок из БД).
+    all_cards = _merge_cards(all_cards, saved)
+    # Пока архивариус думал (секунды LLM-прохода), игрок мог сходить: world снят в начале
+    # вызова, и синхронизация поверх него откатила бы setting к началу хода — берём свежак.
+    # А если для мира идёт перегенерация (↻ откатывает состояние к снапшоту и пересчитывает
+    # его), синхронизацию пропускаем вовсе: карточки уже записаны в entities, а setting
+    # пересоберёт новый ответ — наша правка здесь означала бы потерю/двоение механики
+    # (п.3A).
+    if bg.is_regenerating(world_id):
+        log.debug("архивариус (world %s): идёт перегенерация — синхронизация в setting "
+                  "пропущена", world_id)
+        return saved
+    fresh = db.get_world(world_id) or world
     try:
-        setting = world.get("setting") or {}
-        if isinstance(setting, str):
-            setting = json.loads(setting)
-        qs = setting.setdefault("quests", {})
-        quest_cards = [e for e in db.list_entities(world_id) if e.get("kind") == "quest"]
-        changed = False
-        for e in quest_cards:
-            key = e.get("entity_key") or ""
-            if not key:
-                continue
-            meta = e.get("meta") or {}
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except Exception:
-                    meta = {}
-            status = "done" if str(meta.get("status", "")).strip().lower() in ("done", "completed", "выполнен", "завершён") else "active"
-            existing = qs.get(key)
-            if existing:
-                # не затираем прогресс/описание ручного квеста — только при необходимости завершаем
-                if existing.get("status") != "active" or status == "active":
-                    continue
-                qs[key]["status"] = status
-                changed = True
-            else:
-                qs[key] = {"id": key, "title": e.get("name") or key,
-                           "desc": e.get("summary") or "", "status": status}
-                changed = True
-        if changed:
-            db.update_world(world_id, setting=setting)
+        raw = fresh.get("setting") or "{}"
+        setting = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(setting, dict):
+            raise ValueError("setting не объект")
     except Exception as e:
-        log.warning("синхронизация квестов (world %s): %s", world_id, e)
-    # Персонажи: карточки NPC (архивариус / мастер) должны появляться и в сайдбаре «Персонажи»
-    # (setting.npc), иначе встреченные в сюжете NPC (стражник, сосед, торговец…) не видны как
-    # сущности. Синхронизируем карточки kind=npc в setting.npc (только отсутствующих/живых),
-    # НЕ затирая поля (mood/alive/faction/location), которые задали руками или директивами.
-    try:
-        setting = world.get("setting") or {}
-        if isinstance(setting, str):
-            setting = json.loads(setting)
-        npc = setting.setdefault("npc", {})
-        npc_cards = [e for e in db.list_entities(world_id) if e.get("kind") == "npc"]
-        if npc_cards:
-            changed = False
-            for e in npc_cards:
-                key = e.get("entity_key") or ""
-                if not key or key in npc:
-                    continue
-                meta = e.get("meta") or {}
-                if isinstance(meta, str):
-                    try:
-                        meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
-                npc[key] = {
-                    "name": e.get("name") or key,
-                    "mood": e.get("summary") or "",
-                    "desc": e.get("bio") or e.get("summary") or "",
-                    "alive": meta.get("alive", True),
-                    "faction": meta.get("faction", ""),
-                }
-                changed = True
-            if changed:
-                db.update_world(world_id, setting=setting)
-    except Exception as e:
-        log.warning("синхронизация NPC (world %s): %s", world_id, e)
+        log.warning("синхронизация карточек (world %s): состояние не читается: %s",
+                    world_id, e)
+        return saved
 
-    # Магазины / враги / компаньоны / крафты — те же фоновые карточки архивариуса (kind
-    # shop/enemy/companion/craft) синхронизируем в механическое состояние, чтобы встреченные
-    # в сюжете сущности были видны в своих разделах, а не только во вкладке «Карточки».
-    # Добавляем только отсутствующих (без перезаписи полей, заданных директивами/вручную).
     def _card_meta(e):
         m = e.get("meta") or {}
         if isinstance(m, str):
@@ -671,23 +665,70 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
                 m = json.loads(m)
             except Exception:
                 m = {}
-        return m
+        return m if isinstance(m, dict) else {}
 
-    kind_to_setting = {
-        "shop": "shops",
-        "enemy": "enemies",
-        "companion": "companions",
-        "craft": "crafts",
-    }
+    changed = False
     try:
-        setting = world.get("setting") or {}
-        if isinstance(setting, str):
-            setting = json.loads(setting)
-        changed = False
+        # Квесты: не затираем прогресс/описание ручного квеста — только заводим новые
+        # и завершаем те, что архивариус пометил выполненными.
+        qs = setting.setdefault("quests", {})
+        if not isinstance(qs, dict):
+            setting["quests"] = qs = {}
+        for e in (c for c in all_cards if c.get("kind") == "quest"):
+            key = e.get("entity_key") or ""
+            if not key:
+                continue
+            meta = _card_meta(e)
+            status = ("done" if str(meta.get("status", "")).strip().lower()
+                      in ("done", "completed", "выполнен", "завершён") else "active")
+            existing = qs.get(key)
+            if existing:
+                if not isinstance(existing, dict):
+                    continue
+                # прежняя семантика: НЕ трогаем прогресс/описание ручного квеста;
+                # завершаем только тот, что ещё активен в мире и помечен выполненным
+                # в карточке (иначе «done» архивариуса пересилил бы сюжетный статус)
+                if existing.get("status") == "active" and status == "done":
+                    existing["status"] = "done"
+                    changed = True
+                continue
+            qs[key] = {"id": key, "title": e.get("name") or key,
+                       "desc": e.get("summary") or "", "status": status}
+            changed = True
+    except Exception as e:
+        log.warning("синхронизация квестов (world %s): %s", world_id, e)
+
+    try:
+        # NPC: поля (mood/alive/faction/location), заданные директивами/вручную, не трогает
+        npc = setting.setdefault("npc", {})
+        if not isinstance(npc, dict):
+            setting["npc"] = npc = {}
+        for e in (c for c in all_cards if c.get("kind") == "npc"):
+            key = e.get("entity_key") or ""
+            if not key or key in npc:
+                continue
+            meta = _card_meta(e)
+            npc[key] = {
+                "name": e.get("name") or key,
+                "mood": e.get("summary") or "",
+                "desc": e.get("bio") or e.get("summary") or "",
+                "alive": meta.get("alive", True),
+                "faction": meta.get("faction", ""),
+            }
+            changed = True
+    except Exception as e:
+        log.warning("синхронизация NPC (world %s): %s", world_id, e)
+
+    try:
+        # Магазины/враги/спутники/рецепты — только отсутствующие (без перезаписи полей,
+        # выставленных директивами или мастером).
+        kind_to_setting = {"shop": "shops", "enemy": "enemies",
+                           "companion": "companions", "craft": "crafts"}
         for kind, sec in kind_to_setting.items():
-            cards = [e for e in db.list_entities(world_id) if e.get("kind") == kind]
             target = setting.setdefault(sec, {})
-            for e in cards:
+            if not isinstance(target, dict):
+                setting[sec] = target = {}
+            for e in (c for c in all_cards if c.get("kind") == kind):
                 key = e.get("entity_key") or ""
                 if not key or key in target:
                     continue
@@ -711,13 +752,16 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
                     target[key] = {"id": key, "name": name, "ingredients": [], "result": {},
                                    "desc": e.get("bio") or e.get("summary") or ""}
                 changed = True
-        if changed:
-            db.update_world(world_id, setting=setting)
     except Exception as e:
         log.warning("синхронизация магазинов/врагов/компаньонов/крафтов (world %s): %s", world_id, e)
+
+    # ЕДИНСТВЕННАЯ запись за проход: накопленные правки всех секций сразу.
+    if changed:
+        try:
+            db.update_world(world_id, setting=setting)
+        except Exception as e:
+            log.warning("запись синхронизированного состояния (world %s): %s", world_id, e)
     return saved
-
-
 async def index_entities(world_id: int, cards: list[dict]) -> None:
     """Индексирует/обновляет карточки в ChromaDB (перезапись по id)."""
     for e in cards:

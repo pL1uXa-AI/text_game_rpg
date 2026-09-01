@@ -27,6 +27,7 @@ from .core import (
     _mask_provider,
     _masked_world_providers,
     _process_action,
+    invalidate_turn_registry,
     _world_persona,
     _world_provider_settings,
     _world_providers,
@@ -154,7 +155,7 @@ async def create_world(body: WorldCreate):
             if not (setting.get("player") or {}).get("name") or setting["player"]["name"] == "Путник":
                 try:
                     first = next((w for w in (setting["player"]["identity"] or "").split()
-                                  if any(ch.isalpha() for ch in w)), "").strip(",.");
+                                  if any(ch.isalpha() for ch in w)), "").strip(",.")
                     setting["player"]["name"] = first[:40] or "Путник"
                 except Exception:
                     setting["player"]["name"] = "Путник"
@@ -342,9 +343,29 @@ async def world_providers(world_id: int, body: ProvidersIn):
                 raise HTTPException(400, f"Неизвестный провайдер «{item.id}» для {kind}")
         if item is not None:
             current[kind] = _apply_provider_override(current.get(kind, {}), item)
+    # Сессия 36, п.19: раньше пер-мирная смена провайдера не проверялась нигде,
+    # и сохранение нерабочей модели превращало будущие ходы в лавину ошибок (мир
+    # продолжал думать, что всё в порядке). При создании мира такая проверка есть
+    # (503) — теперь она есть и при правке, но как предупреждение, а не блокировка:
+    # отказать в сохранении — значит запереть игрока, у которого модель поднялась
+    # через минуту, и лишить его возможности пересохранить остальные настройки.
+    warns: list[str] = []
+    eff = cfg.resolve_world_providers(current)
+    try:
+        main = eff.get("main") or {}
+        if main.get("enabled") and not await llm.check_available(main):
+            warns.append("Основная модель «" + (main.get("name") or main.get("id") or "?") +
+                         "» сейчас не отвечает (" + (main.get("base_url") or "адрес не задан") +
+                         "). Ходы будут падать, пока сервер модели не поднимется.")
+    except Exception as e:
+        log.warning("проверка доступности модели (world %s): %s", world_id, e)
     db.update_world(world_id, provider_settings=current)
+    if warns:
+        log.warning("сохранены пер-мирные провайдеры с предупреждением (world %s): %s",
+                    world_id, " | ".join(warns))
     return {"ok": True, "provider_settings": current,
-            "providers_effective": {k: _mask_provider(dict(v)) for k, v in cfg.resolve_world_providers(current).items()}}
+            "warnings": warns,
+            "providers_effective": {k: _mask_provider(dict(v)) for k, v in eff.items()}}
 
 
 # ───────────────────────────── Действия ─────────────────────────────
@@ -399,10 +420,13 @@ async def suggest_actions(world_id: int):
         raise HTTPException(404, "Мир не найден")
     setting = json.loads(world["setting"])
     providers = _world_providers(world)
-    persona = _world_persona(world)
-    # последний ответ рассказчика
+    # Рассказчик-персона (persona) здесь НЕ нужна: narrator.generate_suggestions /
+    # suggestions_messages её не принимают — подсказки это «бытовые действия игрока»,
+    # а не голос NPC. Мёртвый локальный вызов _world_persona() (ruff F841) удалён; если
+    # захотим подсказки в персоне — это отдельная доработка с параметром в narrator.
+    # последний ответ рассказчика (сессия 36, п.8: хвост истории из БД, а не весь лог)
     last_reply = ""
-    for e in reversed(db.get_events(world_id)):
+    for e in reversed(db.get_unfolded_events(world_id, limit=12, roles=("narrator",))):
         if e["role"] == "narrator":
             last_reply = e["content"]
             break
@@ -423,9 +447,11 @@ async def divine(world_id: int, body: DivineIn, _rl: None = Depends(make_guard("
     """Воззвание к Провидению (Божественный арбитр). Игрок жалуется на ошибку Рассказчика;
     та же модель со строгим отдельным промптом проверяет логику и, если ошибка реальна,
     правит мир директивами (add_item, hp, gold, квесты...) с сюжетным объяснением
-    («искажение реальности»). Провидение — корректор мира: доступно при любой неточности
-    (без потолка по ходам); защита от злоупотребления — сами ответы: без реальной ошибки
-    Провидение мягко отказывает (decline) и мир не трогает."""
+    («искажение реальности»). Провидение — корректор мира, а не генератор награды:
+    промпт запрещает выдачу сверх заявленной потери, а интервал между воззваниями
+    ограничивает DIVINE_COOLDOWN_TURNS (сессия 36, п.2; 0 = без лимита). Каждая ресурсная
+    выдача пишется в лог (`narrator._divine_grants`). Без реальной ошибки Провидение
+    мягко отказывает (decline) и мир не трогает."""
     complaint = (body.complaint or "").strip()
     if not complaint:
         raise HTTPException(400, "Опишите, в чём искажение реальности.")
@@ -436,14 +462,26 @@ async def divine(world_id: int, body: DivineIn, _rl: None = Depends(make_guard("
     if setting.get("game_over"):
         raise HTTPException(409, "Игра окончена в этом мире.")
 
-    # Кулдаун опционален (DIVINE_COOLDOWN_TURNS): по умолчанию 0 — можно воззвать в любой момент.
+    # Кулдаун DIVINE_COOLDOWN_TURNS (сессия 36, п.2): по умолчанию 3 хода. Раньше был 0,
+    # и «попросить у богов золото» можно было неограниченно — ответы модели защитой от
+    # фарма не являются. 0 по-прежнему отключает лимит (админка/.env).
     cd = max(0, int(get_config().divine_cooldown_turns))
     if cd > 0:
         turns = setting.get("_player_turns", 0) or 0
-        last = setting.get("_divine_last_turn", 0) or 0
-        if turns - last < cd:
-            left = cd - (turns - last)
-            raise HTTPException(429, f"Провидение ещё не готово ответить. Воззвать можно через {left} ход(ов).")
+        # None = «ещё ни разу не воззывался» — первое воззвание ДОСТУПНО всегда.
+        # (Раньше читалось как `... , 0) or 0`, и на старте мира получалось «боги молчат
+        # первые cd ходов»: игрок не мог пожаловаться на ошибку рассказчика в самой
+        # первой сцене — а это как раз тот момент, где Провидение нужнее всего.)
+        last_raw = setting.get("_divine_last_turn")
+        if last_raw is not None:
+            try:
+                last = int(last_raw)
+            except (TypeError, ValueError):
+                last = 0
+            if turns - last < cd:
+                left = cd - (turns - last)
+                raise HTTPException(429, f"Провидение ещё не готово ответить. "
+                                         f"Воззвать можно через {left} ход(ов).")
 
     providers = _world_providers(world)
     # Последний обмен (действие → ответ), на который указывает игрок — Провидение сверяет с ним
@@ -635,13 +673,19 @@ def _slash_status(world_id: int):
     L = [f"🧙 {name} — ур. {p.get('level', 1)}"]
     L.append(f"❤️ HP {p.get('hp', 0)}/{p.get('max_hp', 0)} | 💧 MP {p.get('mp', 0)}/{p.get('max_mp', 0)} | 🪙 {p.get('gold', 0)} | ✨ XP {p.get('xp', 0)}")
     role = []
-    if p.get("race"): role.append(f"раса: {p['race']}")
-    if p.get("class"): role.append(f"класс: {p['class']} (ранг {p.get('class_rank', 'F')})")
-    if p.get("secondary_class"): role.append(f"мультикласс: {p['secondary_class']} (ранг {p.get('secondary_rank', 'F')})")
-    if p.get("profession"): role.append(f"профессия: {p['profession']}")
-    if role: L.append("🎭 " + "; ".join(role))
+    if p.get("race"):
+        role.append(f"раса: {p['race']}")
+    if p.get("class"):
+        role.append(f"класс: {p['class']} (ранг {p.get('class_rank', 'F')})")
+    if p.get("secondary_class"):
+        role.append(f"мультикласс: {p['secondary_class']} (ранг {p.get('secondary_rank', 'F')})")
+    if p.get("profession"):
+        role.append(f"профессия: {p['profession']}")
+    if role:
+        L.append("🎭 " + "; ".join(role))
     st = p.get("stats", {})
-    if st: L.append("📊 " + ", ".join(f"{k} {v}" for k, v in st.items()))
+    if st:
+        L.append("📊 " + ", ".join(f"{k} {v}" for k, v in st.items()))
     skills = p.get("skills") or {}
     if skills:
         s = []
@@ -650,16 +694,20 @@ def _slash_status(world_id: int):
             s.append(f"{k} ({r})")
         L.append("⚔ Навыки: " + "; ".join(s))
     titles = p.get("titles") or []
-    if titles: L.append("🏅 Титулы: " + ", ".join(str(t) for t in titles[:8]))
+    if titles:
+        L.append("🏅 Титулы: " + ", ".join(str(t) for t in titles[:8]))
     rep = p.get("reputation") or {}
-    if rep: L.append("💗 Репутация: " + "; ".join(f"{k}: {v}" for k, v in list(rep.items())[:8]))
+    if rep:
+        L.append("💗 Репутация: " + "; ".join(f"{k}: {v}" for k, v in list(rep.items())[:8]))
     actions = p.get("actions") or {}
-    if actions: L.append("🔨 Дела: " + "; ".join(f"{k} ×{v}" for k, v in list(actions.items())[:10]))
+    if actions:
+        L.append("🔨 Дела: " + "; ".join(f"{k} ×{v}" for k, v in list(actions.items())[:10]))
     effects = p.get("effects") or {}
     if effects:
         L.append("✨ Эффекты: " + "; ".join(str(k) for k in list(effects.keys())[:10]))
     identity = (p.get("identity") or "").strip()
-    if identity: L.append(f"\n📜 {identity[:800]}")
+    if identity:
+        L.append(f"\n📜 {identity[:800]}")
     return {"reply": "\n".join(L), "events": [], "state": setting, "game_over": False}
 
 
@@ -731,7 +779,7 @@ def _slash_map(world_id: int):
             conn_names = [locs.get(c, {}).get("name", c) for c in conns]
             line = f"{marker} {n.get('label') or node_id}"
             if conn_names:
-                line += f" -> " + ", ".join(conn_names)
+                line += " -> " + ", ".join(conn_names)
             L.append(line)
         # связанные сущности (магазины/фракции/живые NPC)
         shops_n = [n["label"] for n in g["nodes"] if n.get("kind") == "shop" and n["id"].startswith("shop:")]
@@ -753,7 +801,7 @@ def _slash_map(world_id: int):
             conns = [locs.get(c, {}).get("name", c) for c in (loc.get("connections") or [])]
             line = f"{marker} {name}"
             if conns:
-                line += f" -> " + ", ".join(conns)
+                line += " -> " + ", ".join(conns)
             L.append(line)
     return {"reply": "\n".join(L), "events": [], "state": setting, "game_over": False}
 
@@ -867,7 +915,7 @@ def _slash_journal(world_id: int, text: str = ""):
         note = arg.split(" ", 1)[1].strip()[:400]
         if note:
             seq = db.latest_seq(world_id)
-            db.upsert_entity(world_id, _jr.KIND, f"t{seq}-note-{abs(hash(note)) % 100000}",
+            db.upsert_entity(world_id, _jr.KIND, f"t{seq}-note-{_jr._stable_key(note)}",
                              name=note, summary="", meta={"seq": seq, "cat": "note",
                                                            "icon": "✍️"}, seq=seq)
             return {"reply": "✍️ Записано в дневник.", "events": [], "state": setting,
@@ -950,6 +998,9 @@ async def rewind_world(world_id: int, body: RewindIn):
         raise HTTPException(404, "Мир не найден")
     except ValueError as e:
         raise HTTPException(400, str(e))
+    # реестр событий «последнего хода» устарел: часть id удалена/сокрыта, и следующий ↻
+    # не должен опираться на них (сессия 36, п.3B)
+    invalidate_turn_registry(world_id)
     res["world"] = db.get_world(world_id)
     return res
 
@@ -994,6 +1045,7 @@ async def load_save(world_id: int, save_id: int):
         # состояние слота применимо, но таймлайн не поддаётся честному откату —
         # не делаем вид, что всё удалось: говорим, что именно не так
         raise HTTPException(400, f"Загрузка сохранения не удалась: {e}")
+    invalidate_turn_registry(world_id)   # тот же смысл, что при перемотке (п.3B)
     # системное сообщение уже записал rewind_to (с пометкой о сохранении) — не дублируем
     return {"ok": True, "world": db.get_world(world_id), "setting": res["setting"],
             "event": res["event"], "unfolded": res["unfolded"],
@@ -1152,15 +1204,33 @@ async def _reindex_imported_world(world_id: int) -> None:
         cards = db.list_entities(world_id)
         if cards:
             await narrator.index_entities(world_id, cards)
-        evs = [e for e in db.get_events(world_id) if e["role"] in ("player", "narrator")]
-        # парами: действие игрока → следующий рассказчик
-        for i, e in enumerate(evs):
-            if e["role"] != "player":
-                continue
-            reply = next((x["content"] for x in evs[i + 1:] if x["role"] == "narrator"), "")
-            if reply:
-                await narrator.index_exchange(world_id, e["seq"], e["content"], reply,
-                                             provider=providers.get("embedding"))
+        # Сессия 36, п.8: обмены читаются СТРАНИЦАМИ (по seq вперёд), а не все разом:
+        # на перенесённом мире с десятками тысяч событий один SELECT держал бы в памяти
+        # весь лог. Индексация и так идёт по одному обмену, пагинация её не меняет.
+        # `pending` — незакрытое действие игрока с прошлой страницы (его ответ мог
+        # уехать за границу окна: раньше пара «действие → ответ» просто терялась).
+        page = 500
+        after = 0
+        pending: tuple[int, str] | None = None
+        indexed = 0
+        while True:
+            rows = db.get_events_after(world_id, after, page)
+            if not rows:
+                break
+            for e in rows:
+                role = e["role"]
+                if role == "player":
+                    # действие без ответа остаётся неиндексированным (как и раньше)
+                    pending = (e["seq"], e["content"])
+                elif role == "narrator" and pending:
+                    await narrator.index_exchange(world_id, pending[0], pending[1],
+                                                  e["content"], provider=providers.get("embedding"))
+                    pending = None
+                    indexed += 1
+            after = rows[-1]["seq"]
+            if len(rows) < page:
+                break
+        log.info("reindex после импорта (world %s): обменов проиндексировано %d", world_id, indexed)
     except Exception as e:
         log.warning("reindex после импорта (world %s): %s", world_id, e)
 

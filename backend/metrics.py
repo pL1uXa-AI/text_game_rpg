@@ -57,6 +57,7 @@ def record(turn_metrics: dict | None = None, **kw) -> None:
         return
     entry = dict(turn_metrics)
     entry.setdefault("ts", time.time())
+    _ensure_totals_baseline()   # база должна быть снята ДО первой собственной записи
     _samples.append(entry)
     _persist(entry)
 
@@ -89,6 +90,60 @@ def _avg(nums) -> float:
     return round(sum(n) / len(n), 1) if n else 0.0
 
 
+# ── Восстановление счётчиков после рестарта (сессия 36, п.24) ─────────────
+# Кумулятивные `_totals` жили только в памяти: после перезапуска «counters» в
+# /api/metrics показывали нули, хотя история ходов осталась в журнале.
+#
+# Схема: при ПЕРВОМ обращении (до записи своего хода) снимается БАЗА — сумма из
+# журнала на этот момент. Дальше отчёт = база + то, что насчитал этот процесс.
+# База снимается ровно один раз, иначе собственные записи процесса попали бы в
+# счёт дважды (их же пишет и `_persist`). Честно помечаем источник: база — не
+# «вся жизнь сервера», а лишь то, что пережило ротацию журнала.
+_totals_baseline: dict[str, float] | None = None
+
+
+def _totals_from_journal() -> dict[str, float]:
+    """(llm_calls, llm_seconds, completion_tokens, prompt_tokens) из журнала метрик."""
+    base = {"llm_calls": 0, "llm_seconds": 0.0, "completion_tokens": 0, "prompt_tokens": 0}
+    try:
+        for s in read_journal():
+            try:
+                base["completion_tokens"] += int(s.get("completion_tokens") or 0)
+                base["prompt_tokens"] += int(s.get("prompt_tokens") or 0)
+                if s.get("llm_ms") is not None:
+                    base["llm_calls"] += 1
+                    base["llm_seconds"] += float(s["llm_ms"]) / 1000.0
+            except (TypeError, ValueError):
+                continue    # битая строка журнала не обрывает агрегирование
+    except Exception as e:
+        log.warning("metrics: счётчики из журнала не восстановлены: %s", e)
+    return base
+
+
+def _ensure_totals_baseline() -> None:
+    """Снять базу один раз — до того, как процесс сам чего-нибудь дописал в журнал."""
+    global _totals_baseline
+    if _totals_baseline is None:
+        _totals_baseline = _totals_from_journal()
+
+
+def _totals_report() -> dict:
+    """Кумулятивы для отчёта: память процесса + база журнала, снятая на старте."""
+    _ensure_totals_baseline()
+    base = _totals_baseline or {}
+    out = dict(_totals)
+    if any(base.values()):
+        out["llm_calls"] = int(_totals["llm_calls"] + base.get("llm_calls", 0))
+        out["llm_seconds"] = round(_totals["llm_seconds"] + base.get("llm_seconds", 0.0), 2)
+        out["completion_tokens"] = int(_totals["completion_tokens"] + base.get("completion_tokens", 0))
+        out["prompt_tokens"] = int(_totals["prompt_tokens"] + base.get("prompt_tokens", 0))
+        out["source"] = "process+journal"
+        out["journal_baseline"] = dict(base)
+    else:
+        out["source"] = "process"
+    return out
+
+
 # ── Переживание перезапуска (сессия 33) ───────────────────────────────────
 # In-memory буфер (deque 500) был «амнезией»: рестарт сервера стирал историю времени
 # генерации, расходов токенов и кривую качества ответов — а именно по ним видно,
@@ -110,12 +165,51 @@ def _file_path():
         return None
 
 
+# ── Ротация журнала (сессия 36, п.7) ──────────────────────────────────
+# METRICS_TAIL ограничивал только ЧТЕНИЕ: файл рос весь срок жизни игры, и на
+# долгом прохождении в data/ скапливались сотни мегабайт JSON-строк.
+# Теперь при переходе порога журнал сдвигается в .1/.2/… (тот же подход, что у
+# RotatingFileHandler в logsetup). METRICS_MAX_BYTES = 0 — ротация выключена.
+_JOURNAL_MAX_BYTES = 4 * 1024 * 1024
+_JOURNAL_BACKUPS = 3
+
+
+def _journal_max_bytes() -> int:
+    try:
+        from .config import get_config
+        return max(0, int(getattr(get_config(), "metrics_max_bytes", _JOURNAL_MAX_BYTES) or 0))
+    except Exception:
+        return _JOURNAL_MAX_BYTES
+
+
+def _rotate_journal(p: Path) -> None:
+    """Сдвинуть metrics.jsonl → .1 → .2 → … при переполнении (best-effort).
+
+    Ротация — гигиена диска, а не функция игры: её сбой не должен стоить метрики хода."""
+    try:
+        cap = _journal_max_bytes()
+        if not cap or not p.exists() or p.stat().st_size < cap:
+            return
+        oldest = p.with_name(p.name + f".{_JOURNAL_BACKUPS}")
+        if oldest.exists():
+            oldest.unlink()
+        for i in range(_JOURNAL_BACKUPS - 1, 0, -1):
+            src = p.with_name(p.name + f".{i}")
+            if src.exists():
+                src.rename(p.with_name(p.name + f".{i + 1}"))
+        p.rename(p.with_name(p.name + ".1"))
+        log.info("metrics: журнал ротирован (%s, порог %d байт)", p.name, cap)
+    except Exception as e:
+        log.warning("metrics: ротация журнала не удалась: %s", e)
+
+
 def _persist(entry: dict) -> None:
     p = _file_path()
     if not p:
         return
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_journal(p)
         with p.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -173,7 +267,7 @@ def as_json(limit: int = 20) -> dict:
             "all": _aggregate(all_samples),
             "recent_60": _aggregate(recent),
         },
-        "counters": dict(_totals),
+        "counters": _totals_report(),
         "last": all_samples[-limit:],
         # ── Трейсинг фоновых агентов: среднее/суммарное время, счётчики, последние вызовы ──
         "agents": _agents_report(limit),

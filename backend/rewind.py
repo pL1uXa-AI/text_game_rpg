@@ -42,7 +42,7 @@ def _folded_ranges_covering(world_id: int, from_seq: int) -> list[dict]:
     раньше их seq: консервативно — такую сводку не разворачиваем, но и не удаляем вслепую.
     """
     out = []
-    for s in db.get_summary_events(world_id, limit=0):
+    for s in db.get_summary_events(world_id, limit=0, unfolded_only=False):
         meta = s.get("meta") or {}
         if isinstance(meta, str):
             try:
@@ -107,7 +107,9 @@ async def rewind_to(world_id: int, before_seq: int, setting: Optional[dict] = No
                     "Нет снимка состояния для этого хода — перемотка недоступна. "
                     "Используй загрузку сохранения или начни новый проход.")
 
-        # 1) сводки, которые перестают быть достоверными, и их диапазоны
+        # 1) сводки, которые перестают быть достоверными, и их диапазоны.
+        #    Берём ВСЕ сводки (включая уже сокрытые): stale — те, чьё покрытие заходит
+        #    за точку отката или чей seq ≥ точки (сводка о «будущем»).
         summaries = _folded_ranges_covering(world_id, seq)
         stale = [s for s in summaries if (s["to"] is not None and s["to"] >= seq) or s["seq"] >= seq]
         # 2) какие seq были свёрнуты этими сводками → их надо развернуть
@@ -117,13 +119,27 @@ async def rewind_to(world_id: int, before_seq: int, setting: Optional[dict] = No
                                     unfolded_only=False)
         exchange_seqs = sorted({e["seq"] for e in doomed if e["role"] in ("player", "narrator")})
         if hide:
+            # будущее — сокрыть (folded=2), включая сводки с seq ≥ точки.
             db.fold_state_range(world_id, db.FOLD_HIDDEN, seq)
+            # сводки, покрывающие откатываемый диапазон, недостоверны, даже если их seq < точки:
+            # помечаем FOLD_HIDDEN, чтобы они не попадали в промпт (get_summary_events
+            # фильтрует folded=0) и их можно было вернуть при повторной перемотке.
+            for s in stale:
+                if s["seq"] < seq:
+                    db.fold_state_range(world_id, db.FOLD_HIDDEN, s["seq"], s["seq"],
+                                        ("summary",))
             removed_n = len(doomed)
             removed_summaries = [s["seq"] for s in stale]
         else:
             # сначала сводки, потом остальное — иначе delete_events_after смел бы и их,
-            # и отчёт «сколько сводок убрано» стал бы нулём при реально удалённых сводках
+            # и отчёт «сколько сводок убрано» стал бы нулём при реально удалённых сводках.
+            # Сводки с seq < точки, но покрывающие откат, тоже удаляем (иначе они
+            # переживут перемотку и попадут в промпт как «будущее»).
+            below = [s["seq"] for s in stale if s["seq"] < seq]
             removed_summaries = db.delete_summaries_after(world_id, seq - 1)
+            if below:
+                db.delete_events_by_seq(world_id, below)
+                removed_summaries = sorted(set(removed_summaries) | set(below))
             removed_seqs = db.delete_events_after(world_id, seq - 1)
             removed_n = len(removed_seqs)
             exchange_seqs = removed_seqs

@@ -174,21 +174,21 @@ def apply_plot_start(setting: dict, plot: dict) -> list[str]:
 
     # Локации (граф карты) + текущая
     locs = {}
-    for l in (ss.get("locations") or []):
-        if isinstance(l, dict) and str(l.get("id") or "").strip():
-            lid = str(l["id"]).strip()
-            _st = l.get("stations")
+    for _loc in (ss.get("locations") or []):
+        if isinstance(_loc, dict) and str(_loc.get("id") or "").strip():
+            lid = str(_loc["id"]).strip()
+            _st = _loc.get("stations")
             if isinstance(_st, str):
                 _stations = [x.strip() for x in _st.split(",") if x.strip()]
             else:
                 _stations = [str(x) for x in (_st or []) if str(x).strip()]
-            _co = l.get("connections")
+            _co = _loc.get("connections")
             if isinstance(_co, str):
                 _conns = [x.strip() for x in _co.split(",") if x.strip()]
             else:
                 _conns = [str(x) for x in (_co or []) if str(x).strip()]
-            locs[lid] = {"name": str(l.get("name") or lid)[:80],
-                         "desc": str(l.get("desc") or ""),
+            locs[lid] = {"name": str(_loc.get("name") or lid)[:80],
+                         "desc": str(_loc.get("desc") or ""),
                          "connections": _conns,
                          "stations": _stations}
     if locs:
@@ -1262,7 +1262,7 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
     if use_tools:
         # в tools-режиме убираем объёмные примеры с маркером <<ENGINE>> (путают модель;
         # правильная форма — вызов инструмента game_engine)
-        prompt = "\n".join(l for l in prompt.splitlines() if "<<ENGINE>>" not in l)
+        prompt = "\n".join(_ln for _ln in prompt.splitlines() if "<<ENGINE>>" not in _ln)
     # ── Ярусы промпта (сессия 34, B4): минус правила о подсистемах, которых в мире нет ──
     try:
         drop = gated_rules(setting, action or "")
@@ -1275,6 +1275,11 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
         # сокращение промпта — оптимизация, а не обязательная часть хода
         log.warning("ярусы промпта не применились (ухожу на полный промпт): %s", e, exc_info=True)
     return prompt
+
+
+# Сколько последних обменов просматриваем ради оценок «👍/👎» (сессия 36, п.8).
+# Хвост с запасом: feedback игрок ставит на свежие ответы, дальше он не «переезжает».
+_FEEDBACK_SCAN_LIMIT = 60
 
 
 def format_memory(events: list[dict]) -> str:
@@ -1294,8 +1299,19 @@ def format_memory(events: list[dict]) -> str:
 
 
 def feedback_style_note(world_id: int) -> str:
-    """По последним оценкам (feedback) возвращает короткий стилевой намёк или ''."""
-    evs = [e for e in db.get_events(world_id) if e.get("feedback")]
+    """По последним оценкам (feedback) возвращает короткий стилевой намёк или ''.
+
+    Сессия 36, п.8: брался ВЕСЬ лог мира и только потом резался `[-6:]` — на десятках
+    тысяч событий это лишний полный SELECT на каждый ход. Оценка стоит в последних
+    ходах, поэтому читаем ограниченный хвост истории из БД (B5)."""
+    try:
+        tail = db.get_unfolded_events(world_id, limit=_FEEDBACK_SCAN_LIMIT,
+                                      roles=("player", "narrator"))
+    except Exception as e:
+        # без стилевой ноты ход просто продолжается как обычно — но молчать нельзя
+        log.warning("feedback_style_note (world %s): %s", world_id, e)
+        return ""
+    evs = [e for e in tail if e.get("feedback")]
     if not evs:
         return ""
     recent = evs[-6:]
@@ -1435,14 +1451,100 @@ def build_messages(world: dict, setting: dict, action: str,
 # ══════════════════════════════════════════════════════════════
 # Директивы <<ENGINE>>: парсинг + применение
 # ══════════════════════════════════════════════════════════════
-ENGINE_RE = re.compile(r"<{2}ENGINE>{2}[ \t]*(\{.*\})?", re.DOTALL)
 # Модель в tools-режиме иногда «выпевает» вызов как текст вместо настоящего tool_call:
 #   game_engine({"roll": ...})  /  game_engine { ... }  /  game_engine(...)
-GAME_ENGINE_TEXT_RE = re.compile(r"game_engine\s*\(?\s*(\{.*\})\s*\)?", re.DOTALL | re.IGNORECASE)
+# Раньше здесь жили ENGINE_RE и GAME_ENGINE_TEXT_RE (жадный `\{.*\}`) — они удалены:
+# ни одна не использовалась вне split_engine, а greedy-захват в новых форматах вреден
+# (доезжал до последней `{` в ответе). Парсер теперь ходит по тексту балансирующим
+# сканером скобок — см. _iter_json_objs/_cut_engine_blocks (сессия 36, п.4).
 
-
-# начало «служебной» части ответа: сюда уже не нужны прожимальные токены игроку
+# Начало «служебной» части ответа: сюда уже не нужны прожимальные токены игроку
 _ENGINE_START = re.compile(r"(<<ENGINE>>|game_engine\s*\()", re.IGNORECASE)
+_ENGINE_MARKERS = ("<<ENGINE>>", "game_engine(")
+
+# Каноны директив движка — из Цепочки обязанностей (mechanics.DIRECTIVE_CHAIN).
+# По ним определяем «голые» JSON-блоки механики, вставленные моделью в текст.
+try:  # осторожно: при циклическом импорте не ронять модуль — просто отключим эвристику
+    from .mechanics import DIRECTIVE_CHAIN as _DIRECTIVE_CHAIN
+
+    ENGINE_KEYS = frozenset(k for h in _DIRECTIVE_CHAIN for k in h.keys)
+except Exception:  # pragma: no cover - фолбэк для раннего импорта
+    ENGINE_KEYS = frozenset()
+# Директивы вне Цепочки обязанностей: `roll` обрабатывается ядром хода отдельно (кубы),
+# но в ответе модели это ровно такой же служебный блок, и он обязан вырезаться из текста.
+ENGINE_KEYS = ENGINE_KEYS | {"roll", "dice"}
+
+
+def _is_engine_obj(obj) -> bool:
+    """Похож ли разобранный JSON на набор директив движка?
+
+    Требование строгое: непустой dict, у которого ХОТЯ БЫ ОДИН ключ — известная директива,
+    и НЕИЗВЕСТНЫХ ключей не больше одного. Иначе проза с фигурными скобками
+    (`вырезал {рубиново} слово`) могла бы утащить в механику кусок текста."""
+    if not isinstance(obj, dict) or not obj:
+        return False
+    known = [k for k in obj if str(k) in ENGINE_KEYS]
+    unknown = [k for k in obj if str(k) not in ENGINE_KEYS]
+    return bool(known) and len(unknown) <= 1
+
+
+def _iter_json_objs(text: str):
+    """Перебирает (start, end, dict) всех СБАЛАНСИРОВАННЫХ JSON-объектов в тексте.
+
+    Балансировка скобок нужна вместо жадного регулярки на `{.*}`: при прозе после
+    механики (`… game_engine({...}) и он ушёл.` + вторая строка с `{`) greedy-регэксп
+    захватывал всё до последней `{…}` в ответе и склеивал текст. Строки/экранирование
+    учитываются, чтобы `{` внутри строкового значения не ломало баланс скобок."""
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            j += 1
+        if depth != 0 or j >= n:
+            return  # обрывок без закрытия — дальше искать нечего
+        try:
+            obj = json.loads(text[i:j + 1])
+        except Exception:
+            obj = None
+        if obj is not None:
+            yield i, j + 1, obj
+        i = j + 1
+
+
+def _merge_directives(base: Optional[dict], extra: dict) -> dict:
+    """Сливает несколько блоков механики из одного ответа (поздние дополняют ранние;
+    списочные директивы инвентаря складываем, а не затираем)."""
+    out = dict(base or {})
+    for k, v in extra.items():
+        if k in out and isinstance(v, list) and isinstance(out[k], list):
+            out[k] = list(out[k]) + list(v)
+        else:
+            out[k] = v
+    return out
 
 
 def find_engine_start(reply: str) -> int:
@@ -1452,46 +1554,124 @@ def find_engine_start(reply: str) -> int:
     return m.start() if m else -1
 
 
+def engine_tail_hold(text: str) -> int:
+    """Сколько последних символов стрима нельзя отдавать игроку: они могут оказаться
+    началом служебного маркера («…к <» / «…game_eng»). Без этого хвоста в чате на
+    долю секунды мелькают обрывки `<<ENGINE>>`/`game_engine(` (сессия 36, п.4).
+    В конце стрима буфер дописывается целиком, так что текст не теряется."""
+    low = (text or "").lower()
+    hold = 0
+    for marker in _ENGINE_MARKERS:
+        for k in range(min(len(marker) - 1, len(low)), 0, -1):
+            if low.endswith(marker[:k]):
+                hold = max(hold, k)
+                break
+    if re.search(r"[\"\u00ab<\[]\s*$", text or ""):
+        hold = max(hold, 2)
+    return hold
+
+
 def split_engine(reply: str) -> tuple[str, Optional[dict]]:
     """Вырезает механику из ответа и возвращает (чистый текст, директивы JSON или None).
-    Поддерживает три формата:
-      1) <<ENGINE>>{...}            (локальный prompt-формат)
-      2) game_engine({...}) текстом (model в tools-режиме «выпевает» вызов вместо tool_call)
-      3) один голый JSON-блок {...} в конце ответа (литрпг/аудит)"""
-    text = reply.strip()
+
+    Форматы, которые реально выдаёт модель:
+      1) <<ENGINE>>{...}             — локальный prompt-формат
+      2) game_engine({...}) текстом  — «выпетый» вызов вместо tool_call (tools-режим)
+      3) голый JSON-блок {...}       — литрпг/аудит, в конце ответа ИЛИ в середине абзаца
+
+    Реализация — ОДИН сканер (сессия 36, п.4) вместо трёх правил «от маркера до конца
+    строки». Блок механики вырезается вместе с маркером и закрывающей скобкой вызова,
+    а проза ДО и ПОСЛЕ остаётся у игрока. Прежняя версия: жадный `\\{.*\\}` захватывал
+    текст до последней `{...}` в ответе и склеивал куски, а блок в середине абзаца
+    вообще не распознавался и оставался в чате.
+    """
+    text = (reply or "").strip()
     if not text:
         return text, None
 
-    # 1) <<ENGINE>>{...}
-    m = re.search(r"<<ENGINE>>", text, re.DOTALL)
-    if m:
-        clean = text[:m.start()].strip()
-        rest = text[m.end():].strip()
-        try:
-            return clean, json.loads(rest)
-        except Exception:
-            return clean, _fallback_parse(rest)
+    # 1) где начинается служебная зона (первый из маркеров)
+    starts = []
+    m_eng = re.search(r"<<ENGINE>>", text)
+    if m_eng:
+        starts.append(m_eng.start())
+    m_ge = re.search(r"game_engine\s*\(", text, re.IGNORECASE)
+    if m_ge:
+        starts.append(m_ge.start())
+    zone = min(starts) if starts else None
 
-    # 2) game_engine({...}) текстом — вырезаем блок, JSON кладём в директивы
-    gm = GAME_ENGINE_TEXT_RE.search(text)
-    if gm:
-        clean = (text[:gm.start()] + text[gm.end():]).strip()
-        try:
-            return clean, json.loads(gm.group(1))
-        except Exception:
-            return clean, _fallback_parse(gm.group(1))
+    prose: list[str] = []
+    directives: Optional[dict] = None
 
-    # 3) один голый {...} (всегда в самом конце) — например <<ENGINE>> сам не пришёл,
-    #    а модель вернула чистый JSON блоком. Не трогаем текст, где `{}` внутри предложения.
-    tm = re.search(r"\{.*\}", text, re.DOTALL)
-    if tm and tm.end() >= len(text) - 3 and tm.start() >= len(text) // 2:
-        try:
-            d = json.loads(tm.group(0))
-            if isinstance(d, dict):
-                return text[:tm.start()].strip(), d
-        except Exception:
-            pass
-    return text, None
+    def _add(obj: dict) -> None:
+        nonlocal directives
+        directives = _merge_directives(directives, obj)
+
+    if zone is None:
+        head, tail = text, ""
+    else:
+        head, tail = text[:zone], text[zone:]
+
+    # 2) из «служебной зоны» вынимаем все directive-блоки; остальное — проза после вызова
+    if tail:
+        rest, objs = _cut_engine_blocks(tail)
+        for o in objs:
+            _add(o)
+        if not objs:
+            # JSON не разобрался (обрывок/кривые кавычки) — пробуем «ленивый» парсер,
+            # но текст при этом не выбрасываем: пусть останется в чате
+            parsed = _fallback_parse(rest)
+            if parsed:
+                _add(parsed)
+        rest = _strip_engine_markers(rest)
+        if rest.strip():
+            prose.append(rest.strip())
+
+    # 3) в «прологе» тоже мог стоять блок механики (маркер оказался позже или потерялся)
+    if head:
+        head_clean, objs = _cut_engine_blocks(head)
+        for o in objs:
+            _add(o)
+        head_clean = _strip_engine_markers(head_clean)
+        if head_clean.strip():
+            prose.insert(0, head_clean.strip())
+
+    clean = "\n\n".join(prose).strip()
+    return clean, (directives or None)
+
+
+def _cut_engine_blocks(segment: str) -> tuple[str, list[dict]]:
+    """Вырезает из текста все JSON-объекты, похожие на директивы движка.
+
+    Возвращает (остаток текста, список разобранных директив-словарей в порядке встречи).
+    Скобки балансируются вручную (строки/экранирование учитываются): жадный регэксп
+    не годится, он «доезжает» до последней `{` в ответе и уносит прозу между блоками.
+    """
+    objs: list[dict] = []
+    out: list[str] = []
+    pos = 0
+    for s, e, obj in _iter_json_objs(segment):
+        if not _is_engine_obj(obj):
+            continue
+        out.append(segment[pos:s])
+        pos = e
+        objs.append(obj)
+        # закрывающая скобка вызова game_engine(...), приклеенная к блоку
+        while pos < len(segment) and segment[pos] in " \t\n":
+            pos += 1
+        if pos < len(segment) and segment[pos] == ")":
+            pos += 1
+    out.append(segment[pos:])
+    return "".join(out), objs
+
+
+def _strip_engine_markers(text: str) -> str:
+    """Убирает оставшиеся маркеры <<ENGINE>> / game_engine( (повторные, вложенные,
+    недописанные), сохраняя текст вокруг них."""
+    if not text:
+        return text
+    text = re.sub(r"<<ENGINE>>\s*", "", text)
+    text = re.sub(r"game_engine\s*\(\s*", "", text, flags=re.IGNORECASE)
+    return text
 
 
 def _fallback_parse(text: str) -> Optional[dict]:
@@ -1728,6 +1908,19 @@ def judge_messages(setting: dict, action: str, reply: str, lang: str = "ru") -> 
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def _clamp_ratio(value, total, default: float = 1.0) -> float:
+    """Доля value/total в [0,1] для восстановления пропорции при смене максимума.
+    Если максимум не задан или нулевой — считаем «полная шкала» (default)."""
+    try:
+        v = float(value if value is not None else 0)
+        t = float(total) if total else 0.0
+    except (TypeError, ValueError):
+        return default
+    if t <= 0:
+        return default
+    return max(0.0, min(1.0, v / t))
+
+
 def _apply_judge_corrections(setting: dict, corr: dict) -> list[str]:
     """Применяет корректировку согласованности от судьи к состоянию игрока (раса/класс/профессия/уровень/навыки).
     Возвращает читаемые системные сообщения о внесённых изменениях."""
@@ -1748,13 +1941,30 @@ def _apply_judge_corrections(setting: dict, corr: dict) -> list[str]:
     try:
         lv = int(corr.get("level") or 0)
         if 1 <= lv <= 99 and lv != (p.get("level") or 1):
+            # Сессия 36, п.26: раньше ставилось hp/max_hp, mp/max_mp — то есть
+            # «бесплатное лечение» из служебной правки. Явная прокачка рассказчиком
+            # (директива player.level) восстанавливает героя СОЗНАТЕЛЬНО: это сюжетный
+            # ритуал/дар, он и сообщается как праздник. Коррекция судьи — не повод
+            # лечить: иначе раненый герой дёргал бы судью правкой уровня.
+            # Пропорция сохраняется: max_hp/max_mp пересчитает recalc_derived ниже, а
+            # доля остаётся той же (плюс прежний баг — залечивание по СТАРЫМ максимумам).
+            ratio_hp = _clamp_ratio(p.get("hp"), p.get("max_hp"))
+            ratio_mp = _clamp_ratio(p.get("mp"), p.get("max_mp"))
+            was_hp = int(p.get("hp", 0) or 0)
             p["level"] = lv
-            # восстановить HP/MP при смене уровня, как при обычной прокачке
-            p["hp"] = p.get("max_hp", 100)
-            p["mp"] = p.get("max_mp", 50)
+            recalc_derived(p, setting.get("_difficulty", "normal"))
+            new_hp = int(round(p.get("max_hp", 100) * ratio_hp))
+            # жив был — жив и остаётся (округление не должно убивать),
+            # мёртв был — не воскрешаем (решает рассказчик, закон 3)
+            if was_hp > 0 and new_hp < 1:
+                new_hp = 1
+            p["hp"] = max(0, min(new_hp, int(p.get("max_hp", 100))))
+            p["mp"] = max(0, min(int(round(p.get("max_mp", 50) * ratio_mp)),
+                                 int(p.get("max_mp", 50))))
             msgs.append(f"Уровень: {p.get('level',1)}")
-    except Exception:
-        pass
+    except Exception as e:
+        # кривой уровень от судьи не должен ронять остальные корректировки
+        log.warning("коррекция уровня судьей не применена: %s", e)
     sk = corr.get("skills")
     if isinstance(sk, list) and sk:
         for s in sk:
@@ -1811,8 +2021,16 @@ def divine_messages(world: dict, setting: dict, complaint: str,
         "правка — в directives. Не подстраивайся под каприз, но РЕАЛЬНОЕ противоречие обязано быть устранено."
         "3. Отказ (decline: true) применяй ТОЛЬКО если жалоба — каприз без фактической ошибки (просто «дай золото/предмет, "
         "потому что хочу») или если состояние уже корректно и игрок ошибается. Не списывай подлинное противоречие на «так задумано»: "
-        "если есть расхождение — это повод ИСПРАВИТЬ, а не оправдать."
-        "4. Будь краток: twist — 1–2 предложения. Отвечай ЯЗЫКОМ МИРА (персонаж слышит «голос из пустоты»).\n"
+        "если есть расхождение — это повод ИСПРАВИТЬ, а не оправдать.\n"
+        # Сессия 36, п.2: Провидение — КОРРЕКТОР, а не генератор награды. Без этой рамки
+        # та же модель, что и у рассказчика, охотно «возвращала» утраченное по несколько раз
+        # за вечер (жалоба → add_item/gold), и это был фарм, а не починка реальности.
+        "4. Границы исправления (важно): ты ВОССТАНАВЛИВАЕШЬ то, что уже было названо в обмене "
+        "(предмет, деньги, урон — ровно в том количестве, о котором речь), и НЕ выдаёшь ничего "
+        "сверх упомянутой потери. Запрещено: новое золото «в подарок», лишние предметы, лечение "
+        "сверх справедливой компенсации, прокачка уровня/статов, готовые квесты с наградой. "
+        "Если для согласованности достаточно флага/титула/квеста — правь только их.\n"
+        "5. Будь краток: twist — 1–2 предложения. Отвечай ЯЗЫКОМ МИРА (персонаж слышит «голос из пустоты»).\n"
         "ВЕРНИ ТОЛЬКО валидный JSON без пояснений:\n"
         "{\"decline\": false, \"twist\": \"<сюжетное объяснение>\", \"directives\": {..директивы..}}\n"
         "или {\"decline\": true, \"twist\": \"<голос, что игрок ошибся>\", \"directives\": {}}.\n"
@@ -1824,6 +2042,29 @@ def divine_messages(world: dict, setting: dict, complaint: str,
             exchange +
             f"ЖАЛОБА ИГРОКА: {complaint}\n\nВынеси решение (decline / correction) в JSON.")
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _divine_grants(directives: dict) -> str:
+    """Сводка «тяжёлых» выдач Провидения для лога: положительно изменённые золото/HP/MP
+    и добавленные предметы. Пустая строка, если правка ресурсам не касается."""
+    parts: list[str] = []
+    pl = directives.get("player")
+    if isinstance(pl, dict):
+        for key in ("gold", "hp", "mp"):
+            try:
+                v = int(pl.get(key) or 0)
+            except (TypeError, ValueError):
+                v = 0
+            if v > 0:
+                parts.append(f"{key}+{v}")
+    items = directives.get("add_item")
+    if isinstance(items, dict):
+        items = [items]
+    if isinstance(items, list):
+        for it in items:
+            if isinstance(it, dict) and it.get("name"):
+                parts.append(f"item:{it['name']}\u00d7{it.get('qty', 1)}")
+    return ", ".join(parts)
 
 
 async def divine_intervene(world_id: int, world: dict, setting: dict, complaint: str,
@@ -1847,7 +2088,7 @@ async def divine_intervene(world_id: int, world: dict, setting: dict, complaint:
             return None
         return d if isinstance(d, dict) else None
 
-    data, text = None, None
+    data = None
     try:
         data = await llm_json_tool(
             msgs, "divine_verdict",
@@ -1876,6 +2117,15 @@ async def divine_intervene(world_id: int, world: dict, setting: dict, complaint:
         raw = data.get("directives")
         directives = normalize_directives(raw) if isinstance(raw, dict) else None
         if directives:
+            # ПРАВИЛО 3/15 и сессия 36, п.2: Провидение может выдать ресурсы, и это
+            # единственный «кододоступный» контроль над его щедростью — каждое «тяжёлое»
+            # дарование (золото/лечение/предметы) оседает в логе, чтобы фарма не случилось
+            # незаметно. Ограничение выдачи — на уровне промпта и кулдауна в роутере.
+            heavy = _divine_grants(directives)
+            if heavy:
+                log.warning("Провидение (world %s) ВЫДАЛО ресурсы: %s — жалоба: %.120s",
+                            world_id, heavy, complaint,
+                            extra={"fields": {"divine_grants": heavy}})
             try:
                 sys_msgs = apply_directives(setting, directives)
             except Exception as e:
@@ -2321,7 +2571,6 @@ async def generate_enemy_ai(setting: dict, recent_text: str, lang: str = "ru",
 # ══════════════════════════════════════════════════════════════
 def vision_messages(setting: dict, vision: dict, lang: str = "ru", memories: list[str] | None = None) -> list[dict]:
     """Промпт видения: текст-заготовка мастера + текущее состояние + факты памяти (RAG)."""
-    p = setting.get("player") or {}
     cur = format_state(setting)
     hint = (vision or {}).get("hint", "") if isinstance(vision, dict) else ""
     mem = "\n".join(f"— {m[:200]}" for m in (memories or [])[:6]) or "(память пуста)"

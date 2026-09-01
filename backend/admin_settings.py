@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from pathlib import Path
@@ -21,12 +22,14 @@ ENV_FILE = ROOT / ".env"
 
 def db_path() -> str:
     """Путь к БД: env процесса → .env → дефолт data/game.db (как в Config.load)."""
+    from .config import strip_env_comment
+
     db_path = os.environ.get("DB_PATH", "")
     if not db_path and ENV_FILE.exists():
         for raw in ENV_FILE.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if line.startswith("DB_PATH="):
-                db_path = line.partition("=")[2].strip().strip('"').strip("'")
+                db_path = strip_env_comment(line.partition("=")[2])
                 break
     if not db_path:
         db_path = str(ROOT / "data" / "game.db")
@@ -38,7 +41,10 @@ def db_path() -> str:
 def read_overrides() -> dict:
     """{КЛЮЧ (верх. регистр): значение} из admin_settings — только непустые.
 
-    Ошибки (БД недоступна/сломана) молча дают {} — игра живёт на .env."""
+    Ошибки (БД недоступна/сломана) дают {} — игра живёт на .env. Но молчать нельзя
+    (правило 14, сессия 36 п.23): вся админка при этом тихо перестаёт действовать, и
+    «почему судья логики снова включён» приходится гадать. Пишем об этом ОДИН раз
+    (log_once), чтобы не залить лог на каждом обращении к конфигу."""
     try:
         conn = sqlite3.connect(db_path())
         try:
@@ -50,7 +56,11 @@ def read_overrides() -> dict:
         finally:
             conn.close()
         return {str(k).upper(): str(v).strip() for k, v in rows if str(v).strip()}
-    except Exception:
+    except Exception as e:
+        from .logsetup import get_logger, log_once
+        log_once(get_logger(__name__), "admin-overrides-unavailable", logging.WARNING,
+                 "admin_settings недоступна (%s) — переопределения админки игнорируются, "
+                 "игра идёт по .env", e)
         return {}
 
 

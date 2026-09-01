@@ -147,7 +147,7 @@
     <label>Интервал боевого ИИ (ходов) <input type="number" min="1" max="100" id="a-enemy-ai-interval" placeholder="2"></label>
     <label class="check"><input type="checkbox" id="a-tick-enabled"> 🌀 Авто-тик статус-эффектов</label>
     <label class="check"><input type="checkbox" id="a-tick-needs-enabled"> 🍖 Авто-тик потребностей и рассудка</label>
-    <label>Кулдаун Провидения (ходов, 0 = без) <input type="number" min="0" max="100" id="a-divine-cd" placeholder="0"></label>
+    <label>Кулдаун Провидения (ходов, 0 = без) <input type="number" min="0" max="100" id="a-divine-cd" placeholder="3"></label>
     <label>Макс. длина действия игрока (символов) <input type="number" min="50" max="10000" id="a-max-action" placeholder="640"></label>
   </div>
 
@@ -168,6 +168,13 @@
       <input type="checkbox" id="a-metrics-persist"> 📈 Журнал метрик ходов на диск (переживает рестарт)</label>
     <label>Сколько последних записей журнала читать в /api/metrics
       <input type="number" min="50" max="100000" id="a-metrics-tail" placeholder="500"></label>
+    <label class="check" title="METRICS_TAIL ограничивает только ЧТЕНИЕ. Порог размера
+      ротацирует сам файл: metrics.jsonl → .1 → .2 → .3, иначе журнал растёт бесконечно
+      на длинном прохождении. 0 = ротация выключена.">
+      <input type="checkbox" id="a-metrics-rotate"> 🔄 Ротировать журнал метрик по размеру</label>
+    <label>Порог ротации журнала метрик, байт (0 = выкл.)
+      <input type="number" min="0" max="268435456" step="1048576" id="a-metrics-max-bytes"
+        placeholder="4194304"></label>
   </div>
 
   <div class="admin-panel">
@@ -351,13 +358,21 @@ async function load() {
   const setAg = (id, key, fallback) => {
     const el = $(id);
     if (!el) return;
-    el.value = stored[key] !== undefined ? stored[key] : (fallback ?? "");
+    const v = stored[key] !== undefined ? stored[key] : (fallback ?? "");
+    el.value = v;
     el.placeholder = "" + (fallback ?? "");
+    // СЕССИЯ 36 (п.2, корневая причина): collect() отправлял ЛЮБОЕ непустое поле,
+    // поэтому каждое сохранение админки «материализовало» все текущие ЭФФЕКТИВНЫЕ
+    // значения в admin_settings — и будущий дефолт кода (например DIVINE_COOLDOWN_TURNS
+    // 0 → 3) уже не мог подействовать: поверх .env висела сохранённая старая строка.
+    // Запоминаем исходное значение и при сохранении шлём только ИЗМЕНЁННЫЕ поля.
+    el.dataset.orig = String(v ?? "");
   };
   const setAgCheck = (id, key, fb) => {
     const el = $(id);
     if (!el) return;
     el.checked = stored[key] !== undefined ? stored[key] === "true" : !!fb;
+    el.dataset.orig = el.checked ? "1" : "0";   // см. комментарий в setAg (сессия 36, п.2)
   };
   setAgCheck("a-judge-enabled", "LOGIC_JUDGE_ENABLED", ag.logic_judge_enabled);
   setAg("a-judge-interval", "LOGIC_JUDGE_INTERVAL", ag.logic_judge_interval);
@@ -378,6 +393,14 @@ async function load() {
   setAg("a-backup-keep", "BACKUP_KEEP", pz.backup_keep);
   setAgCheck("a-metrics-persist", "METRICS_PERSIST", pz.metrics_persist);
   setAg("a-metrics-tail", "METRICS_TAIL", pz.metrics_tail);
+  setAg("a-metrics-max-bytes", "METRICS_MAX_BYTES", pz.metrics_max_bytes);
+  // галка «ротировать» — это НЕ отдельный флаг конфига, а способ выставить порог в 0
+  const rot = $("a-metrics-rotate");
+  if (rot) {
+    rot.checked = (stored.METRICS_MAX_BYTES !== undefined)
+      ? String(stored.METRICS_MAX_BYTES).trim() !== "0"
+      : (pz.metrics_max_bytes ?? 0) > 0;
+  }
   const rtop = $("a-rerank-top-n"); if (rtop) { rtop.value = stored.RERANK_TOP_N !== undefined ? stored.RERANK_TOP_N : (eff.rerank_top_n ?? ""); rtop.placeholder = "" + (eff.rerank_top_n ?? ""); }
   const rthr = $("a-rerank-threshold"); if (rthr) { rthr.value = stored.RERANK_THRESHOLD !== undefined ? stored.RERANK_THRESHOLD : (eff.rerank_threshold ?? ""); rthr.placeholder = "" + (eff.rerank_threshold ?? ""); }
 
@@ -420,28 +443,58 @@ async function load() {
   setField("a-max-tokens", "MAX_TOKENS", def.max_tokens);
   setField("a-context-tokens", "CONTEXT_TOKENS", def.context_tokens);
   setField("a-hybrid-weight", "HYBRID_WEIGHT_BM25", eff.hybrid_weight_bm25);
+
+  // Сессия 36, п.2: общий снимок «как при открытии» для ЛЮБОГО контрола формы (включая
+  // setField/TTS/провайдеры, которые выше заполнялись напрямую). collect() отправляет
+  // только реально изменённые поля — иначе каждое сохранение админки закрепляло в
+  // admin_settings все ЭФФЕКТИВНЫЕ значения, и будущий дефолт кода/`.env` уже не мог
+  // до них достучаться (так, например, новый DIVINE_COOLDOWN_TURNS=3 оказывался перебит
+  // старой строкой «0» на живой базе).
+  document.querySelectorAll("input, select, textarea").forEach((el) => {
+    if (!el.id) return;
+    el.dataset.orig = el.type === "checkbox" ? (el.checked ? "1" : "0") : String(el.value ?? "");
+  });
 }
 
 function collect() {
   const payload = {};
+  // сессия 36, п.2: значение, совпадающее с тем, что было в форме при открытии,
+  // считается «не трогали» — НЕ отправляем, чтобы не закреплять в admin_settings
+  // эффективный дефолт (иначе он навсегда перебудет будущие дефолты .env/кода).
+  const valOr = (id) => {
+    const el = $(id);
+    const v = el ? String(el.value ?? "").trim() : "";
+    if (!el) return null;
+    if (el.dataset.orig !== undefined && v === el.dataset.orig.trim()) return null;
+    return v;
+  };
+  // то же для булевых тумблеров: не трогали — не шлём (иначе каждый save закрепляет
+  // эффективное значение в admin_settings и будущий дефолт .env уже не пройдётся)
+  const boolOr = (id) => {
+    const el = $(id);
+    if (!el) return null;
+    const now = el.checked ? "1" : "0";
+    if (el.dataset.orig !== undefined && now === el.dataset.orig) return null;
+    return el.checked;
+  };
   ["main", "embedding", "rerank"].forEach((kind) => {
-    const U = kind.toUpperCase();
-    payload[`${kind}_provider`] = $val(`a-${kind}-provider`);
-    const url = $val(`a-${kind}-base-url`).trim();
+    const provNow = valOr(`a-${kind}-provider`);
+    if (provNow !== null) payload[`${kind}_provider`] = provNow;
+    const url = valOr(`a-${kind}-base-url`);
     const key = $val(`a-${kind}-api-key`).trim();
-    const model = $val(`a-${kind}-model`).trim();
+    const model = valOr(`a-${kind}-model`);
     if (url) payload[`${kind}_base_url`] = url;
     if (key && key !== KEYMASK) payload[`${kind}_api_key`] = key;
     if (model) payload[`${kind}_model`] = model;
   });
-  payload.rerank_enabled = $checked("a-rerank-enabled");
-  const rtop = $val("a-rerank-top-n").trim();
-  if (rtop !== "") payload.rerank_top_n = rtop;
-  const rthr = $val("a-rerank-threshold").trim();
-  if (rthr !== "") payload.rerank_threshold = rthr;
-  payload.background_tasks_enabled = $checked("a-bgtasks-enabled");
-  const hw = $val("a-hybrid-weight").trim();
-  if (hw !== "") payload.hybrid_weight_bm25 = hw;
+  payload.rerank_enabled = boolOr("a-rerank-enabled");
+  const rtop = valOr("a-rerank-top-n");
+  if (rtop) payload.rerank_top_n = rtop;
+  const rthr = valOr("a-rerank-threshold");
+  if (rthr) payload.rerank_threshold = rthr;
+  payload.background_tasks_enabled = boolOr("a-bgtasks-enabled");
+  const hw = valOr("a-hybrid-weight");
+  if (hw !== null) payload.hybrid_weight_bm25 = hw;
   // ⚠ баг: JS строил id через `a-${f}` с подчёркиванием (a-context_tokens), а в HTML id через дефис
   // (a-context-tokens) → $val возвращал "" → поля генерации/памяти МОЛЧА не сохранялись.
   // Чиним: явное соответствие f (ключ payload) → id элемента (дефисный).
@@ -450,8 +503,8 @@ function collect() {
     max_tokens: "a-max-tokens", context_tokens: "a-context-tokens",
   };
   Object.entries(GEN_FIELD_ID).forEach(([f, id]) => {
-    const v = $val(id).trim();
-    if (v !== "") payload[f] = v;
+    const v = valOr(id);
+    if (v !== null) payload[f] = v;
   });
   // Память (f → id элемента; в HTML — дефисные id)
   const MEM_FIELD_ID = {
@@ -462,39 +515,48 @@ function collect() {
     cosine_threshold: "a-cosine", cosine_threshold_local: "a-cosine-local",
   };
   Object.entries(MEM_FIELD_ID).forEach(([f, id]) => {
-    const v = $val(id).trim();
-    if (v !== "") payload[f] = v;
+    const v = valOr(id);
+    if (v !== null) payload[f] = v;
   });
   // Фоновые агенты и мир
-  payload.logic_judge_enabled = $checked("a-judge-enabled");
-  const ji = $val("a-judge-interval").trim(); if (ji !== "") payload.logic_judge_interval = ji;
-  payload.dynamic_events_enabled = $checked("a-events-enabled");
-  const ee = $val("a-event-every").trim(); if (ee !== "") payload.event_every_turns = ee;
-  payload.autonomous_master_enabled = $checked("a-master-enabled");
-  const mi = $val("a-master-interval").trim(); if (mi !== "") payload.autonomous_master_interval = mi;
-  payload.enemy_ai_enabled = $checked("a-enemy-ai-enabled");
-  const ei = $val("a-enemy-ai-interval").trim(); if (ei !== "") payload.enemy_ai_interval = ei;
-  payload.tick_effects_enabled = $checked("a-tick-enabled");
-  payload.tick_needs_enabled = $checked("a-tick-needs-enabled");
-  const dc = $val("a-divine-cd").trim(); if (dc !== "") payload.divine_cooldown_turns = dc;
-  const ma = $val("a-max-action").trim(); if (ma !== "") payload.max_action_chars = ma;
+  payload.logic_judge_enabled = boolOr("a-judge-enabled");
+  const ji = valOr("a-judge-interval"); if (ji !== null) payload.logic_judge_interval = ji;
+  payload.dynamic_events_enabled = boolOr("a-events-enabled");
+  const ee = valOr("a-event-every"); if (ee !== null) payload.event_every_turns = ee;
+  payload.autonomous_master_enabled = boolOr("a-master-enabled");
+  const mi = valOr("a-master-interval"); if (mi !== null) payload.autonomous_master_interval = mi;
+  payload.enemy_ai_enabled = boolOr("a-enemy-ai-enabled");
+  const ei = valOr("a-enemy-ai-interval"); if (ei !== null) payload.enemy_ai_interval = ei;
+  payload.tick_effects_enabled = boolOr("a-tick-enabled");
+  payload.tick_needs_enabled = boolOr("a-tick-needs-enabled");
+  // пустое поле = «сбросить к .env» (отсюда !== null), а «0» — значимое «выключить лимит»
+  const dc = valOr("a-divine-cd"); if (dc !== null) payload.divine_cooldown_turns = dc;
+  const ma = valOr("a-max-action"); if (ma !== null) payload.max_action_chars = ma;
   // Переносимость и наблюдаемость
-  payload.detect_model_context = $checked("a-detect-ctx");
-  payload.backup_db_on_start = $checked("a-backup-start");
-  const bk = $val("a-backup-keep").trim(); if (bk !== "") payload.backup_keep = bk;
-  payload.metrics_persist = $checked("a-metrics-persist");
-  const mt = $val("a-metrics-tail").trim(); if (mt !== "") payload.metrics_tail = mt;
+  payload.detect_model_context = boolOr("a-detect-ctx");
+  payload.backup_db_on_start = boolOr("a-backup-start");
+  const bk = valOr("a-backup-keep"); if (bk !== null) payload.backup_keep = bk;
+  payload.metrics_persist = boolOr("a-metrics-persist");
+  const mt = valOr("a-metrics-tail"); if (mt !== null) payload.metrics_tail = mt;
+  // Ротация журнала: галка — производное состояние от порога (0 = выключена), поэтому
+  // обрабатываем оба перехода: снять галку → «0»; включить галку при пороге 0/пустом →
+  // дефолтный размер, иначе включение ничего не дало бы.
+  const rotChanged = boolOr("a-metrics-rotate");
+  const mb = valOr("a-metrics-max-bytes");
+  if (rotChanged === false) payload.metrics_max_bytes = "0";
+  else if (rotChanged === true && (!mb || mb === "0")) payload.metrics_max_bytes = "4194304";
+  else if (mb !== null) payload.metrics_max_bytes = mb;
   // TTS
-  payload.tts_provider = aTtsProvider();
+  const tp = valOr("a-tts-provider"); if (tp !== null && tp !== "") payload.tts_provider = tp;
   const tv = aTtsSelectedVoice();
   if (tv) payload.tts_voice = tv;
-  const tr = $val("a-tts-rate").trim();
+  const tr = valOr("a-tts-rate");
   if (tr) payload.tts_rate = tr;
-  payload.tts_enabled = $checked("a-tts-enabled");
-  payload.tts_auto_play = $checked("a-tts-auto-play");
-  payload.tts_cache_enabled = $checked("a-tts-cache");
-  const ttl = $val("a-tts-cache-ttl").trim(); if (ttl !== "") payload.tts_cache_ttl_days = ttl;
-  const tmc = $val("a-tts-max-chars").trim(); if (tmc !== "") payload.tts_max_chars = tmc;
+  payload.tts_enabled = boolOr("a-tts-enabled");
+  payload.tts_auto_play = boolOr("a-tts-auto-play");
+  payload.tts_cache_enabled = boolOr("a-tts-cache");
+  const ttl = valOr("a-tts-cache-ttl"); if (ttl) payload.tts_cache_ttl_days = ttl;
+  const tmc = valOr("a-tts-max-chars"); if (tmc) payload.tts_max_chars = tmc;
   return payload;
 }
 
@@ -532,7 +594,7 @@ const ALL_ADMIN_KEYS = [
   "ENEMY_AI_ENABLED", "ENEMY_AI_INTERVAL", "TICK_EFFECTS_ENABLED", "TICK_NEEDS_ENABLED",
   "DIVINE_COOLDOWN_TURNS", "MAX_ACTION_CHARS",
   "DETECT_MODEL_CONTEXT", "BACKUP_DB_ON_START", "BACKUP_KEEP",
-  "METRICS_PERSIST", "METRICS_TAIL",
+  "METRICS_PERSIST", "METRICS_TAIL", "METRICS_MAX_BYTES",
   "TTS_ENABLED", "TTS_PROVIDER", "TTS_VOICE", "TTS_RATE", "TTS_AUTO_PLAY",
   "TTS_CACHE_ENABLED", "TTS_CACHE_TTL_DAYS", "TTS_MAX_CHARS",
 ];

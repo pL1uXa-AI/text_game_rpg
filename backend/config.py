@@ -46,6 +46,32 @@ DEFAULT_PROVIDER_ID: dict[str, str] = {"main": "llamacpp", "embedding": "routera
 KEY_MASK = "••••••••"
 
 
+def strip_env_comment(value: str) -> str:
+    """Отрезает хвостовой комментарий строки `.env`: `KEY=value # пояснение`.
+
+    Сессия 36, п.13: раньше комментарий попадал в значение (`"value # пояснение"`), и
+    числовые/буевые настройки молча ломались (it()/flt() откатывались на дефолт, а строка
+    пути уходила в значение с мусором). Срезаем только `#` после пробела и только вне
+    кавычек — иначе сломали бы `SECRET="pa#ssword"` и URL с якорем.
+    """
+    v = (value or "").strip()
+    if not v:
+        return v
+    quote = ""
+    for i, ch in enumerate(v):
+        if quote:
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            continue
+        if ch == "#" and i > 0 and v[i - 1] in " \t":
+            v = v[:i]
+            break
+    return v.strip().strip('"').strip("'")
+
+
 @dataclass
 class Config:
     # API
@@ -131,10 +157,13 @@ class Config:
 
     # Провидение (Божественный арбитр) — ручное воззвание игроком, когда он считает, что
     # рассказчик ошибся (не выдал предмет, не списал урон и т.п.). Модель проверяет логику
-    # и правит мир директивой. Это «корректор мира»: НЕ ограничен ходами — игрок может
-    # воззвать при любой неточности, а не ждать N ходов (защита от злоупотребления
-    # лежит в самих ответах Провидения — decline без настоящей ошибки, а не в ожидании).
-    divine_cooldown_turns: int = 0    # минимум ходов между воззваниями (0 = без кулдауна)
+    # и правит мир директивой. Это «корректор мира».
+    # Сессия 36, п.2: раньше кулдаун был 0, и «попросить у богов золото» можно было в
+    # неограниченном количестве — ответы Провидения защитой от фарма не являются (они
+    # генерирует та же модель, что и директивы выдачи). Поэтому по умолчанию включён
+    # минимальный интервал: жаловаться чаще, чем раз в N ходов, не имеет смысла, а 429
+    # в роутере уже был — просто недостижимый при cd=0. 0 по-прежнему отключает лимит.
+    divine_cooldown_turns: int = 3    # минимум ходов между воззваниями (0 = без кулдауна)
     tick_effects_enabled: bool = True  # авто-тик статус-эффектов в начале хода («физический движок»)
     tick_needs_enabled: bool = True    # авто-тик потребностей/рассудка (голод/усталость/жажда/рассудок/стресс/мораль)
 
@@ -163,6 +192,10 @@ class Config:
     metrics_persist: bool = True
     metrics_file: str = "data/metrics.jsonl"
     metrics_tail: int = 500     # сколько последних строк читать из файла для отчёта
+    # Ротация журнала метрик (сессия 36, п.7): METRICS_TAIL ограничивал только чтение, а
+    # сам файл рос бесконечно. При переходе порога metrics.jsonl сдвигается в .1/.2/.3
+    # (как лог-файлы logsetup). 0 = ротация выключена (журнал растёт как раньше).
+    metrics_max_bytes: int = 4_194_304   # 4 МБ на файл журнала
     # Авто-подгонка размера контекста мира под реальный n_ctx модели (защита от обрезов
     # на локальной llama.cpp 8192 при стандарте .env 32768).
     detect_model_context: bool = True
@@ -308,7 +341,7 @@ class Config:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, _, v = line.partition("=")
-                vals[k.strip()] = v.strip().strip('"').strip("'")
+                vals[k.strip()] = strip_env_comment(v.strip())
         admin_over = admin_settings.read_overrides()
         def get(*keys: str, default=None):
             for k in keys:
@@ -393,6 +426,7 @@ class Config:
             metrics_persist=get("METRICS_PERSIST", default="true").lower() in ("1", "true", "yes", "on"),
             metrics_file=get("METRICS_FILE", default="data/metrics.jsonl"),
             metrics_tail=it(500, "METRICS_TAIL"),
+            metrics_max_bytes=it(4194304, "METRICS_MAX_BYTES"),
             detect_model_context=get("DETECT_MODEL_CONTEXT", default="true").lower() in ("1", "true", "yes", "on"),
             log_level=get("LOG_LEVEL", default="INFO"),
             log_file=get("LOG_FILE", default="data/logs/game.log"),

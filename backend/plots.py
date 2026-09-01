@@ -111,9 +111,9 @@ def _theme_from_plot(pid: str, plot: dict, group: str = "user") -> dict:
     # Стартовая локация — из starting_state.locations по start_location_id
     start_loc = None
     sid = str(meta.get("start_location_id") or "").strip()
-    for l in (start_state.get("locations") or []):
-        if isinstance(l, dict) and str(l.get("id") or "") == sid:
-            start_loc = {"name": str(l.get("name") or sid), "desc": str(l.get("desc") or "")}
+    for _loc in (start_state.get("locations") or []):
+        if isinstance(_loc, dict) and str(_loc.get("id") or "") == sid:
+            start_loc = {"name": str(_loc.get("name") or sid), "desc": str(_loc.get("desc") or "")}
             break
     # Лор: структурированные статьи или разбор lore_text
     lore_art = [a for a in (plot.get("lore_articles") or []) if isinstance(a, dict)]
@@ -186,7 +186,6 @@ def _scan() -> tuple[list[dict], dict[str, dict]]:
             if not isinstance(data, dict):
                 log.warning("plots: пропущен %s (не JSON-объект)", f)
                 continue
-            meta = _as_dict(data.get("metadata"))
             story = _as_dict(data.get("story"))
             opening = str(story.get("opening") or "").strip() or str(data.get("plot_text") or "").strip()
             if not opening:

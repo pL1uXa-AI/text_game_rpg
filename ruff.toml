@@ -13,3 +13,19 @@ ignore = [
     "E501",   # длинные строки промптов/текстов — сознательно
     "F401",   # импорты-«транзиты» в __init__ и реэкспортах фасада narrator
 ]
+
+# E402 («импорт не в начале файла») — в этом проекте НАМЕРЕННО, а не забывчиво:
+#   * narrator.py — фасад: сначала конфиг/логгер и механика, затем plots/narrators_loader
+#     (иначе цикл импортов narrator ↔ plots ↔ narrator_data);
+#   * routers/worlds.py|lore.py|system.py — роутеры реэкспортируют помощники из
+#     routers/core.py, импорт идёт после `router = APIRouter()`/логгера, чтобы
+#     избежать цикла core ↔ worlds/lore/system;
+#   * embeddings.py — тяжёлые/поздние импорты (asyncio/threading) под секцией fastembed.
+# Перенос этих импортов «наверх» ломает загрузку пакета, поэтому глушим точечно,
+# а не глобально: E402 остаётся включённым для остального кода (сессия 37).
+[lint.per-file-ignores]
+"backend/narrator.py" = ["E402"]
+"backend/embeddings.py" = ["E402"]
+"backend/routers/worlds.py" = ["E402"]
+"backend/routers/lore.py" = ["E402"]
+"backend/routers/system.py" = ["E402"]
