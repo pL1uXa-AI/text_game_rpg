@@ -359,7 +359,6 @@ def test_admin_persist_toggles_roundtrip(api_client, monkeypatch):
     env процесса имеет высший приоритет (conftest выключает персист/бэкап), поэтому
     на время теста снимаем эти три переменные."""
     from backend import db
-    from backend import config as config_mod
     from backend.config import get_config, invalidate_config
 
     client, _holder = api_client

@@ -1360,7 +1360,10 @@ def build_messages(world: dict, setting: dict, action: str,
                    recent_events: list[dict], summaries: list[dict],
                    rag_chunks: list[str], entity_cards: list[dict] | None = None,
                    persona: str | None = None, use_tools: bool = False,
-                   lore: list[str] | None = None) -> list[dict]:
+                   # D5 (аудит 38): аннотация врала — функция возвращает ПАРУ (messages, meta)
+                   # с сессии 34 (A2), а signature осталась «list[dict]»: mypy не мог проверить
+                   # вызывающий код и молча принимал dict там, где ждали список.
+                   lore: list[str] | None = None) -> tuple[list[dict], dict]:
     """Собирает единственный system-message хода. Гарантирует, что промпт НЕ вылезет за
     контекст модели (A2, сессия 34): если после бюджета recent всё равно перебор —
     в порядке меньшей важности выкидываются лор-чанки → воспоминания RAG → сводки →

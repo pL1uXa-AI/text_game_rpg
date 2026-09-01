@@ -80,9 +80,12 @@ async def create_world(body: WorldCreate):
         hook = plot_text
         is_plot = False
     else:
-        theme = narrator.get_theme(body.theme_id)
-        if not theme:
+        # D5: get_theme формально возвращает Optional — проверяем явно и дальше работаем
+        # с dict (раньше mypy молчал только потому, что шаг не выполнялся).
+        chosen = narrator.get_theme(body.theme_id)
+        if not chosen:
             raise HTTPException(400, f"Неизвестная тема: {body.theme_id}")
+        theme = chosen
         genre = theme["genre"]
         if genres_sel:
             genre = ", ".join(genres_sel)
@@ -139,7 +142,7 @@ async def create_world(body: WorldCreate):
             lore_texts = [str(v) for v in lore.values() if v]
         elif isinstance(lore, list):
             # темы из сюжетов — список статей {title, content, ...}: берём текст статьи
-            lore_texts = [v.get("content") if isinstance(v, dict) and v.get("content") else str(v)
+            lore_texts = [str(v.get("content") if isinstance(v, dict) and v.get("content") else v)
                           for v in lore if v]
     # Лор передаём в генератор, чтобы персонаж не противоречил «библии» вселенной.
     try:
@@ -191,7 +194,9 @@ async def create_world(body: WorldCreate):
         db.update_world(world_id, setting=setting)
     except Exception as e:
         log.warning("create_world update_world (world %s): %s", world_id, e)
-    world = db.get_world(world_id)
+    # D5: только что созданный мир читается через единую проверку (get_world формально
+    # возвращает Optional — mypy указывал на индексацию ["setting"] у нескольких мест)
+    world = _world_or_404(world_id)
     providers = _world_providers(world)
     persona = _world_persona(world)
 
@@ -848,10 +853,13 @@ def _slash_map(world_id: int):
         log.warning("граф (/map, world %s): %s", world_id, e)
     L = ["🗺 Известные локации:"]
     if g and g["nodes"]:
-        adj = {}
-        for e in g["edges"]:
-            adj.setdefault(e["source"], set()).add(e["target"])
-            adj.setdefault(e["target"], set()).add(e["source"])
+        # D5 (аудит 38): цикл назывался `e` ПОСЛЕ `except ... as e` выше — mypy прав, что
+        # «присваивание e вне except»: в лог попал бы не тот объект при ином раскладе.
+        # adj аннотирован явно (раньше mypy не выводил тип вложенного set).
+        adj: dict[str, set[str]] = {}
+        for edge in g["edges"]:
+            adj.setdefault(edge["source"], set()).add(edge["target"])
+            adj.setdefault(edge["target"], set()).add(edge["source"])
         # локации (kind=location); соседи из рёбер графа
         for n in g["nodes"]:
             if n.get("kind") != "location":
@@ -1112,7 +1120,7 @@ async def load_save(world_id: int, save_id: int):
     можно вернуть), ставшие недостоверными сводки сняты с выдачи, а их покрытие возвращено
     в недавнее окно. Векторы ушедших ходов убираются из ChromaDB (A4).
     """
-    world = db.get_world(world_id)
+    world = _world_or_404(world_id)
     save = db.get_save(save_id)
     if not world or not save or save["world_id"] != world_id:
         raise HTTPException(404, "Сохранение/мир не найден")

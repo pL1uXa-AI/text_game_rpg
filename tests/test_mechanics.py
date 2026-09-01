@@ -784,7 +784,6 @@ def test_divine_intervene_declines(monkeypatch, setting):
 
 
 def test_apply_judge_corrections_fills_role(setting):
-    import asyncio
     msgs = narrator._apply_judge_corrections(
         setting, {"race": "человек", "class": "Пробуждённый", "profession": "Безработный"})
     p = setting["player"]
@@ -917,7 +916,7 @@ def test_apply_character_russian_keys_and_role_fill(setting):
 
 def test_norm_rank_maps_digits_to_letters(setting):
     """Цифровые ранги навыков (1,2,3…) от генератора приводятся к буквенным ступеням F..G."""
-    from backend.mechanics import norm_rank, RANK_ORDER
+    from backend.mechanics import norm_rank
     assert norm_rank("F") == "F"
     assert norm_rank("1") == "F"
     assert norm_rank("2") == "E"
@@ -957,7 +956,6 @@ def test_apply_character_normalizes_digit_skill_ranks(setting):
 
 def test_apply_character_normalizes_mixed_skill_ranks(setting):
     """Смешанные цифровые ранги в skill_add также приводятся к буквенным."""
-    from backend.narrator import apply_directives
     data = {"name": "Кэй", "identity": "Хакер", "race": "Человек", "class": "Вор",
             "profession": "", "level": 1,
             "stats": {"сила": 10, "ловкость": 14, "выносливость": 10, "интеллект": 12,
@@ -1078,7 +1076,6 @@ def test_add_item_carries_weight(setting):
 
 
 def test_trade_buy_blocks_on_overload_and_shares_value(setting):
-    from backend import mechanics as m
     setting["player"]["gold"] = 1000
     apply_directives(setting, {"shop_add": {"id": "gb", "name": "Гильдия",
         "items": [{"name": "Слиток", "price": 5, "qty": 5, "weight": 50, "value": 3}]}})
@@ -1127,7 +1124,6 @@ def test_npc_money_and_kill_loot(setting):
 # ═══════════════ Сессия 28 (глубже): станции крафта, профессия-требование, экономика справки ═══════════════
 
 def test_craft_station_required(setting):
-    from backend import mechanics as m
     apply_directives(setting, {"gather": {"item": "Руда", "qty": 1, "weight": 1}})
     apply_directives(setting, {"craft_learn": {"name": "Ковать", "id": "smith",
         "profession": "Кузнец", "station": "кузорня",

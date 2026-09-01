@@ -23,7 +23,8 @@
 
 Использование:
     from .. import bg
-    await bg.submit("cards", coro_factory, priority=bg.PRIO_MEMORY)   # из create_task
+    await bg.submit("cards", lambda: narrator.update_entity_cards(...), priority=bg.PRIO_CARDS)
+    bg.spawn(tts.ensure_event_audio(...))          # «огонь-и-забыл» без очереди
     with bg.player_turn():                                            # в ядре хода
         ...
 """
@@ -43,19 +44,23 @@ log = get_logger(__name__)
 
 # Приоритеты (меньше — идёт раньше). Память и карточки важнее для будущих ходов,
 # «украшательства» мира — ниже хода игрока, который вообще вне очереди.
+# Значения строго соответствуют ШЕСТИ агентам, которые сюда действительно ставятся
+# (routers/core.py::_process_action). D7 (аудит 38): из списка удалены PRIO_SUMMARY и
+# PRIO_SUGGEST — задачи с ними не ставились никогда: сводка выполняется ВНУТРИ агента
+# memory (memory.summarize_and_compress после index_exchange, одним LLM-проходом, а не
+# отдельной задачей), а подсказки идут синхронно в ходе через asyncio.wait_for (их
+# очередь имела смысл только вместе с await_result — см. его удаление).
 PRIO_MEMORY = 10     # индексация обменов/сводок в Chroma
 PRIO_CARDS = 20      # архивариус карточек сущностей
 PRIO_JUDGE = 30      # судья логики (правки мира ценнее атмосферных вставок)
-PRIO_SUMMARY = 35    # свёртка истории в сводку
 PRIO_ENEMY_AI = 45   # боевой ИИ врагов
 PRIO_VISION = 55     # сны/видения
 PRIO_MASTER = 60     # автономный «мастер»
 PRIO_EVENT = 70      # динамическое событие мира
-PRIO_SUGGEST = 80    # подсказки действий (самое дешевое — можно потерять)
 
 
 class _Item:
-    __slots__ = ("prio", "seq", "name", "factory", "future", "enqueued", "world_id", "agent")
+    __slots__ = ("prio", "seq", "name", "factory", "enqueued", "world_id", "agent")
 
     def __init__(self, prio: int, seq: int, name: str, factory: Callable[[], Awaitable[Any]],
                  world_id: int | None, agent: str):
@@ -63,7 +68,6 @@ class _Item:
         self.seq = seq
         self.name = name
         self.factory = factory
-        self.future: asyncio.Future | None = None
         self.enqueued = time.monotonic()
         self.world_id = world_id
         self.agent = agent
@@ -144,19 +148,15 @@ class _Scheduler:
                 self.wait_n += 1
                 if item.world_id is not None:
                     with turn_context(world_id=item.world_id, agent=item.agent):
-                        res = await item.factory()
+                        await item.factory()
                 else:
-                    res = await item.factory()
-                if item.future and not item.future.done():
-                    item.future.set_result(res)
+                    await item.factory()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 ok = False
                 self.errors[item.name] += 1
                 log.warning("фоновая задача %r упала: %s", item.name, e, exc_info=True)
-                if item.future and not item.future.done():
-                    item.future.set_exception(e)
             finally:
                 self.running -= 1
                 self.done[item.name if ok else f"{item.name}!"] += 1
@@ -172,8 +172,7 @@ class _Scheduler:
             return True
 
     async def submit(self, name: str, factory, *, priority: int = PRIO_EVENT,
-                     world_id: int | None = None, agent: str = "",
-                     await_result: bool = False) -> Any:
+                     world_id: int | None = None, agent: str = "") -> Any:
         factory = _as_factory(factory)
         if not self._ensure():
             # нет цикла событий — выполняем напрямую (скрипты/синхронные тесты)
@@ -187,12 +186,9 @@ class _Scheduler:
                 await _close_coro(factory)
             return None
         item = _Item(priority, next(self.counter), name, factory, world_id, agent or name)
-        item.future = asyncio.get_running_loop().create_future() if await_result else None
         async with self._cond:
             heapq.heappush(self.heap, item)
             self._cond.notify()
-        if await_result and item.future is not None:
-            return await item.future
         return None
 
     @staticmethod
@@ -305,14 +301,19 @@ async def _close_coro(factory) -> None:
 
 
 async def submit(name: str, factory, *, priority: int = PRIO_EVENT,
-                 world_id: int | None = None, agent: str = "", await_result: bool = False) -> Any:
-    """Поставить фоновый LLM-проход в очередь (см. модуль). await_result=True — ждать результат.
+                 world_id: int | None = None, agent: str = "") -> Any:
+    """Поставить фоновый LLM-проход в очередь (см. модуль).
 
     `factory` — либо функция без аргументов, возвращающая корутину (`lambda: narrator.foo(...)`),
     либо уже готовая корутина (для совместимости со старым стилем `create_task(coro)`).
-    """
+
+    D7 (аудит 38): прежний флаг `await_result` (+ future-механика в _Item) удалён: ни один
+    вызов в проекте его не ставил, а «дождаться фон из хода» здесь и не нужен — очередь
+    существует, чтобы фон НЕ блокировал ответ игроку. Если понадобится настоящий
+    «запросить результат фоновой задачи», это отдельная доработка (и, скорее всего,
+    обычный asyncio.Task, а не очередь)."""
     return await _sched.submit(name, factory, priority=priority, world_id=world_id,
-                               agent=agent, await_result=await_result)
+                               agent=agent)
 
 
 @contextlib.contextmanager
@@ -354,8 +355,10 @@ def spawn(coro, name: str = "") -> asyncio.Task | None:
         return None
     task = loop.create_task(coro, name=name or None)
     _stray_tasks.add(task)
-    task.add_done_callback(_stray_tasks.discard)
-    task.add_done_callback(lambda t, n=name: _log_stray_error(n, t))
+    def _done(t: asyncio.Task, n: str = name) -> None:
+        _stray_tasks.discard(t)
+        _log_stray_error(n, t)
+    task.add_done_callback(_done)
     return task
 
 

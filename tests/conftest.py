@@ -50,7 +50,14 @@ def api_client(monkeypatch):
 
     Возвращает (client, holder): holder["reply"] — текст, который «вернёт LLM».
     Если reply содержит <<ENGINE>>{...} — механика применится как в бою.
+
+    D7 (аудит 38): планировщик фоновых задач (`bg._sched`) — модульный глобал, а каждый
+    TestClient приносит СВОЙ asyncio-цикл. `bg._ensure()` пересоздаёт примитивы при смене
+    цикла, но воркеры/heap прошлого прогона остаются живыми в старых задачах — источник
+    флейков «фон одного теста доедает очередь другого». Сбрасываем явно до и после теста.
     """
+    from backend import bg as _bg
+    _bg.reset()
     holder: dict = {"reply": "Ты осматриваешься. Вокруг тихо."}
     async def _noop(*a, **kw):
         return None
@@ -98,7 +105,12 @@ def api_client(monkeypatch):
     for _name in ("ping", "count", "query", "add", "upsert", "delete_by_where", "delete_by_ids"):
         if hasattr(chroma_mod, _name):
             monkeypatch.setattr(chroma_mod, _name, _noop_list if _name in ("query", "count") else _noop)
-    return TestClient(app), holder
+    try:
+        yield TestClient(app), holder
+    finally:
+        # D7: планировщик фоновых задач глобален — убираем его состояние ПОСЛЕ теста,
+        # иначе отменённые воркеры/heap переходят в следующий прогон со своим циклом.
+        _bg.reset()
 
 
 def create_world_payload(theme: str = "") -> dict:

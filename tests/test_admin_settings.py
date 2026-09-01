@@ -4,9 +4,7 @@
 сброс через invalidate_config."""
 from __future__ import annotations
 
-import os
 
-import pytest
 
 
 def test_db_path_from_env(tmp_path, monkeypatch):

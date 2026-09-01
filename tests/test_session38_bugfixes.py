@@ -677,7 +677,8 @@ def test_check_typos_script_runs():
     """Дешёвое закрытие класса опечаток: скрипт + шаг CI (аудит C10)."""
     script = ROOT / "scripts" / "check_typos.py"
     assert script.exists(), "нет scripts/check_typos.py"
-    import subprocess, sys
+    import subprocess
+    import sys
     r = subprocess.run([sys.executable, "-X", "utf8", str(script)], cwd=str(ROOT),
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, f"check_typos.py: {r.stdout[-800:]}{r.stderr[-400:]}"
@@ -830,7 +831,8 @@ def test_frontend_dedupes_by_event_id():
 
 def test_check_frontend_passes():
     """Встроенные проверки фронта (id-ссылки, jsAttr, CJK/омоглифы) обязаны быть зелёными."""
-    import subprocess, sys
+    import subprocess
+    import sys
     r = subprocess.run([sys.executable, "-X", "utf8",
                         str(ROOT / "scripts" / "check_frontend.py")],
                        cwd=str(ROOT), capture_output=True, text=True, timeout=300)

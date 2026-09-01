@@ -3,7 +3,6 @@
 календарь/сезоны, локации-зоны, доска объявлений, звания во фракциях, ставки на бросок."""
 from __future__ import annotations
 
-import json
 
 from backend import mechanics
 from backend.mechanics import apply_directives, normalize_directives
@@ -42,7 +41,11 @@ def test_timer_remove_and_eternal():
     assert "Вечный" not in s["timers"]
     apply_directives(s, {"timer_add": {"name": "Без срока", "turns": -1}})
     msgs = mechanics.tick_world_timers(s)
+    # D12 (аудит 38): сверяем и СИСТЕМНЫЕ СООБЩЕНИЯ тика, а не только состояние:
+    # бессрочный таймер обязан остаться и не выдать «истёк».
     assert "Без срока" in s["timers"]  # бессрочный не тикает
+    assert not any("истёк" in m for m in msgs), f"бессрочный таймер объявлен истёкшим: {msgs}"
+    assert s["timers"]["Без срока"].get("turns_left") in (-1, None)
 
 
 # ── Экипировка и слоты ──
@@ -74,10 +77,13 @@ def test_equip_directive_and_stats():
     s = _world_setting()
     s["player"]["inventory"] = [{"name": "Броня", "qty": 1, "slot": "торс", "bonus": {"выносливость": 5}}]
     msgs = apply_directives(s, {"equip": {"item": "Броня"}})
+    # D12: сообщение экипировки — часть контракта (игрок видит «🛡 Надето»)
+    assert any("Броня" in m for m in msgs), f"нет системного сообщения об экипировке: {msgs}"
     assert s["player"]["equipped"]["торс"] == "Броня"
     eff = mechanics.effective_stats(s["player"])
     assert eff["выносливость"] == 10 + 5
     msgs = apply_directives(s, {"unequip": {"item": "Броня"}})
+    assert any("Броня" in m for m in msgs), f"нет системного сообщения о снятии: {msgs}"
     assert "торс" not in s["player"]["equipped"]
 
 
@@ -88,6 +94,7 @@ def test_needs_tick_and_directive():
     before = s["player"]["needs"]["голод"]["value"]
     msgs = mechanics.tick_needs_mental(s)
     assert s["player"]["needs"]["голод"]["value"] < before
+    assert isinstance(msgs, list), "тик потребностей обязан возвращать список сообщений"
     # директива дельты
     apply_directives(s, {"needs": {"голод": {"value": -50}}})
     assert s["player"]["needs"]["голод"]["value"] <= 100 - 50
@@ -126,6 +133,8 @@ def test_location_zone_effects():
     assert s["player"]["effects"]["Радиация"]["damage"] == 2
     # при выходе снимается
     msgs = mechanics.apply_location_effects(s, "ruins", apply=False)
+    # D12/A2: именно это сообщение терялось в чате при move — проверяем его наличие
+    assert any("Радиация" in m for m in msgs), f"нет сообщения о снятии эффекта зоны: {msgs}"
     assert "Радиация" not in s["player"]["effects"]
 
 

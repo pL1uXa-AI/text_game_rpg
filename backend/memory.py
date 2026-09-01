@@ -156,7 +156,9 @@ async def index_summary(world_id: int, seq: int, summary: str, provider: dict | 
 # Сводки (сжатие старых событий)
 # ══════════════════════════════════════════════════════════════
 
-def _provider_settings(world: dict) -> dict:
+def _provider_settings(world: dict | None) -> dict:
+    if not world:      # A4/D5: мир мог быть удалён — get_world возвращает Optional
+        return {}
     try:
         ws = json.loads(world.get("provider_settings") or "{}")
         return ws if isinstance(ws, dict) else {}
@@ -657,8 +659,8 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
                     world_id, e)
         return saved
 
-    def _card_meta(e):
-        m = e.get("meta") or {}
+    def _card_meta(card):
+        m = card.get("meta") or {}
         if isinstance(m, str):
             try:
                 m = json.loads(m)
@@ -673,11 +675,11 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
         qs = setting.setdefault("quests", {})
         if not isinstance(qs, dict):
             setting["quests"] = qs = {}
-        for e in (c for c in all_cards if c.get("kind") == "quest"):
-            key = e.get("entity_key") or ""
+        for card in (c for c in all_cards if c.get("kind") == "quest"):
+            key = card.get("entity_key") or ""
             if not key:
                 continue
-            meta = _card_meta(e)
+            meta = _card_meta(card)
             status = ("done" if str(meta.get("status", "")).strip().lower()
                       in ("done", "completed", "выполнен", "завершён") else "active")
             existing = qs.get(key)
@@ -691,8 +693,8 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
                     existing["status"] = "done"
                     changed = True
                 continue
-            qs[key] = {"id": key, "title": e.get("name") or key,
-                       "desc": e.get("summary") or "", "status": status}
+            qs[key] = {"id": key, "title": card.get("name") or key,
+                       "desc": card.get("summary") or "", "status": status}
             changed = True
     except Exception as e:
         log.warning("синхронизация квестов (world %s): %s", world_id, e)
@@ -702,15 +704,15 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
         npc = setting.setdefault("npc", {})
         if not isinstance(npc, dict):
             setting["npc"] = npc = {}
-        for e in (c for c in all_cards if c.get("kind") == "npc"):
-            key = e.get("entity_key") or ""
+        for card in (c for c in all_cards if c.get("kind") == "npc"):
+            key = card.get("entity_key") or ""
             if not key or key in npc:
                 continue
-            meta = _card_meta(e)
+            meta = _card_meta(card)
             npc[key] = {
-                "name": e.get("name") or key,
-                "mood": e.get("summary") or "",
-                "desc": e.get("bio") or e.get("summary") or "",
+                "name": card.get("name") or key,
+                "mood": card.get("summary") or "",
+                "desc": card.get("bio") or card.get("summary") or "",
                 "alive": meta.get("alive", True),
                 "faction": meta.get("faction", ""),
             }
@@ -727,29 +729,29 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
             target = setting.setdefault(sec, {})
             if not isinstance(target, dict):
                 setting[sec] = target = {}
-            for e in (c for c in all_cards if c.get("kind") == kind):
-                key = e.get("entity_key") or ""
+            for card in (c for c in all_cards if c.get("kind") == kind):
+                key = card.get("entity_key") or ""
                 if not key or key in target:
                     continue
-                meta = _card_meta(e)
-                name = e.get("name") or key
+                meta = _card_meta(card)
+                name = card.get("name") or key
                 if kind == "shop":
                     target[key] = {"id": key, "name": name, "owner": meta.get("owner", ""),
                                    "faction": meta.get("faction", ""), "location": meta.get("location", ""),
-                                   "items": [], "desc": e.get("summary") or ""}
+                                   "items": [], "desc": card.get("summary") or ""}
                 elif kind == "enemy":
                     hp = meta.get("hp") or meta.get("max_hp") or 20
                     target[key] = {"name": name, "hp": hp, "max_hp": hp,
-                                   "dmg": meta.get("dmg", 4), "desc": e.get("bio") or e.get("summary") or ""}
+                                   "dmg": meta.get("dmg", 4), "desc": card.get("bio") or card.get("summary") or ""}
                 elif kind == "companion":
                     hp = meta.get("hp") or meta.get("max_hp") or 30
                     target[key] = {"id": key, "name": name, "hp": hp, "max_hp": max(hp, meta.get("max_hp") or hp),
                                    "level": meta.get("level", 1), "loyalty": meta.get("loyalty", 0),
                                    "faction": meta.get("faction", ""), "skills": meta.get("skills") or {},
-                                   "desc": e.get("bio") or e.get("summary") or ""}
+                                   "desc": card.get("bio") or card.get("summary") or ""}
                 elif kind == "craft":
                     target[key] = {"id": key, "name": name, "ingredients": [], "result": {},
-                                   "desc": e.get("bio") or e.get("summary") or ""}
+                                   "desc": card.get("bio") or card.get("summary") or ""}
                 changed = True
     except Exception as e:
         log.warning("синхронизация магазинов/врагов/компаньонов/крафтов (world %s): %s", world_id, e)

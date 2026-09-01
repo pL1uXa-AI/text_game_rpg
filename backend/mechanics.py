@@ -71,7 +71,7 @@ STAT_HINTS = {
     "удача": "криты, находки, случайные события",
 }
 
-RACES = [  # вшитые расы; мастер/рассказчик может придумать свою (race_change с bonus/passive)
+RACES: list[dict[str, Any]] = [  # вшитые расы; мастер/рассказчик может придумать свою (race_change с bonus/passive)
     {"name": "человек", "bonus": {"удача": 1, "харизма": 1}, "desc": "универсал без слабостей",
      "passive": {"name": "Адаптивность", "desc": "+10% к опыту за квесты"}},
     {"name": "эльф", "bonus": {"ловкость": 3, "мудрость": 2, "выносливость": -1},
@@ -98,7 +98,7 @@ RACES = [  # вшитые расы; мастер/рассказчик может
 ]
 RACE_NAMES = [r["name"] for r in RACES]
 
-CLASSES = [  # вшитые классы; при смене класса выдаётся стартовый навык
+CLASSES: list[dict[str, Any]] = [  # вшитые классы; при смене класса выдаётся стартовый навык
     {"name": "Воин", "stat": "сила", "desc": "танк, физ. урон, тяжёлая броня",
      "starter_skill": {"name": "Сильный удар", "rank": "F", "kind": "боевой", "desc": "мощный удар (+урон от силы)"}},
     {"name": "Лучник", "stat": "ловкость", "desc": "дальний бой, криты, скрытность",
@@ -114,7 +114,7 @@ CLASSES = [  # вшитые классы; при смене класса выд�
 ]
 CLASS_NAMES = [c["name"] for c in CLASSES]
 
-PROFESSIONS = [  # ремёсла; смена профессии даёт постоянный бафф
+PROFESSIONS: list[dict[str, Any]] = [  # ремёсла; смена профессии даёт постоянный бафф
     {"name": "Кузнец", "desc": "ковать и чинить оружие/броню", "buff": {"сила": 1}},
     {"name": "Алхимик", "desc": "зелья и эликсиры", "buff": {"интеллект": 1}},
     {"name": "Травник", "desc": "лечебные снадобья, знание ядов", "buff": {"мудрость": 1}},
@@ -180,7 +180,10 @@ def normalize_setting_ranks(setting: dict) -> bool:
     p = setting.get("player") or {}
     skills = p.get("skills")
     if isinstance(skills, dict):
-        for n, sk in list(skills.items()):
+        # D8 (аудит 38, B007): ключ `n` в этих циклах не читался — берём значения.
+        # list(...) ОСТАВЛЕН намеренно: ранг пишется в тот же dict (мутация на месте,
+        # без копии — RuntimeError: dictionary changed size during iteration).
+        for sk in list(skills.values()):
             if isinstance(sk, dict):
                 nr = norm_rank(sk.get("rank", "F"))
                 if nr != str(sk.get("rank", "F")).upper():
@@ -192,12 +195,12 @@ def normalize_setting_ranks(setting: dict) -> bool:
         if nr != str(cur).upper():
             p[key] = nr
             changed = True
-    for cid, comp in (setting.get("companions") or {}).items():
+    for comp in (setting.get("companions") or {}).values():
         if not isinstance(comp, dict):
             continue
         csk = comp.get("skills")
         if isinstance(csk, dict):
-            for n, sk in list(csk.items()):
+            for sk in list(csk.values()):
                 if isinstance(sk, dict):
                     nr = norm_rank(sk.get("rank", "F"))
                     if nr != str(sk.get("rank", "F")).upper():
@@ -244,7 +247,7 @@ def ensure_player_schema(p: dict) -> None:
     p.setdefault("actions", {})  # накопленные действия → смена профессий (PROF_ACTION_MAP)
     p.setdefault("abilities", {})  # универсальные сверхспособности/умения (магия/техника/псионика)
     p.setdefault("progress", {})    # статистика пути (ходы/убийства/квесты/локации)
-    p.setdefault("achievements", list())  # 🏆 достижения {name, desc}
+    p.setdefault("achievements", [])  # 🏆 достижения {name, desc}
     # Сессия 32: потребности/рассудок и экипировка (универсальные оси ресурсов)
     p.setdefault("needs", {})        # {голод: {value, max, decay}, ...}
     p.setdefault("mental", {})       # {рассудок/стресс/мораль: {value, max, decay}}
@@ -760,7 +763,9 @@ def tick_needs_mental(setting: dict) -> list[str]:
 def equipped_bonuses(p: dict) -> dict:
     """Суммарные бонусы от экипировки {стат: +N} (моды, базу не меняют)."""
     out: dict = {}
-    for slot, item_name in (p.get("equipped") or {}).items():
+    # D8 (B007): slot здесь не используется — equipped уже {слот: имя}, и учитывается
+    # сам факт записи, а не его ключ
+    for item_name in (p.get("equipped") or {}).values():
         if not item_name:
             continue
         it = next((x for x in (p.get("inventory") or []) if x.get("name") == item_name), None)
@@ -1009,7 +1014,7 @@ def check_profession_advance(setting: dict) -> list[str]:
     if not acts:
         return []
     cur_prof = (p.get("profession") or "").strip()
-    best: tuple = None  # (перевыполнение, действие, счётчик, порог, имя_профессии)
+    best: tuple | None = None  # (перевыполнение, действие, счётчик, порог, имя_профессии)
     for act, count in acts.items():
         prof = PROF_ACTION_MAP.get(str(act).strip().lower())
         if not prof:
@@ -1351,14 +1356,21 @@ class EffectHandler(DirectiveHandler):
             ea = d["effect_add"]
             if isinstance(ea, dict) and ea.get("name"):
                 name = str(ea["name"])[:80]
-                # turns может прийти строкой ("permanent", "∞", "forever") — держимся
+                # turns может прийти строкой ("permanent", "∞", "постоянно", "-").
+                # D8 (аудит 38, RUF034): РАНЬШЕ здесь был тернарник, у которого ОБЕ ветки
+                # давали -1, то есть разбор слов «бессрочно/постоянно/∞» не делал ничего и
+                # только вводил читателя в заблуждение (ожидалась разная семантика).
+                # Разных исходов и не должно быть: длительность решает мастер (закон 3 —
+                # код не додумывает за рассказчика), поэтому ЛЮБОЕ нечисловое значение =
+                # постоянный эффект (-1), а «0»/"5"/8 парсятся как числа. Мёртвый
+                # тернарник ниже («turns if turns != -1 else -1») свёрнут к turns.
                 _turns_raw = ea.get("turns", ea.get("duration", -1))
                 try:
                     turns = int(_turns_raw)
                 except (TypeError, ValueError):
-                    turns = -1 if isinstance(_turns_raw, str) and _turns_raw.strip().lower() in ("permanent", "forever", "∞", "бессрочно", "постоянно", "-1") else -1
+                    turns = -1
                 new_ef = {
-                    "turns": turns if turns != -1 else -1,
+                    "turns": turns,
                     "damage": int(ea.get("damage", 0) or 0),
                     "heal": int(ea.get("heal", 0) or 0),
                     "kind": str(ea.get("kind", "особый"))[:30],
@@ -1542,12 +1554,12 @@ class CraftHandler(DirectiveHandler):
                 cr = {"id": str(cr)}
             rid = str(cr.get("id", "") or "").strip() or (cr.get("name") or "").strip()
             if rid:
-                ing = {}
+                ing: dict[str, int] = {}
                 for it in (cr.get("ingredients") or []):
                     if isinstance(it, dict) and (it.get("name") or "").strip():
                         nm = str(it["name"]).strip()
                         ing[nm] = ing.get(nm, 0) + max(1, _safe_int(it.get("qty", 1), 1))
-                ing = [{"name": n, "qty": q} for n, q in ing.items()]
+                ing_list = [{"name": n, "qty": q} for n, q in ing.items()]
                 res = cr.get("result") or cr.get("name")
                 if isinstance(res, dict):
                     res = {"name": str(res.get("name", rid)).strip(), "qty": max(1, _safe_int(res.get("qty", 1), 1)),
@@ -1557,7 +1569,7 @@ class CraftHandler(DirectiveHandler):
                 else:
                     res = {"name": str(res or rid).strip(), "qty": 1, "value": 0, "weight": 0.0, "desc": ""}
                 crafts[rid] = {"id": rid, "name": cr.get("name", rid),
-                               "result": res, "ingredients": ing,
+                               "result": res, "ingredients": ing_list,
                                "profession": cr.get("profession", ""), "desc": cr.get("desc", "")}
                 # опциональная станция/мастерская (универсально для всех жанров)
                 _st = cr.get("station")

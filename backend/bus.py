@@ -25,13 +25,20 @@ import json
 from collections import defaultdict
 from typing import Callable, Optional
 
-from .logsetup import get_logger
+from .logsetup import get_logger, log_once
 
 log = get_logger(__name__)
 
 _MAX_QUEUE = 200                 # на подписчика: больше = клиент завис, режем старое
 _loop: Optional[asyncio.AbstractEventLoop] = None
+# defaultdict(set) ОПАСЕН: чтение на отсутствующем ключе СОЗДАЁТ пустое множество
+# (протечка ключей → растёт _subs и счётчик «миров» в stats()). Поэтому читается через
+# _queues() (get, а не []), а пустое множество удаляется явно (см. unsubscribe/publish).
 _subs: dict[int, set[asyncio.Queue]] = defaultdict(set)
+# Счётчики ПРИБЛИЗИТЕЛЬНЫЕ (аудит 38, D10): publish() вызывается и из потока цикла БД
+# (publish_threadsafe → call_soon_threadsafe), и из цикла приложения; инкременты идут без
+# блокировки. Для наблюдаемости («есть ли потери рассылки») это допустимо, но читать их
+# как точный журнал нельзя — и нигде они так и не читаются (только отдаются в /api/metrics).
 _sent = 0
 _dropped = 0
 
@@ -52,17 +59,32 @@ def subscribe(world_id: int) -> asyncio.Queue:
     return q
 
 
+def _queues(world_id: int) -> set[asyncio.Queue] | None:
+    """Очереди мира БЕЗ создания записи (defaultdict[...] создал бы пустое множество)."""
+    return _subs.get(int(world_id))
+
+
 def unsubscribe(world_id: int, q: asyncio.Queue) -> None:
-    with contextlib.suppress(KeyError):
-        _subs[int(world_id)].discard(q)
-        if not _subs[int(world_id)]:
-            del _subs[int(world_id)]
+    # D10 (аудит 38): три прежних дефекта в четырёх строках —
+    #   (1) `_subs[int(world_id)]` на отсутствующем ключе СОЗДАВАЛ множество (протечка ключей);
+    #   (2) `contextlib.suppress(KeyError)` был мёртв: defaultdict KeyError не бросает;
+    #   (3) `del` при параллельном subscribe() того же мира мог выбросить ЧУЖУЮ очередь.
+    # Теперь: читаем через get() (без создания записи) и удаляем ключ только если
+    # множество опустело именно от нашего discard — между discard и проверкой вклиниться
+    # чужому subscribe нельзя, т.к. весь publish/unsubscribe живёт в одном цикле событий.
+    wid = int(world_id)
+    qset = _subs.get(wid)
+    if qset is None:
+        return
+    qset.discard(q)
+    if not qset:
+        del _subs[wid]
 
 
 def publish(world_id: int, payload: dict) -> None:
     """Асинхронная публикация (вызываем из async-кода)."""
     global _sent, _dropped
-    qset = _subs.get(int(world_id))
+    qset = _queues(world_id)
     if not qset:
         return
     for q in list(qset):
@@ -77,9 +99,10 @@ def publish(world_id: int, payload: dict) -> None:
             try:
                 q.put_nowait(payload)
             except asyncio.QueueFull:
-                log_once_id = f"bus-full-{world_id}"
-                from .logsetup import log_once
-                log_once(log, log_once_id, 30,
+                # D10 (аудит 38): импорт и log_once были ВНУТРИ обработчика на «горячем»
+                # пути рассылки (import в except — лишняя работа в момент, когда клиент
+                # и так отстал). Импорт — наверху модуля, ключ — инлайном.
+                log_once(log, f"bus-full-{world_id}", 30,
                          "bus: очередь подписчика мира %s переполнена — клиент отстанет "
                          "и догрузит по поллингу", world_id)
 
@@ -90,7 +113,7 @@ def publish_threadsafe(world_id: int, payload: dict) -> None:
     Вызов может прийти из любого потока (в т.ч. фонового цикла aiosqlite) — поэтому
     идём через call_soon_threadsafe, а не трогаем очереди напрямую.
     """
-    if not _subs.get(int(world_id)):
+    if not _queues(world_id):
         return
     loop = _loop
     if loop is None:

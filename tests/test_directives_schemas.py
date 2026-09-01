@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
 
 from backend import directives
 from backend import narrator

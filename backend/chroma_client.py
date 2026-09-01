@@ -13,6 +13,7 @@ delete_by_* применяется к ОБЕИМ коллекциям (base и l
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 import httpx
@@ -137,23 +138,37 @@ async def add(ids: list[str], embeddings: list[list[float]], metadatas: list[dic
     name = collection_name_for_dim(dim)
     cid = await ensure_collection(name)
     payload = {"ids": ids, "embeddings": normed, "metadatas": metadatas, "documents": documents}
-    # при несовпадении размерности (старая коллекция другой размерности) — пересоздаём имя с суффиксом
+    # D9 (аудит 38): в этом обработчике было два дефекта.
+    #   (а) условие «"dimension" in str(e).lower() or "dimension" in str(e)» — вторая часть
+    #       является подмножеством первой, то есть мертва (смысл был в регистронезависимости);
+    #   (б) dimension-ветка имела собственный `continue` без потолка attempt: при
+    #       повторяющемся конфликте размерностей имя удлинялось каждый круг
+    #       (`base_local_4096_4096_…`), в Chroma плодились мусорные коллекции, а кэш
+    #       `_collections` очищался только по последнему имени. Теперь на конфликт — ОДНА
+    #       попытка переименования, затем предупреждение и наружу (закон 2: код замечает
+    #       неладное, а не молча копит мусор). `import asyncio` из тела перенесён наверх.
+    renamed = False
     for attempt in range(1, 4):
         try:
             await _raw("POST", _collection_url(cid, "/add"), payload)
             return
         except RuntimeError as e:
-            if "dimension" in str(e).lower() or "dimension" in str(e):
-                # размерности не совпали — регистрируем свежее имя и пробуем ещё раз
+            msg = str(e)
+            if "dimension" in msg.lower():
+                if renamed:
+                    log.warning("ChromaDB: повторный конфликт размерности (коллекция %s, "
+                                "вектор %d) — добавление прервано вместо бесконечного "
+                                "переименования коллекции", name, dim)
+                    raise
                 _collections.pop(name, None)
-                name = name + "_" + str(dim)
+                name = f"{name}_{dim}"
                 cid = await ensure_collection(name)
+                renamed = True
                 continue
-            if "ECONNRESET" not in str(e) and "reset" not in str(e).lower():
+            if "econnreset" not in msg.lower() and "reset" not in msg.lower():
                 raise
             if attempt >= 3:
                 raise
-            import asyncio
             await asyncio.sleep(2 * attempt)
 
 

@@ -73,7 +73,6 @@ def test_risk_returns_resources_and_no_verdict(api_client):
 
 def test_chekhov_guns_lifecycle():
     """C9: ружья заряжаются из диффа, снимаются по упоминанию, гаснут по TTL."""
-    wid = _mk_base_world()
     prev = {"player": {"hp": 50, "inventory": []}, "npc": {}, "locations": {"a": {"name": "Таверна"}},
             "flags": {}, "quests": {}, "timers": {}}
     now = {"player": {"hp": 50, "inventory": [{"name": "Старый компас"}]},

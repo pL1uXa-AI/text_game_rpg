@@ -18,7 +18,6 @@ import asyncio
 import json
 import re
 
-import pytest
 
 from backend import db, journal, rewind
 

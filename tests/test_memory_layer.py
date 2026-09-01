@@ -309,6 +309,9 @@ def test_world_recent_budget_math(fake_config):
     """A2 (сессия 34): бюджет recent = контекст − (измеренный промпт + ответ) − резерв памяти,
     где резерв — ДОЛЯ окна, а не плоские 16384 (которые были больше всего локального n_ctx)."""
     cfg = fake_config(context_tokens=32768, max_tokens=2000)
+    # D12 (аудит 38): фикстура возвращает конфиг — сверяем, что подмена действительно та,
+    # на которую опирается формула (иначе тест мог «проходить» на чужих значениях).
+    assert cfg.context_tokens == 32768 and cfg.max_tokens == 2000
     w = {"gen_settings": json.dumps({"context_tokens": 32768, "max_tokens": 2000})}
     b = narrator.world_recent_budget(w)
     extra = narrator.memory_extra_budget(w)
@@ -614,6 +617,8 @@ def test_tts_effective_disabled_globally(fake_config):
                       tts_rate="+0%")
     eff = tts.tts_effective({"tts_settings": json.dumps({"enabled": True})})
     assert eff.get("enabled") is False or eff.get("provider") in ("none", "edge")
+    # D12: per-world «enabled: true» не обязан побеждать глобальное выключение озвучки
+    assert cfg.tts_enabled is False, "фикстура не подменила глобальный выключатель"
 
 
 def test_piper_voice_ready_false_when_missing(monkeypatch, tmp_path):

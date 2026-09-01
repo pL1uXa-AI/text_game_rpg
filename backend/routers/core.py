@@ -191,18 +191,22 @@ def _mask_provider(p: dict) -> dict:
     return out
 
 
-def _world_provider_settings(world: dict) -> dict:
+def _world_provider_settings(world: dict | None) -> dict:
+    """Per-world переопределения провайдеров (мир может быть None — см. A4: фоновые
+    агенты читают мир, который успели удалить; None = «переопределений нет»)."""
+    if not world:
+        return {}
     try:
         return json.loads(world.get("provider_settings") or "{}")
     except Exception:
         return {}
 
 
-def _world_providers(world: dict) -> dict:
+def _world_providers(world: dict | None) -> dict:
     return get_config().resolve_world_providers(_world_provider_settings(world))
 
 
-def _masked_world_providers(world: dict) -> dict:
+def _masked_world_providers(world: dict | None) -> dict:
     return {k: _mask_provider(dict(v)) for k, v in _world_providers(world).items()}
 
 
@@ -219,14 +223,16 @@ def _masked_provider_settings(settings: dict) -> dict:
             for k, v in (settings or {}).items()}
 
 
-def _safe_world_row(world: dict) -> dict:
+def _safe_world_row(world: dict | None) -> dict | None:
     """Строка мира для ОТДАЧИ наружу: `provider_settings` замаскирован внутри JSON-строки.
 
     A3 (аудит 38): отдельного замаскированного поля в ответе мало — `world_detail` отдаёт
     и весь dict мира (`world.provider_settings` — сырой JSON из БД), и через него живой
     ключ утекал наружу. Server-side резолв провайдеров читает исходную строку, поэтому
     его маскирование копии не затрагивает."""
-    out = dict(world or {})
+    if not world:
+        return None
+    out = dict(world)
     try:
         out["provider_settings"] = json.dumps(_masked_provider_settings(
             _world_provider_settings(world)), ensure_ascii=False)
@@ -334,7 +340,9 @@ async def _context_guard(world_id: int, providers: dict, gen_settings: dict) -> 
     return g
 
 
-def _world_persona(world: dict) -> str | None:
+def _world_persona(world: dict | None) -> str | None:
+    if not world:
+        return None
     nid = world.get("narrator_id")
     if not nid:
         return None
@@ -346,7 +354,7 @@ def _world_persona(world: dict) -> str | None:
             log.warning("персона рассказчика пуста (world %s, narrator_id %s) — мир играется "
                         "со стандартным голосом", world.get("id"), nid)
             return None
-        return nr["prompt"]
+        return str(nr["prompt"])
     except Exception as e:
         # A19 (аудит 38, правило 14): раньше это был голый `except: return None` — мир тихо
         # терял выбранную персону, и «почему рассказчик снова безликий» приходилось гадать.
@@ -618,7 +626,7 @@ def _dedupe_repeats(text: str) -> str:
         seps.append(pending)
         blocks.append(piece.strip())
         pending = ""
-    out: list[str] = []
+    out: list[tuple[str, str]] = []
     dropped = 0
     for i, b in enumerate(blocks):
         if out and len(b) >= 30 and b == out[-1][1]:
@@ -1372,9 +1380,10 @@ async def _maybe_dynamic_event(world_id: int) -> None:
             return
         event_text, directives = ev
         # свежее состояние: игрок мог успеть походить, пока генерировали; не задваиваем событие
-        world2 = db.get_world(world_id)
-        setting2 = json.loads(world2["setting"])
-        if not _bg_may_write(world_id, setting2, "_event_last_turn", last_turn, turns):
+        # (A4: перечитывание через хелпер фона — удалённый мир не даёт TypeError)
+        setting2 = _fresh_setting_or_none(world_id)
+        if setting2 is None or not _bg_may_write(world_id, setting2, "_event_last_turn",
+                                                 last_turn, turns):
             log.debug("событие мира (world %s): запись пропущена (перегенерация/новый ход)",
                       world_id)
             return

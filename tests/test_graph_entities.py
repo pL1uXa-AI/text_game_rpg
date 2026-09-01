@@ -42,8 +42,9 @@ def test_sync_incremental_no_write_when_unchanged():
     setting = {"locations": {"a": {"name": "A", "connections": ["b"]}, "b": {"name": "B"}}}
     graph.sync_from_setting(11, setting)
     # (node_id, label, kind) — сравним до/после повторного синка
-    snap = lambda: { (n["node_id"], n["label"], n["kind"]) for n in db.graph_nodes(11) } | \
-                   { (e["source"], e["target"]) for e in db.graph_edges(11) }
+    def snap():
+        return ({(n["node_id"], n["label"], n["kind"]) for n in db.graph_nodes(11)}
+                | {(e["source"], e["target"]) for e in db.graph_edges(11)})
     s1 = snap()
     # повторный синк с тем же состоянием (deep-copy): граф не перестраивается
     graph.sync_from_setting(11, json.loads(json.dumps(setting)))

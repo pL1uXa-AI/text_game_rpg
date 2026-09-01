@@ -14,7 +14,6 @@ import re
 import json
 import logging
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -129,7 +128,6 @@ def test_turn_registry_rebuilt_from_db(api_client):
     """После «рестарта» (пустой in-memory реестр) ↻ обязан ЗАМЕНИТЬ события хода, а не
     добавить второй комплект."""
     client, holder = api_client
-    from backend import narrator
     wid = _mk_world(client, "П3")
     r = client.post(f"/api/worlds/{wid}/action", json={"text": "осмотреться"})
     assert r.status_code == 200
@@ -305,7 +303,6 @@ def test_engine_tail_hold_protects_partial_marker():
 def test_stream_never_emits_engine_marker(api_client, monkeypatch):
     """Сквозная проверка SSE: ни один токен не содержит обрывок служебного блока."""
     client, holder = api_client
-    from backend import narrator
     wid = _mk_world(client, "П4")
     holder["reply"] = ('Ты идёшь вперёд. game_engine({"player": {"gold": 5}}) '
                        'факелы зашипели во тьме.')
@@ -578,7 +575,7 @@ def test_list_worlds_counts_are_correct():
 def test_list_worlds_uses_single_group_by_query():
     src = io.open(ROOT / "backend" / "db.py", encoding="utf-8").read()
     body = _func_body(src, src.index("async def _list_worlds"))
-    sql = " ".join(l for l in body.splitlines() if not l.strip().startswith("#"))
+    sql = " ".join(ln for ln in body.splitlines() if not ln.strip().startswith("#"))
     assert "GROUP BY world_id" in sql, "вернулся correlated COUNT(*) на каждую строку"
     assert sql.count("COUNT(*)") == 1, "в запросе больше одного COUNT — счётчик перекосится"
 
@@ -597,7 +594,6 @@ def test_db_run_has_timeout_and_loop_guard():
 
 def test_db_run_from_bg_thread_raises(monkeypatch):
     """Вызов _run из потока фонового цикла БД = понятная ошибка, а не вечный стоп."""
-    import threading
     db_mod._ensure_loop()
     box: dict = {}
 
@@ -613,7 +609,7 @@ def test_db_run_from_bg_thread_raises(monkeypatch):
     fut = None
     with db_mod._lock:
         fut = __import__("asyncio").run_coroutine_threadsafe(_probe(), db_mod._loop)
-        res = fut.result(timeout=20)
+        fut.result(timeout=20)      # ждём пробы; её «результат» (None) не используется
     assert isinstance(box.get("err"), RuntimeError), f"ожидался RuntimeError, получено {box.get('err')!r}"
     assert "взаимоблокировк" in str(box["err"]).lower() or "дедлок" in str(box["err"]).lower()
 
@@ -853,7 +849,6 @@ def test_admin_rejects_out_of_range_bm25(api_client):
 # ══════════════════════════════════════════════════════════════════════
 
 def test_app_has_lifespan_shutdown():
-    from backend.app import app as fastapi_app
     src = io.open(ROOT / "backend" / "app.py", encoding="utf-8").read()
     assert "asynccontextmanager" in src and "def _lifespan" in src
     assert "db.close" in src and "llm.close" in src and "chroma_client.close" in src
@@ -867,7 +862,9 @@ def test_bg_shutdown_nowait_cancels_workers():
     async def _scenario():
         async def _slow():
             await asyncio.sleep(30)
-        t = await bg_mod.submit("slow", lambda: _slow(), world_id=1, agent="slow")
+        # D12 (аудит 38): задача ставится РАДИ побочного эффекта (воркер её подхватит),
+        # а await_result не включён — возвращаемое значение здесь и не может быть результатом.
+        await bg_mod.submit("slow", lambda: _slow(), world_id=1, agent="slow")
         await asyncio.sleep(0.05)
         assert bg_mod.stats()["queued"] + bg_mod.stats()["running"] >= 0
         bg_mod.shutdown_nowait()
@@ -922,12 +919,12 @@ def test_start_bat_tolerates_401():
     seg = bat[bat.index("REM 1. Проверка llama.cpp"):bat.index("REM 2.")]
     # только ИСПОЛНЯЕМЫЕ строки секции (в REM-комментарии слово errorlevel законно —
     # там оно объясняет, от чего мы ушли)
-    code = [l.strip() for l in seg.splitlines()
-            if l.strip() and not l.strip().upper().startswith("REM")
-            and not l.strip().startswith(":")]
-    assert not any("errorlevel" in l.lower() for l in code), \
+    code = [ln.strip() for ln in seg.splitlines()
+            if ln.strip() and not ln.strip().upper().startswith("REM")
+            and not ln.strip().startswith(":")]
+    assert not any("errorlevel" in ln.lower() for ln in code), \
         "проверка снова на errorlevel curl (любая 4xx = «мёртв» — ложный отказ в запуске)"
-    assert any("LLAMA_CODE" in l for l in code), "пропадала проверка HTTP-кода ответа"
+    assert any("LLAMA_CODE" in ln for ln in code), "пропадала проверка HTTP-кода ответа"
     assert "llama_dead" in seg and "000" in seg
 
 
@@ -981,7 +978,6 @@ def test_world_providers_no_warning_when_available(api_client, monkeypatch):
 def test_all_documented_keys_exist_in_config():
     """Ключи из .env.example обязаны читаться конфигом (нет «мёртвых» настроек)."""
     from backend.config import Config
-    import re
     fields = {f.name.upper() for f in __import__("dataclasses").fields(Config)}
     missing = []
     for line in io.open(ROOT / ".env.example", encoding="utf-8"):
@@ -1000,7 +996,6 @@ def test_all_documented_keys_exist_in_config():
 
 def test_tts_edge_retry_on_transient(monkeypatch, fake_config):
     """429/обрыв от Microsoft-сервиса — не ⚠ у игрока, а автоматический повтор."""
-    import types
     pytest.importorskip("edge_tts", reason="опциональная зависимость (requirements-optional.txt)")
     import edge_tts
     from backend import tts as tts_mod
@@ -1124,7 +1119,8 @@ def test_turn_registry_fallback_for_legacy_world():
         syst = db_mod.add_event(wid, "system", "Золото: 5")     # seq 4
         bg_sys = db_mod.add_event(wid, "system", "🌍 Событие мира")   # seq 5 (фон)
         bg_vis = db_mod.add_event(wid, "narrator", "🌙 Видение:\n…")  # seq 6 (фон)
-        core_mod._turn_events.clear(); core_mod._turn_seq.clear()
+        core_mod._turn_events.clear()
+        core_mod._turn_seq.clear()
 
         ids = core_mod._turn_registry(wid, p["seq"])
         assert set(ids) >= {dice["id"], narr["id"]}, f"ход не найден: {ids}"

@@ -301,7 +301,7 @@ def _aggregate(samples: list[dict]) -> dict:
     # Её нельзя трактовать как зацикливание: у живой прозы она 0.4–0.55 всегда.
     lex = [s.get("lexical_dup_share") for s in samples
            if s.get("lexical_dup_share") is not None]
-    providers = defaultdict(int)
+    providers: "defaultdict[str, int]" = defaultdict(int)
     for s in samples:
         providers[str(s.get("provider") or "?")] += 1
     # ── E3 (сессия 34): качество ответа как измеримые сигналы ──
