@@ -145,7 +145,9 @@ def t_snapshot_tick():
 
     # перегенерация: состояние откатывается к снапшоту → тик ещё раз = тот же результат
     restored = copy.deepcopy(snap) if isinstance(snap, dict) else json.loads(snap)
-    msgs2 = narrator.tick_effects(restored)
+    # D12 (аудит 38): вызов нужен РАДИ побочного эффекта (откатанный тик обязан дать тот
+    # же урон) — имя результату не нужно, проверяется само состояние.
+    narrator.tick_effects(restored)
     assert restored["player"]["hp"] == hp_after_first, \
         f"тик задвоился: {restored['player']['hp']} != {hp_after_first}"
     assert restored["player"]["effects"]["Яд"]["turns"] == 2, "turns не уменьшился"

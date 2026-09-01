@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Smoke-тест TTS: статус, настройки мира, синтез кириллицы, фоновый синтез события."""
-import asyncio, json, sys, os
+import asyncio
+import json
 
 import httpx
 

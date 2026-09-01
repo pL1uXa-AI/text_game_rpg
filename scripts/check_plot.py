@@ -99,11 +99,11 @@ def check(path: Path) -> int:
                         f"призрачная ссылка (п.5.3): определи NPC или убери ссылку")
 
     # [5] connections — только существующие локации
-    for l in ss.get("locations") or []:
-        if not isinstance(l, dict):
+    for loc in ss.get("locations") or []:
+        if not isinstance(loc, dict):
             continue
-        lid = l.get("id")
-        for c in l.get("connections") or []:
+        lid = loc.get("id")
+        for c in loc.get("connections") or []:
             if c not in locs:
                 bad(f"connections '{lid}' -> '{c}': нет такой локации (ребро в никуда ломает карту)")
 
