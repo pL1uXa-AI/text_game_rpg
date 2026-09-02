@@ -10,8 +10,12 @@ REM 0. Если игра уже запущена — второй раз не з
 netstat -ano | findstr ":8002" | findstr "LISTENING" >nul 2>&1
 if %errorlevel% equ 0 (
     echo [OK] Игра уже запущена: http://127.0.0.1:8002
-    start "" http://127.0.0.1:8002
-    echo      (открыл браузер. Закрой это окно.)
+    REM GAME_NO_BROWSER задан — вкладку НЕ открывать: нужно автотестам (харнесс
+    REM tests/test_start_bat_harness.py) и автозапуску, где окно браузера — вредный
+    REM побочный эффект. Игрок по умолчанию видит прежнее поведение.
+    if "%GAME_NO_BROWSER%"=="" start "" http://127.0.0.1:8002
+    if "%GAME_NO_BROWSER%"=="" echo      открыл браузер. Закрой это окно.
+    if not "%GAME_NO_BROWSER%"=="" echo      браузер не открыт: GAME_NO_BROWSER задан
     pause
     exit /b 0
 )
@@ -44,7 +48,7 @@ set "CHROMA_CODE=000"
 for /f "usebackq delims=" %%c in (`curl -s -o nul --max-time 5 -w "%%{http_code}" http://127.0.0.1:8001/api/v2/heartbeat`) do set "CHROMA_CODE=%%c"
 if "%CHROMA_CODE%"=="000" goto chroma_start
 if not "%CHROMA_CODE:~0,1%"=="5" (
-    echo [OK] Game ChromaDB отвечает на 127.0.0.1:8001 (HTTP %CHROMA_CODE%)
+    echo [OK] Game ChromaDB отвечает на 127.0.0.1:8001 ^(HTTP %CHROMA_CODE%^)
     goto chroma_ok
 )
 :chroma_start
@@ -69,7 +73,7 @@ if "%GAME_PYTHON%"=="" set "GAME_PYTHON=python"
 "%GAME_PYTHON%" -V >nul 2>&1
 if %errorlevel% neq 0 (
     echo [ERROR] Интерпретатор "%GAME_PYTHON%" не найден в PATH.
-    echo         Запусти с GAME_PYTHON=C:\\путь\\python.exe (нужен Python 3.11+),
+    echo         Запусти с GAME_PYTHON=C:\\путь\\python.exe ^(нужен Python 3.11+^),
     echo         либо добавь python в PATH. Установка зависимостей: scripts\\setup_env.bat
     pause
     exit /b 1
@@ -80,9 +84,9 @@ echo         помня: авторизации в игре нет, в .env жи
 "%GAME_PYTHON%" -X utf8 -m uvicorn backend.app:app --host %GAME_BIND% --port 8002
 if %errorlevel% neq 0 (
     echo.
-    echo [ERROR] Сервер не запустился или упал (код %errorlevel%).
+    echo [ERROR] Сервер не запустился или упал ^(код %errorlevel%^).
     echo         Внимательно посмотри сообщения выше. Обычно это:
     echo           - порт 8002 занят другим процессом,
-    echo           - ошибка в коде backend (тогда читай traceback выше).
+    echo           - ошибка в коде backend ^(тогда читай traceback выше^).
     pause
 )

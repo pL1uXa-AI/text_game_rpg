@@ -59,7 +59,7 @@ timeout /t 1 /nobreak >nul
 set "CHROMA_CODE=000"
 for /f "usebackq delims=" %%c in (`curl -s -o nul --max-time 5 -w "%%{http_code}" http://%CHROMA_HOST%:%CHROMA_PORT%/api/v2/heartbeat`) do set "CHROMA_CODE=%%c"
 if not "%CHROMA_CODE%"=="000" if not "%CHROMA_CODE:~0,1%"=="5" (
-    echo [OK] Game ChromaDB ready on http://%CHROMA_HOST%:%CHROMA_PORT% (HTTP %CHROMA_CODE%)
+    echo [OK] Game ChromaDB ready on http://%CHROMA_HOST%:%CHROMA_PORT% ^(HTTP %CHROMA_CODE%^)
     exit /b 0
 )
 set /a count+=1

@@ -316,3 +316,25 @@ def test_d11_checker_detects_degradation(tmp_path, needle, replace, kind):
     bat.write_text(src.replace(needle, replace), encoding="utf-8")
     errs = c.check_bat(bat) + c.check_main_bat(bat.read_text(encoding="utf-8"))
     assert errs, f"чекер пропустил возврат к {kind}"
+
+
+def test_d11_block_echo_rule(tmp_path):
+    """D11: «голая» скобка в echo внутри if-блока сторожится и структурно.
+
+    Нужно именно потому, что харнесс tests/test_start_bat_harness.py исполняет bat только на
+    Windows, а CI — Linux: без этой проверки регрессия launcher'а (см. git log сессии 39:
+    из-за одной такой строки сервер не запускался никогда) проходила бы в CI незамеченной.
+    """
+    import sys
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from check_start_bat import block_echo_check
+    for b in [ROOT / "start_game.bat"] + sorted((ROOT / "scripts").glob("*.bat")):
+        assert not block_echo_check(b), f"{b.name}: echo/set со скобкой внутри if-блока"
+    d = tmp_path / "broken_block.bat"
+    d.write_text("@echo off\r\nif 1 EQU 0 (\r\n    echo text (x)\r\n    pause\r\n)\r\n",
+                 encoding="utf-8")
+    assert block_echo_check(d), "чекер ослеп: сломанный блок не пойман"
+    ok = tmp_path / "good_block.bat"
+    ok.write_text("@echo off\r\nif 1 EQU 0 (\r\n    echo text ^(x^)\r\n    pause\r\n)\r\n",
+                  encoding="utf-8")
+    assert not block_echo_check(ok), "чекер врёт на исправленном bat"

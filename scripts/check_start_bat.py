@@ -108,6 +108,37 @@ def check_ports_agree() -> list[str]:
     return errs
 
 
+def block_echo_check(path: Path) -> list[str]:
+    """D11: `echo`/`set` со «ногой» скобкой внутри многострочного if(...) ломает весь блок.
+
+    cmd.exe закрывает блок по первой неэкранированной `)`: строки после неё (в
+    start_game.bat там был `pause` и `exit /b 0`) начинают выполняться БЕЗУСЛОВНО. Живая
+    поломка, найденная харнессом tests/test_start_bat_harness.py: launcher не доходил до
+    запуска сервера НИКОГДА. Экранирование — `^(` и `^)`. Харнесс исполняет bat только на
+    Windows, поэтому на Linux-CI этот инвариант сторожит отсюда.
+    """
+    errs: list[str] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    depth = 0
+    for n, line in enumerate(text.splitlines(), 1):
+        t = line.strip()
+        skip = t.upper().startswith("REM") or t.startswith(":")
+        if depth and not skip and re.match(r"(?i)^(echo|set)\b", t):
+            outside_quotes = re.sub(r'"[^"]*"', '""', t)   # в кавычках скобки безвредны
+            if re.search(r"(?<!\^)[()]", outside_quotes):
+                errs.append(f"{path.name}:{n}: echo/set со скобкой внутри if-блока — cmd "
+                            f"закроет блок досрочно и строки ниже утекут в безусловное "
+                            f"выполнение (экранируй ^( и ^)): {t[:70]}")
+        if not skip and re.match(r"(?i)^(if|for|call)\b", t) and t.endswith("("):
+            depth += 1
+        if depth and t == ")":
+            depth -= 1
+    return errs
+
+
 def main() -> int:
     errors: list[str] = []
     print("bat checks:")
@@ -116,6 +147,9 @@ def main() -> int:
             errors.append(f"нет файла {b.name}")
             continue
         errors += check_bat(b)
+        errors += block_echo_check(b)
+    n_blocks = sum(1 for b in BATS if b.exists() and block_echo_check(b))
+    print(f"  · echo/set с неэкранированными скобками в if-блоках: {n_blocks} файлов")
     game = (ROOT / "start_game.bat")
     if game.exists():
         errors += check_main_bat(game.read_text(encoding="utf-8"))
