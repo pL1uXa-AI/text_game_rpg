@@ -301,21 +301,31 @@ def test_d11_check_start_bat_green():
     assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-500:]
 
 
-@pytest.mark.parametrize("needle,replace,kind", [
+@pytest.mark.parametrize("needle,replace,kind,expect", [
     ('if "%GAME_PYTHON%"=="" set "GAME_PYTHON=python"',
-     'set GAME_PYTHON="D:\\Tools\\python.exe"', "abs_path"),
-    ("--host %GAME_BIND%", "--host 0.0.0.0", "public_bind"),
-    ('-w "%%{http_code}"', "", "errorlevel_style"),
+     'set GAME_PYTHON="D:\\Tools\\python.exe"', "abs_path", "абсолютный путь"),
+    ("--host %GAME_BIND%", "--host 0.0.0.0", "public_bind", "0.0.0.0"),
+    ('-w "%%{http_code}"', "", "errorlevel_style", "http_code"),
 ])
-def test_d11_checker_detects_degradation(tmp_path, needle, replace, kind):
-    """Страховка от «тест ничего не проверяет»: подпорченный bat обязан быть пойман."""
+def test_d11_checker_detects_degradation(tmp_path, needle, replace, kind, expect):
+    """Страховка от «тест ничего не проверяет»: подпорченный bat обязан быть пойман.
+
+    Два обязательных условия честности пробы: (а) файл пишся байтами с CRLF — иначе на
+    Linux сработал бы CRLF-инвариант и тест «зеленел» бы по ложной причине, не увидев
+    реальной поломки; (б) проверяется КОНКРЕТНОЕ нарушение (expect), а не «любая ошибка».
+    """
     import check_start_bat as c
     src = (ROOT / "start_game.bat").read_text(encoding="utf-8")
     assert needle in src, f"исходник start_game.bat изменился — обнови пробу ({kind})"
     bat = tmp_path / "start_game.bat"
-    bat.write_text(src.replace(needle, replace), encoding="utf-8")
+    bat.write_bytes(src.replace(needle, replace).replace("\n", "\r\n").encode("utf-8"))
     errs = c.check_bat(bat) + c.check_main_bat(bat.read_text(encoding="utf-8"))
-    assert errs, f"чекер пропустил возврат к {kind}"
+    assert any(expect in e for e in errs), \
+        f"чекер не поймал возврат к {kind}; ошибки: {[e[:60] for e in errs]}"
+    # и фальшивых срабатываний нет: целый файл проходит чисто
+    whole = tmp_path / "whole.bat"
+    whole.write_bytes(src.replace("\n", "\r\n").encode("utf-8"))
+    assert not (c.check_bat(whole) + c.check_main_bat(src)), "чекер врёт на целом bat"
 
 
 def test_d11_block_echo_rule(tmp_path):
@@ -331,10 +341,10 @@ def test_d11_block_echo_rule(tmp_path):
     for b in [ROOT / "start_game.bat"] + sorted((ROOT / "scripts").glob("*.bat")):
         assert not block_echo_check(b), f"{b.name}: echo/set со скобкой внутри if-блока"
     d = tmp_path / "broken_block.bat"
-    d.write_text("@echo off\r\nif 1 EQU 0 (\r\n    echo text (x)\r\n    pause\r\n)\r\n",
-                 encoding="utf-8")
+    d.write_bytes("@echo off\r\nif 1 EQU 0 (\r\n    echo text (x)\r\n    pause\r\n)\r\n"
+                  .encode("utf-8"))
     assert block_echo_check(d), "чекер ослеп: сломанный блок не пойман"
     ok = tmp_path / "good_block.bat"
-    ok.write_text("@echo off\r\nif 1 EQU 0 (\r\n    echo text ^(x^)\r\n    pause\r\n)\r\n",
-                  encoding="utf-8")
+    ok.write_bytes("@echo off\r\nif 1 EQU 0 (\r\n    echo text ^(x^)\r\n    pause\r\n)\r\n"
+                   .encode("utf-8"))
     assert not block_echo_check(ok), "чекер врёт на исправленном bat"
