@@ -540,7 +540,8 @@ def _apply_provider_override(current: dict, body: ProviderIn | None) -> dict:
 
 
 async def _narrate_mech_outcome(world: dict, setting: dict, persona: str | None,
-                                 providers: dict, sys_msgs: list[str], action: str) -> str:
+                                 providers: dict, sys_msgs: list[str], action: str,
+                                 tick_msgs: list[str] | None = None) -> str:
     """Когда модель вернула только механику (tool_call/<<ENGINE>>) без прозы,
     генерирует короткий связный текст, что произошло в мире. Возвращает прозу
     или пустую строку (тогда вызывающий пишет «Механика применена»)."""
@@ -554,12 +555,45 @@ async def _narrate_mech_outcome(world: dict, setting: dict, persona: str | None,
             {"role": "user", "content": f"Действие игрока: {action}\n\nЧто произошло в итоге: {mech}\n"
                " Напиши 1–3 предложения игрового текста."},
         ]
-        out = (await llm.complete(msgs, temperature=0.7, max_tokens=250,
-                                  provider=prov_main)).strip()
+        # п.16 (сессия 40): пустой ответ модели раньше означал «Механика применена.» —
+        # служебную строку вместо сцены (ход «Идти в path_to_architects» в мире №103).
+        # Модель в tools-режиме иногда отдаёт ОДИН tool_call без текста; пробуем до
+        # `mech_narrate_retries` раз (тот же приём, что у судьи/Провидения), а когда не
+        # вышло — говорим текстом по системкам хода, но НЕ заглушкой.
+        tries = max(1, int(get_config().mech_narrate_retries))
+        out = ""
+        for attempt in range(tries):
+            out = (await llm.complete(msgs, temperature=0.7 + 0.1 * attempt, max_tokens=250,
+                                      provider=prov_main)).strip()
+            # механика/маркеры в дописывающем проходе недопустимы — они уже применены
+            out = narrator.split_engine(out)[0].strip()
+            if out:
+                break
+        if not out:
+            log.warning("дописывание механики (world %s): модель %d раз(а) вернула пустой "
+                        "текст — сценой станут системные сообщения хода", world.get("id"), tries)
+            out = _mech_fallback_prose(sys_msgs, tick_msgs)
         return out[:900]
     except Exception as e:
         log.warning("нарративное дописывание механики (world %s): %s", world.get("id"), e)
-        return ""
+        return _mech_fallback_prose(sys_msgs, tick_msgs)
+
+
+def _mech_fallback_prose(sys_msgs: list[str], tick_msgs: list[str] | None = None) -> str:
+    """Детерминированная проза по системкам хода (закон 2: только показ, ничего не решает).
+
+    Нужна потому, что «Механика применена.» — служебная фраза: игрок остаётся без сцены,
+    а модель на следующем ходу не знает, что переход/находку вообще показали. Здесь из
+    системных сообщений хода собирается короткий пересказ («Ты перехёл в «Тропа…»;
+    наложен эффект…» — как есть, без выдумывания). Пусто — пусто: вызывающий честно
+    оставит служебную строку (другого текста нет)."""
+    parts: list[str] = []
+    for m in (list(tick_msgs or []) + list(sys_msgs or []))[:8]:
+        s = str(m).strip()
+        if not s:
+            continue
+        parts.append(re.sub(r"^[^\w\u0400-\u04FF]+\s*", "", s))
+    return ("Ты продолжаешь: " + "; ".join(parts) + ".") if parts else ""
 
 
 _FINISH_CHARS = (".", "!", "?", "…", "\"", "»", "'", "”", "\n")
@@ -753,6 +787,15 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
             tick_msgs += narrator.tick_world_timers(setting)
         except Exception as e:
             log.warning("tick_world_timers (world %s): %s", world_id, e, exc_info=True)
+        # п.14b (сессия 40): часы мира идут сами — иначе время суток из сюжета («вечер»)
+        # не меняется НИКОГДА, пока мастер сам не даст `time`, и расписания NPC/«ночь»
+        # противоречат тексту. Движок ведёт только календарь (закон 3: последствия — на
+        # мастере); выключается глобально (AUTO_TIME_ENABLED=false).
+        if get_config().auto_time_enabled:
+            try:
+                tick_msgs += narrator.tick_time(setting, every=get_config().auto_time_every)
+            except Exception as e:
+                log.warning("tick_time (world %s): %s", world_id, e, exc_info=True)
 
     providers = _world_providers(world)
     persona = _world_persona(world)
@@ -983,7 +1026,8 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
     if not final_text.strip():
         # модель отправила ТОЛЬКО механику (tool_call / <<ENGINE>>) без прозы —
         # не пишем бессмысленное «Механика применена», а сгенерируем связный текст.
-        final_text = await _narrate_mech_outcome(world, setting, persona, providers, sys_msgs, text)
+        final_text = await _narrate_mech_outcome(world, setting, persona, providers, sys_msgs,
+                                                 text, tick_msgs=tick_msgs)
     if not final_text.strip():
         final_text = ("Механика применена." + roll_extra).strip()
 

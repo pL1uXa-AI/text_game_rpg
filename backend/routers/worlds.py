@@ -816,13 +816,16 @@ def _slash_quests(world_id: int):
 
 
 def _slash_stats(world_id: int):
+    from backend.mechanics import progress_label   # п.11 (сессия 40)
     setting = _world_setting_or_404(world_id)
     p = setting["player"]
     name = p.get("name") or "Путник"
     L = [f"📊 {name} — статистика пути"]
     prog = p.get("progress") or {}
     if prog:
-        L.append("Пройдено: " + "; ".join(f"{k} {v}" for k, v in list(prog.items())[:16]))
+        # п.11 (сессия 40): машинные ключи движка (moves/discoveries/…) → игровые ярлыки
+        L.append("Пройдено: " + "; ".join(f"{progress_label(k)} {v}"
+                                          for k, v in list(prog.items())[:16]))
     else:
         L.append("Прозрачный путь ещё не отмечен — отметка появится по событиям.")
     ach = p.get("achievements") or []
@@ -1195,7 +1198,11 @@ async def patch_state(world_id: int, body: PatchIn):
     world = _world_or_404(world_id)
     setting = _json_object(world.get("setting"))
     allowed = {"player", "enemies", "npc", "locations", "current_location", "quests",
-               "flags", "weather", "time", "game_over", "style_notes"}
+               # п.12: flag_titles — человекочитаемые названия флагов (режим мастера правит и их)
+               "flags", "flag_titles", "weather", "time", "game_over", "style_notes",
+               # п.14/14b: возраст среды — мастер может поправить и его (например,
+               # «потушить» залипший туман, не меняя саму погоду)
+               "_env_last_turn", "_weather_last_turn", "_time_last_turn", "_time_anchor_turn"}
     def _merge(dst: dict, src: dict) -> None:
         for k, v in src.items():
             if isinstance(v, dict) and isinstance(dst.get(k), dict):
@@ -1208,6 +1215,19 @@ async def patch_state(world_id: int, body: PatchIn):
                 _merge(setting[key], val)
             else:
                 setting[key] = val
+        # п.14/п.14b: мастер поменял среду — счётчик «залипшей погоды»/часов обнуляется
+        # тем же ходом, иначе предупреждение висело бы и после «рассеял туман»
+        if key in ("weather", "time"):
+            try:
+                now = int(setting.get("_player_turns") or 0)
+            except (TypeError, ValueError):
+                now = 0
+            setting["_env_last_turn"] = now
+            if key == "weather":
+                setting["_weather_last_turn"] = now
+            else:
+                setting["_time_last_turn"] = now
+                setting["_time_anchor_turn"] = now   # авто-часы стартуют от правки мастера
     db.update_world(world_id, setting=setting)
     db.add_event(world_id, "system", "🛠 Мастер изменил состояние мира.")
     return {"ok": True, "setting": setting}

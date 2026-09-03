@@ -440,37 +440,72 @@ async def generate_opening(world: dict, setting: dict, persona: str | None = Non
     # пустое событие рассказчика. Повторяем до 3 раз; при полном провале — завязка сюжета
     # (theme.opening / hook), чтобы вступительное сообщение НИКОГДА не было пустым.
     opening_fallback = (theme.get("opening") or hook or "Мир пробуждается. Что ты делаешь?").strip()
+    best = ""
     for attempt in range(3):
+        fin: dict = {}
         try:
             out = (await llm.complete(messages,
                                       temperature=get_config().default_temp + 0.05,
-                                      max_tokens=OPENING_MAX_TOKENS, provider=provider)).strip()
+                                      max_tokens=OPENING_MAX_TOKENS, provider=provider,
+                                      finish_out=fin)).strip()
         except Exception as e:
             log.warning("generate_opening (попытка %d/3): ошибка LLM: %s", attempt + 1, e)
             out = ""
-        if out:
-            from .narrator import split_engine  # локально: избегаем цикла импортов
-            clean, _ = split_engine(out)  # noqa
-            res = (clean or out).strip()
-            # Страховка от обрыва на полуслове: если текст не заканчивается знаком конца
-            # предложения (модель упёрлась в лимит) — обрезаем до последнего полного предложения,
-            # чтобы вступительное сообщение не выглядело оборванным.
-            if res and res[-1] not in ".!?…»\"":
-                cut = _cut_sentence(res)
-                if cut:
-                    return cut
+        if not out:
+            log.warning("generate_opening (попытка %d/3): пустой ответ модели — повторяем", attempt + 1)
+            continue
+        from .narrator import split_engine  # локально: избегаем цикла импортов
+        clean, _ = split_engine(out)  # noqa
+        res = (clean or out).strip()
+        # «Вступление дописано» = мысль кончается знаком конца предложения (хвостовые
+        # кавычки/скобки не в счёт — см. _ends_sentence) И текст не упёрся в лимит токенов.
+        # РАНЬШЕ проверка была `res[-1] not in ".!?…»"`: закрывающая кавычка обрывка
+        # «…в свободной колонии «Осколок Рассвета»» считалась концом мысли, и оборванное
+        # на середине фразы вступление (409 симв. вместо сцены) уходило в чат как есть —
+        # игрок не видел ни персонажа, ни сцены и считал, что вступления не было (п.3).
+        if _ends_sentence(res) and str(fin.get("finish_reason") or "") != "length":
             return res
-        log.warning("generate_opening (попытка %d/3): пустой ответ модели — повторяем", attempt + 1)
-    # Все попытки неудачны — гарантированный фолбэк на завязку сюжета
-    log.warning("generate_opening: все попытки пустые — использую завязку сюжета")
+        log.warning("generate_opening (попытка %d/3): вступление оборвано на полуслове "
+                    "(finish=%s, %d симв.) — повторяю генерацию", attempt + 1,
+                    fin.get("finish_reason") or "?", len(res))
+        if len(res) > len(best):
+            best = res
+    # Ни одна попытка не дала законченной сцены: берём длиннейшую, но режем до последнего
+    # ПОЛНОГО предложения (короткая целая сцена лучше оборванной), а нечего резать —
+    # завязка сюжета. Молча отдавать обрывок нельзя.
+    if best:
+        cut = _cut_sentence(best)
+        if len(cut) >= 120:
+            log.warning("generate_opening: законченного вступления не дождались — обрезаю "
+                        "обрывок до последнего полного предложения (%d → %d симв.)",
+                        len(best), len(cut))
+            return cut
+    log.warning("generate_opening: все попытки пусты/оборваны — использую завязку сюжета")
     return opening_fallback
 
 
+# Знак конца мысли и «хвосты», которые могут стоять ПОСЛЕ него (кавычки, скобки, пробелы).
+_SENT_END = ".!?…"
+# многоточие НЕ хвост: это знак конца мысли (…), его не срезаем
+_TRAILERS = " »”’)]}"
+
+
+def _ends_sentence(text: str) -> bool:
+    """Закончена ли мысль: срезав хвостовые кавычки/скобки/пробелы, видим . ! ? …
+    Для русского «…Осколок Рассвета» (закрывающая кавычка БЕЗ точки) — False: кавычка
+    концом предложения не является, это обрыв."""
+    t = (text or "").strip()
+    while t and t[-1] in _TRAILERS:
+        t = t[:-1].rstrip()
+    return bool(t) and t[-1] in _SENT_END
+
+
 def _cut_sentence(text: str) -> str:
-    """Обрезает текст до последнего полного предложения (по .!?…»") — защита от обрыва на полуслове.
+    """Обрезает текст до последнего полного предложения (по .!?…) — защита от обрыва на полуслове.
     Режем по самому позднему знаку конца предложения (даже если он раньше середины —
-    лучше короткое полное сообщение, чем оборванное)."""
-    idx = max(text.rfind("."), text.rfind("!"), text.rfind("?"), text.rfind("…"), text.rfind("»"))
+    лучше короткое полное сообщение, чем оборванное). `»` знаком конца мысли НЕ считается
+    (в русском он обычно закрывает кавычки), поэтому из списка символов убран."""
+    idx = max((text.rfind(c) for c in _SENT_END), default=-1)
     if idx > 0:
         return text[:idx + 1].strip()
     return text

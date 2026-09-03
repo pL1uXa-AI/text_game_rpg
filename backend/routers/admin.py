@@ -63,6 +63,10 @@ async def admin_settings_get():
                        "enemy_ai_interval": cfg.enemy_ai_interval,
                        "tick_effects_enabled": bool(cfg.tick_effects_enabled),
                        "tick_needs_enabled": bool(cfg.tick_needs_enabled),
+                       # п.14b/п.16 (сессия 40): авто-часы мира и дописывание механики
+                       "auto_time_enabled": bool(cfg.auto_time_enabled),
+                       "auto_time_every": cfg.auto_time_every,
+                       "mech_narrate_retries": cfg.mech_narrate_retries,
                        "divine_cooldown_turns": cfg.divine_cooldown_turns,
                        "max_action_chars": cfg.max_action_chars},
             # переносимость и наблюдаемость (сессия 33)
@@ -164,6 +168,7 @@ async def admin_settings_save(body: AdminSettingsIn):
                    ("enemy_ai_enabled", "ENEMY_AI_ENABLED"),
                    ("tick_effects_enabled", "TICK_EFFECTS_ENABLED"),
                    ("tick_needs_enabled", "TICK_NEEDS_ENABLED"),
+                   ("auto_time_enabled", "AUTO_TIME_ENABLED"),
                    ("detect_model_context", "DETECT_MODEL_CONTEXT"),
                    ("backup_db_on_start", "BACKUP_DB_ON_START"),
                    ("metrics_persist", "METRICS_PERSIST"),
@@ -178,6 +183,7 @@ async def admin_settings_save(body: AdminSettingsIn):
               "cosine_threshold", "cosine_threshold_local", "logic_judge_interval",
               "event_every_turns", "autonomous_master_interval", "enemy_ai_interval",
               "divine_cooldown_turns", "max_action_chars", "tts_cache_ttl_days", "tts_max_chars",
+              "auto_time_every", "mech_narrate_retries",
               "backup_keep", "metrics_tail", "metrics_max_bytes"):
         v = getattr(body, f, None)
         if v is None:

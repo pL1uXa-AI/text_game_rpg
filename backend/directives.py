@@ -51,7 +51,10 @@ class RollDirective(BaseModel):
 
 
 class EffectAddDirective(BaseModel):
-    """`effect_add`: статус-эффект {name, turns|duration, damage, heal, kind, stacks, mods, desc, tag}."""
+    """`effect_add`: статус-эффект {name, turns|duration, damage, heal, mp_damage, mp_heal,
+    kind, stacks, mods, desc, tag}. damage/heal — HP за ход, mp_damage/mp_heal — MP за ход
+    (сессия 40, п.1: убыль энергии кристалла «Кристальная лихорадка −20 MP/ход»).
+    Принимает и английский синоним `mp_cost_per_turn`."""
     model_config = ConfigDict(extra="allow")
 
     name: Any = None
@@ -59,11 +62,31 @@ class EffectAddDirective(BaseModel):
     duration: Any = None  # алиас turns
     damage: Any = None
     heal: Any = None
+    mp_damage: Any = None
+    mp_heal: Any = None
     kind: Any = None
     stacks: Any = None
     mods: Any = None
     desc: Any = None
     tag: Any = None
+
+
+class ItemUpdateDirective(BaseModel):
+    """`item_update`: правка уже выданного предмета {name, desc, qty, weight, value, note}.
+
+    Сессия 40, п.2: у движка НЕ БЫЛО способа дописать описание предмету — `add_item`
+    дописывал desc только в пустое поле и не трогал существующий. Поэтому рассказчик,
+    два хода подряд подробно описывавший найденный кристалл, не мог закрепить это
+    в карточке: «у предмета так и не появилось описание»."""
+    model_config = ConfigDict(extra="allow")
+
+    name: Any = None
+    new_name: Any = None
+    desc: Any = None
+    qty: Any = None
+    weight: Any = None
+    value: Any = None
+    note: Any = None
 
 
 class DictWithIdDirective(BaseModel):
@@ -215,6 +238,7 @@ DICT_SPECS: dict[str, type[BaseModel]] = {
     "player": PlayerDirective,
     "roll": RollDirective,
     "effect_add": EffectAddDirective,
+    "item_update": ItemUpdateDirective,
     "quest": DictWithIdDirective,
     "npc_set": DictWithIdDirective,
     "location_add": DictWithIdDirective,
@@ -256,7 +280,6 @@ _DICT_WITH_ID_KEYS = ("quest", "npc_set", "location_add", "location_update",
                       "enemy_add", "enemy_apply", "flag",
                       "companion_add", "companion_update", "companion_apply")
 _ITEM_KEYS = ("add_item", "remove_item")
-
 
 def _norm_item(item: Any) -> dict:
     """Предмет из строки ("меч") или кривого dict → {name, qty, desc}."""
@@ -321,6 +344,24 @@ def _norm_items(v: Any) -> list | None:
     return None
 
 
+def _norm_item_updates(v: Any) -> list | None:
+    """item_update: dict/список/строка → список правок [{name, ...}]; пустое → отбросить."""
+    if isinstance(v, dict):
+        v = [v]
+    if not isinstance(v, list):
+        return None
+    out: list = []
+    for it in v:
+        if isinstance(it, str) and it.strip():
+            continue  # голая строка — править нечего (нет полей)
+        if isinstance(it, dict):
+            if not str(it.get("name") or "").strip() and it.get("item"):
+                it = {**it, "name": it["item"]}  # модель иногда пишет `item` вместо `name`
+            if str(it.get("name") or "").strip():
+                out.append(it)
+    return out or None
+
+
 def _norm_passthrough(key: str, v: Any) -> Any:
     """Остальные ключи — «как есть»; dict-формы дополнительно прогоняем через Pydantic
     (ничего не меняет: extra=allow + Any, но даёт валидацию и самодокументацию)."""
@@ -364,6 +405,10 @@ def normalize(d: Any) -> dict:
             items = _norm_items(v)
             if items is not None:
                 out[k] = items
+        elif k == "item_update":
+            iu = _norm_item_updates(v)
+            if iu is not None:
+                out[k] = [_model_dump(ItemUpdateDirective.model_validate(x)) if x else x for x in iu]
         else:
             out[k] = _norm_passthrough(k, v)
     return out

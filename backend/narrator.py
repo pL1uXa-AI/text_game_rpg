@@ -27,9 +27,10 @@ from .mechanics import (
     apply_directives, normalize_directives, reputation_standing, faction_rep_value,
     dynamic_adversary_scale, inventory_weight, carry_capacity,
     total_sell_value, location_stations, can_craft,
-    board_text, location_effects_for,
+    board_text, location_effects_for, desc_compact, effect_needs_turns,
+    find_similar_effect, is_player_npc,
     # — то, что вызывает router-слой и скрипты через narrator.X —
-    tick_effects, tick_world_timers, tick_needs_mental,
+    tick_effects, tick_world_timers, tick_needs_mental, tick_time,
     apply_location_effects, normalize_setting_ranks,
 )
 
@@ -40,7 +41,7 @@ from .mechanics import (
 # глушится на весь файл, а «транзит» виден и защищён от случайного удаления.
 __all__ = [
     # механика через фасад (зовут routers/core.py, app.py, scripts/test_directives.py)
-    "tick_effects", "tick_world_timers", "tick_needs_mental",
+    "tick_effects", "tick_world_timers", "tick_needs_mental", "tick_time",
     "apply_location_effects", "normalize_setting_ranks",
     # пресеты рассказчиков (app.py / routers/catalog.py: db.seed_narrators(...))
     "NARRATOR_PRESETS",
@@ -277,7 +278,16 @@ def apply_plot_start(setting: dict, plot: dict) -> list[str]:
     flags = ss.get("flags")
     if isinstance(flags, dict):
         for k, v in flags.items():
-            setting.setdefault("flags", {})[str(k)] = bool(v) if isinstance(v, bool) else v
+            # п.12 (сессия 40): сюжет может задать и человекочитаемое название флага —
+            # тогда значение пишется как {"value": true, "title": "Дверь открыта"}
+            # (старый вид «ключ: true» остаётся валидным).
+            if isinstance(v, dict):
+                setting.setdefault("flags", {})[str(k)] = v.get("value", True)
+                t = str(v.get("title") or "").strip()[:120]
+                if t:
+                    setting.setdefault("flag_titles", {})[str(k)] = t
+            else:
+                setting.setdefault("flags", {})[str(k)] = bool(v) if isinstance(v, bool) else v
     return []
 
 
@@ -458,6 +468,8 @@ def default_setting(theme: dict, difficulty: str = "normal") -> dict:
         "current_location": "start",
         "quests": {},
         "flags": {},
+        # п.12: машинный ключ флага → человекочитаемое название (водит рассказчик/сюжет)
+        "flag_titles": {},
         "weather": "ясно",
         "time": "вечер",
         "game_over": False,
@@ -580,7 +592,10 @@ def _w0(v) -> str:
 
 def format_state(setting: dict) -> str:
     p = setting["player"]
-    inv = ", ".join(f"{i['name']} ×{i.get('qty', 1)}" for i in p.get("inventory", [])) or "пусто"
+    # Сессия 40, п.2: помечаем предметы БЕЗ описания — иначе модель не видит, что карточка
+    # пустая, и не закреплёт раскрытые позже свойства директивой item_update.
+    inv = ", ".join(f"{i['name']} ×{i.get('qty', 1)}" + ("" if str(i.get('desc') or '').strip() else " (описание не известно)")
+                    for i in p.get("inventory", [])) or "пусто"
     loc = setting.get("locations", {}).get(setting.get("current_location", "start"), {})
 
     lines = [
@@ -670,6 +685,9 @@ def format_state(setting: dict) -> str:
     effects = p.get("effects") or {}
     if effects:
         parts = []
+        # п.8 (сессия 40): имена-синонимы одного состояния. Разовая системка о дубле
+        # могла уйти в историю, поэтому пометку «имя близко» мастер видит каждый ход.
+        dup = {str(n) for n in effects if find_similar_effect(p, str(n))}
         for name, ef in list(effects.items())[:8]:
             label = str(name).strip()
             if re.fullmatch(r"[A-Za-z0-9_\-]+", label):
@@ -678,7 +696,13 @@ def format_state(setting: dict) -> str:
             dur = "постоянно" if t in (-1, None) else f"{int(t)} ход."
             dmg = int(ef.get("damage", 0) or 0)
             heal = int(ef.get("heal", 0) or 0)
+            mpd = int(ef.get("mp_damage", 0) or 0)
+            mph = int(ef.get("mp_heal", 0) or 0)
             tick_txt = f", −{dmg} HP/ход" if dmg else (f", +{heal} HP/ход" if heal else "")
+            if mpd:
+                tick_txt += f", −{mpd} MP/ход"
+            elif mph:
+                tick_txt += f", +{mph} MP/ход"
             stk = int(ef.get("stacks", 1) or 1)
             if stk > 1:
                 tick_txt += f", стаков {stk}"
@@ -689,8 +713,20 @@ def format_state(setting: dict) -> str:
             # D5: НЕ dsc — выше по функции под этим именем живёт dict масштабирования
             # сложности; прежнее затирание имени мюпи ловил как «str в dict».
             edesc = str(ef.get("desc") or "").strip()
-            desc_txt = f" — {edesc[:70]}" if edesc else ""
-            base = f"{label}{desc_txt}"
+            # П.7 (сессия 40): desc_compact, а не edesc[:70] — срок/условие снятия эффекта
+            # почти всегда во ВТОРОЙ половине фразы, и при жёстком обрезе мастер их не
+            # видел: перекладывал «Требуется ещё 1-2 сессии медитации» как бессрочный.
+            # П.7 (сессия 40): ОТПРАВИТЬ desc ЦЕЛИКОМ (без лимита). Условие снятия/срок
+            # почти всегда во второй половине фразы: при обрезе мастер их не видел и
+            # перекладывал «Требуется ещё 1-2 сессии медитации» как бессрочный эффект.
+            desc_txt = f" — {desc_compact(edesc)}" if edesc else ""
+            # бессрочный эффект со сроком в описании помечается: мастер видит противоречие
+            # КАЖДЫЙ ход (а не один раз в момент наложения — системка могла уйти в историю)
+            if effect_needs_turns(ef):
+                # эффект висит бессрочно, а срок в тексте назван — напоминание мастеру
+                # каждый ход (системка о наложении могла уйти в историю)
+                dur += " ⚠в описании срок: задай turns или сними effect_remove"
+            base = f"{label}{desc_txt}" + (" ⚠возможен дубль имени (ср. другой эффект: обнови прежний или сними effect_remove)" if str(name) in dup else "")
             parts.append(f"{base} ({kind}, {dur}{tick_txt})" if kind else f"{base} ({dur}{tick_txt})")
         lines.append("Эффекты: " + "; ".join(parts))
     acts = p.get("actions") or {}
@@ -785,6 +821,20 @@ def format_state(setting: dict) -> str:
                 z_parts.append(f"{fx['name']}" + (f" (−{dmg} HP/ход)" if dmg else "") + (f" — {fx.get('desc')}" if fx.get("desc") else ""))
         lines.append("🌫 Влияние места (зоны): " + "; ".join(z_parts[:6]))
     lines.append(f"Погода: {setting.get('weather','ясно')} | Время суток: {setting.get('time','')}")
+    # п.14 (сессия 40, мир «Новый мир»): «весь текст про туман». Погода ставится один раз
+    # при создании мира (сюжетный start_weather) и дальше двигается ТОЛЬКО директивой
+    # weather. Пока её не двигали, строка выше — якорь: модель каждый ход начинает с
+    # «Туман …» и ответ превращается в одно и то же. Код погоду не меняет (закон 3), он
+    # показывает возраст среды и напоминает, что её можно сдвинуть. Время суток с п.14b
+    # ведёт авто-тик (tick_time), поэтому оно в этом предупреждении не нуждается.
+    try:
+        _wx_from = setting.get("_weather_last_turn", setting.get("_env_last_turn", 0))
+        _env_age = int(setting.get("_player_turns", 0) or 0) - int(_wx_from or 0)
+        if _env_age >= 3:
+            lines.append(f"⚠ Погода не менялась {_env_age} ходов — не тащи её через весь текст: "
+                         "сдвинь weather или пиши сцену без погоды.")
+    except (TypeError, ValueError):
+        pass
     _date = setting.get("date") or {}
     if isinstance(_date, dict) and _date:
         _dp = ", ".join(f"{k}: {v}" for k, v in _date.items() if v)
@@ -796,10 +846,23 @@ def format_state(setting: dict) -> str:
         lines.append("Влияние среды (учитывай в проверках/поведении): " + "; ".join(env_effects))
     npc = setting.get("npc", {})
     if npc:
+        # Сессия 40, п.13: «player = Игрок» — не персонаж окружения (в мире №103 модель
+        # заводила игрока как NPC, и тот стоял в одном списке с торговцем). Показ
+        # не зависит от само-исцеления: своё состояние игрок видит строкой «Игрок: …» выше.
+        _here = str(setting.get("current_location") or "")
+        npc_items = [(k, v) for k, v in npc.items()
+                     if isinstance(v, dict) and not is_player_npc(k, v)]
+        # рядом стоящие — первыми (у NPC может быть поле location: npc_set/карточка)
+        npc_items.sort(key=lambda kv: 0 if not str(kv[1].get("location") or "")
+                       or str(kv[1].get("location")) == _here else 1)
         npc_lines = []
-        for k, v in list(npc.items())[:10]:
+        for k, v in npc_items[:10]:
             alive = "жив" if v.get('alive', True) else "мёртв"
             extra = npc_schedule_text(setting, k, v)
+            _loc = str(v.get("location") or "")
+            if _loc and _loc != _here:
+                _lname = ((setting.get("locations") or {}).get(_loc) or {}).get("name") or _loc
+                extra += f", не рядом: {_lname}"
             frac = ""
             if v.get('faction'):
                 fr = str(v['faction'])
@@ -809,11 +872,12 @@ def format_state(setting: dict) -> str:
                     frac = f", {fr}"
             _coin = f", {v['money']} 🪙" if v.get("money") else ""
             npc_lines.append(f"{k}={v.get('name',k)}({alive}{_coin}, {v.get('mood','')}{frac}){extra}")
-        lines.append("NPC: " + "; ".join(npc_lines))
+        if npc_lines:
+            lines.append("NPC (окружение, не ты сам): " + "; ".join(npc_lines))
         # C5 (сессия 34): «заметки мастера» — что персонаж знает/скрывает/хочет. Ведёт
         # их мастер: подача игроку (намёк, проверка, цена молчания) — его решение.
         note_lines = [f"{v.get('name', k)}: {_notes_text(v.get('notes'))}"
-                      for k, v in list(npc.items())[:12] if _notes_text(v.get("notes"))]
+                      for k, v in npc_items[:12] if _notes_text(v.get("notes"))]
         if note_lines:
             lines.append("🗝 Знания и тайны NPC (не вываливай прямо — веди через намёки,"
                          " проверки и поведение по репутации):\n  " + "\n  ".join(note_lines))
@@ -905,7 +969,10 @@ def format_state(setting: dict) -> str:
         lines.append("Рецепты крафта: " + " | ".join(c_lines))
     flags = setting.get("flags", {})
     if flags:
-        lines.append("Флаги: " + "; ".join(f"{k}={v}" for k, v in list(flags.items())[:12]))
+        # п.12 (сессия 40): машинный ключ флага — то, что видит игрок в дневнике и в UI.
+        # Если мастер/сюжет дали человекочитаемое название (`flag_titles`), показываем его
+        # рядом с id: id остаётся (по нему судья сверяет факты), имя — читабельно.
+        lines.append("Флаги: " + _flag_line(flags, setting.get("flag_titles"), limit=12))
     return "\n".join(lines)
 
 
@@ -1101,7 +1168,7 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
                     "effect_add, effect_remove, add_item, remove_item, enemy_add, enemy_apply, enemy_remove, quest, quest_done (id или {{id, next}} — цепочка), quest_advance, quest_choose, "
                     "quest_success/quest_fail (итог: {{id, reason, next}}), quest {{id, timer: {{name, turns}}}} (дедлайн квеста), "
                     "enemy_effect_add/enemy_effect_remove (статусы на врагах — сами не тикают), enemy_mark (позиция/инициатива/цель), "
-                    "npc_set (name/mood/alive/faction/schedule [расписание по времени суток]/notes [что знает и скрывает]), npc_kill, faction_add/faction_update/faction_remove (фракции и их связи), location_add, location_update, move, flag, time, weather, roll, game_over (true/false). "
+                    "npc_set (name/mood/alive/desc/faction/location [где стоит]/schedule [расписание по времени суток]/notes [что знает и скрывает]), npc_kill, faction_add/faction_update/faction_remove (фракции и их связи), location_add, location_update, move, flag, time, weather, roll, game_over (true/false). "
                     "Экономика: shop_add, shop_remove, shop_update, trade_buy, trade_sell. Крафт: gather, craft_learn, craft_remove, craft. "
                     "Компаньоны: companion_add, companion_remove, companion_update, companion_apply. "
                     "Способности: ability_add, ability_remove, ability_update, ability_use. "
@@ -1213,7 +1280,7 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
 ## Правила рассказчика
 1. Отвечай на ЛЮБОЕ действие игрока естественным продолжением мира: что происходит, что он видит/слышит/чувствует, последствия.
 2. Мир живой: NPC имеют характер и память, погода и время меняются, события не ждут игрока.
-3. НЕ нарушай уже установленные факты: мёртвый NPC не говорит, сломанный замок не чинится сам. Следи за флагами и состоянием — они даны ниже. Перед упоминанием NPC перепроверь секцию NPC/Враги: не пиши о мёртвых как о живых, не воскрешай убитых, не открывай то, что уже сломано или заперто навсегда. Если ты всё же описываешь противоречие — оставь это в духе «искажения реальности», не подавая как норму.
+3. НЕ нарушай уже установленные факты: мёртвый NPC не говорит, сломанный замок не чинится сам. Следи за флагами и состоянием — они даны ниже. Перед упоминанием NPC перепроверь секцию NPC/Враги: не пиши о мёртвых как о живых, не воскрешай убитых, не открывай то, что уже сломано или заперто навсегда. Если ты всё же описываешь противоречие — оставь это в духе «искажения реальности», не подавая как норму. NPC — не ты сам.
 4. Не решай за игрока: не совершай его поступки, не говори за него. Если действие двусмысленно — коротко уточни.
 5. Веди сюжет интересно: подкидывай события, загадки, развития. Не зацикливайся на одном месте.
 6. Описания — 1–4 абзаца, живые, но без воды. Никогда не повторяйся дословно.{char_note}
@@ -1227,13 +1294,13 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
 13. НЕ вызывай roll без реального риска: обыденные действия (осмотреться, прочитать записку, поесть, поговорить) проверок не требуют. Бросай куб только при противодействии, опасности или ставке.
 14. Статы игрока — числа (10 = средний человек): сила (физические действия, урон в ближнем бою), ловкость (скрытность, точность, уклонение), выносливость (HP, стойкость к урону/усталости), интеллект (знания, логика, заклинания, MP), мудрость (восприятие, чутьё, воля), харизма (убеждение, торг, общение), удача (шанс, случайность). Профильный стат даёт бонус к проверке (roll.mod). Это ОРИЕНТИР, а не жёсткий закон: статы меняются не только накоплением, но и по сюжету — тренировки, обучение, духи/артефакты, проклятия, ритуалы, дар Системы. Меняй их директивами stats (аддитивно) или player.level (явное повышение уровня за значимое достижение — ритуал, испытание, дар; не только формулой XP). Производные HP/MP пересчитаются сами — не считай их вручную. При уместных проверках добавляй бонус к roll.mod за профильный стат/навык.
 15. Раса/класс/профессия — часть идентичности. Вшитые: расы — человек/эльф/дварф/орк/зверолюд/полудемон/драконид/нежить (дают бонусы статов и пассивку); классы — Воин/Лучник/Маг/Вор/Жрец/Бард (стартовый навык выдаётся сам при смене класса); профессии — Кузнец/Алхимик/Травник/Охотник/Шахтёр/Повар/Портной/Моряк/Книжник (дают постоянный бафф). Можно вводить и СВОИ творческие: для расы укажи bonus/passive, для класса — своё имя и (опц.) skill, для профессии — buff. Ранги классов и навыков: F < E < D < C < B < A < S < SS < SSS < Z < ZZ < ZZZ < G (F низший, G высший). Ранг повышай за испытания/квесты (class_rank/skill_rank). Эволюция/мультикласс: class_evolve/secondary_class.
-16. Эффекты (отравлен/благословлён и т.п.) действуют сами: в начале каждого хода их урон/лечение применяется автоматически (× стаки), длительность уменьшается, по истечении снимаются (всё видно в «Эффекты»). Постоянные эффекты — без turns (или -1), временные — с turns. НЕ дублируй периодический урон эффекта через player.hp. Накладывай/снимай только директивами effect_add/effect_remove.
-17. Флаги — фиксированные факты-истины мира: «дверь_открыта=true» = дверь открыта, «ловушка_сработала=true» = ловушка уже сработала. Давай понятные имена, меняй только при реальных событиях. Для игрока флаги показываются человеческим языком (да/нет), поэтому не храни в них промежуточные заметки.
+16. Эффекты (отравлен/благословлён и т.п.) действуют сами: в начале каждого хода их урон/лечение применяется автоматически (× стаки), длительность уменьшается, по истечении снимаются (всё видно в «Эффекты»). Постоянные эффекты — без turns (или -1), временные — с turns. Убыль/лечение энергии за ход — поля mp_damage/mp_heal. НЕ дублируй периодический урон эффекта через player.hp/player.mp. Накладывай/снимай только директивами effect_add/effect_remove. Называешь в desc срок/условие — задавай и turns: без него эффект бессмертен.
+17. Флаги — факты-истины мира («door_open=true» = дверь открыта): меняй только при реальных событиях, промежуточные заметки не храни. Ключ флага машинный и игроку не виден — давай `title` человекочитаемым на языке мира («Дверь в склепах открыта»).
 18. Если у игрока ещё нет расы или класса — назначь их в ближайшем ответе (вшитые или творческие с полями). Если игрок использует навык — проверь, есть ли он у него и хватает ли MP (mp_cost); не давай использовать навыки из ниоткуда.
-18а. ПРЕДМЕТЫ И ИНВЕНТАРЬ: если игрок находит/берёт/подбирает/получает предмет (палку, шест, зелье, артефакт) — ОБЯЗАТЕЛЬНО добавь его в инвентарь директивой add_item В ЭТОМ ЖЕ ответе. НИКОГДА не упоминай, не доставай и не используй предметы, которых НЕТ в «Инвентарь» состояния (гранаты, оружие, бомбы и т.п.) — это грубое противоречие. Если игрок использует/выбрасывает предмет — сними его через remove_item. Перечисление того, что у игрока есть, в твоём тексте должно совпадать с инвентарём из состояния.
+18а. ПРЕДМЕТЫ И ИНВЕНТАРЬ: если игрок находит/берёт/подбирает/получает предмет (палку, шест, зелье, артефакт) — ОБЯЗАТЕЛЬНО добавь его в инвентарь директивой add_item В ЭТОМ ЖЕ ответе, всегда с `desc`. НИКОГДА не упоминай, не доставай и не используй предметы, которых НЕТ в «Инвентарь» состояния (гранаты, оружие, бомбы и т.п.) — это грубое противоречие. Если игрок использует/выбрасывает предмет — сними его через remove_item. Перечисление того, что у игрока есть, в твоём тексте должно совпадать с инвентарём из состояния. Свойства, раскрытые ПОЗЖЕ, закрепляй тем же ответом: item_update {{name, desc}}.
 18б. УНИВЕРСАЛЬНЫЕ СПОСОБНОСТИ — единая абстракция для всех жанров (магия / техно-устройства / псионика / навыки Системы). Выдавай их директивой ability_add {{name, school, cost, source, desc}}: school — направление, cost — трата энергии (MP), source — откуда (свиток/дар/чип/ритуал). Использование — ability_use {{name, cost}} (списывает энергию), правка/снятие — ability_update/ability_remove. Это дополнение к обычным навыкам.
 19. ПРОФЕССИИ, КЛАССЫ, ТИТУЛЫ — твоё живое творчество как рассказчика (дух литрпг: FFF-уровни, Система в «Ключах Пангеи»). Ты сам решаешь, когда и как появляются новые расы/классы/профессии/навыки/титулы, и сам их изобретаешь. Выдавай их в значимые сюжетные моменты (освоение ремесла, клятва, ритуал, испытание, открытие, чужой дар, «пробуждение Системы») через директивы: profession {{name, buff}}, class {{name, skill}}, race_change {{name, bonus, passive}}, title, skill_add. НЕ привязан к фиксированному списку и НЕ к счётчику. Повторяющиеся занятия игрока (player.actions) — лишь неформальная история мастерства, на которую ты опираешься в описаниях и поводах, но это НЕ автоматический триггер и НЕ обязательный порог: профессия меняется, когда это логично по сюжету, а не когда «накопилось N». Уникальная профессия/класс могут быть одноразовыми, двуименными, сплавом нескольких ремёсел — твори, но не ломай уже установленные факты. РЕПУТАЦИЯ — тоже смысловые отношения, а не сухие цифры: меняй её (reputation) со знаком по реальным событиям (дружба, предательство, услуга, конфликт), и используй в диалогах/реакциях NPC. УРОВЕНЬ и СТАТЫ — не только авто-прокачка по XP, но и твоё сюжетное решение (дай уровень за важную победу/ритуал через player.level, дай статы за обучение/дар через stats). Классы/расы/профессии/навыки могут быть СКРЫТЫМИ: выдавай их за особые цепочки действий, ритуалы, испытания, артефакты — не афишируй условия заранее. ВСЕГДА называй в системном сообщении условие получения (например «🎖 Изучен навык…», «🎭 Класс: — → …») — из него сформируется карточка знаний, чтобы потом не противоречить.
-20. Имена эффектов — человекочитаемые, на языке мира (например «Сковывающий холод», а не chill_resonance). В effect_add всегда пиши поле desc — короткое описание действия эффекта (показывается игроку и в системных сообщениях).
+20. Имена эффектов — человекочитаемые, на языке мира (не chill_resonance), ОДНО состояние = ОДНО имя: сверься со списком «Эффекты», синоним плодит дубль — правь прежний effect_add или сними effect_remove. В effect_add всегда пиши desc — что делает эффект (видно игроку).
 20а. СТАТИСТИКА и ДОСТИЖЕНИЯ: код сам учитывает убийства, выполненные квесты и впервые открытые локации (player.progress). В значимые сюжетные моменты добавляй и свои счётчики (progress_add {{победы: 1}}) и — главное — выдавай достижения (achievement_add {{name, desc}}) за важные вехи пути, чтобы игрок отслеживал свой прогресс (/stats).
 21. Экономика и торговля: у предмета может быть цена `price` (покупка), ценность `value` (продажа), вес `weight` (кг) и — в магазине — запас `qty`. Торгуй директивами trade_buy/trade_sell (shop и item). Цены автоматически корректируются репутацией фракции магазина (высокая - дешевле покупать, выгоднее продавать); золото/запасы движок списывает и начисляет сам. ДАВАЙ предметам/товарам разумный вес `weight` (0.1-0.5 мелочь, 2-5 оружие/руда): рюкзак ограничен «🎒 Загрузка: N/Банк» из состояния, при перегрузе покупка/сбор/крафт автоматически отклоняются («🎒 Перегруз») — так и опиши поведение персонажа.
 22. Крафт: собирай ресурсы `gather`, учи рецепты `craft_learn` (ингредиенты + результат {{name, qty, value, weight, desc}}), создавай через `craft` (укажи recipe и qty). Ингредиенты спишутся сами; нехватка материала → отказ. Рецепт может требовать СТАНЦИЮ (`station`: место-мастерская — кузница, верстак, лаборатория, кухня…): задай её в рецепте и добавь `stations` в локацию (`location_add/update` с полем stations) либо флаг `station:<имя>=true`, где находится мастерство. Может требовать и ПРОФЕССИЮ (`profession` в рецепте) — это базовая логика, профессию/доступ к станции ты меняешь сам директивами. Не создавай предметы «из ниоткуда» без рецепта и материалов. У врагов и NPC может быть КОШЕЛЁК (`money` в enemy_add/npc_set — виден «🪙»): при победе (enemy_apply до 0 HP) или npc_kill монеты автоматически переходят игроку. Давай умеренные суммы (1-10 за моба, больше за главарей/сундуки).
@@ -1261,7 +1328,7 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
 <<ENGINE>>{{"npc_set": {{"id": "barman", "name": "Трактирщик", "mood": "радушен", "alive": true}}}}
 <<ENGINE>>{{"npc_set": {{"id": "tavern", "name": "Таверна «У камина»", "faction": "", "schedule": {{"ночь": "закрыта, хозяин спит", "день": "открыта, подают эль"}}}}}}   — расписание NPC по времени суток
 <<ENGINE>>{{"location_add": {{"id": "cellar", "name": "Подвал", "desc": "Тёмный, пахнет плесенью"}}, "move": "cellar"}}
-<<ENGINE>>{{"flag": {{"name": "door_open", "value": true}}, "time": "ночь", "weather": "гроза"}}
+<<ENGINE>>{{"flag": {{"name": "door_open", "value": true, "title": "Дверь в склепах открыта"}}, "time": "ночь", "weather": "гроза"}}
 <<ENGINE>>{{"game_over": true}}   — завершить игру (смерть игрока/финал сюжета)
 Можно комбинировать: <<ENGINE>>{{"player": {{"hp": -3}}, "flag": {{"name": "trapped", "value": true}}}}
 
@@ -1764,6 +1831,21 @@ def parse_tool_args(args):
                 if "count" in item:
                     item["qty"] = item.pop("count")
                 d[k] = [item]
+    # item_update: модель часто пишет {item: ..., desc: ...} — имя приводим к name,
+    # одиночный dict оборачиваем в список (ожидание ItemHandler).
+    if "item_update" in d:
+        iu = d["item_update"]
+        if isinstance(iu, dict):
+            iu = [iu]
+        if isinstance(iu, list):
+            fixed = []
+            for x in iu:
+                if isinstance(x, dict):
+                    x = dict(x)
+                    if "item" in x and "name" not in x:
+                        x["name"] = x.pop("item")
+                    fixed.append(x)
+            d["item_update"] = fixed
     return d
 
 
@@ -1793,6 +1875,19 @@ def mech_trigger(text: str) -> bool:
 # (проверено grep'ом по backend/, tests/, scripts/). Возвращать их «на будущее» незачем:
 # будущее — это директивы mechanics/apply_directives, они там и переписываются.
 
+def _flag_line(flags: dict, titles: Any = None, limit: int = 14) -> str:
+    """Строка флагов для промптов: `key=value` + (если мастер/сюжет дали) человекочитаемое
+    название из `setting["flag_titles"]`. Машинный ключ СОХРАНЯЕТСЯ: по нему сверяет факты
+    судья и на него ссылается директива `flag` (закон 2 — только показ, ничего не меняем).
+    """
+    ft = titles if isinstance(titles, dict) else {}
+    parts = []
+    for k, v in list(flags.items())[:limit]:
+        t = str(ft.get(k) or "").strip()
+        parts.append(f"{k}={v}" + (f" ({t})" if t else ""))
+    return "; ".join(parts)
+
+
 def audit_messages(setting: dict, text: str, reply: str = "") -> list[dict]:
     """Компактный промпт для аудит-прохода: без полного контекста — только базовое состояние
     (чтобы модель считала ДЕЛЬТЫ, а не абсолюты) + критичные факты (живые/мёртвые NPC, флаги) +
@@ -1809,11 +1904,13 @@ def audit_messages(setting: dict, text: str, reply: str = "") -> list[dict]:
     npc = setting.get("npc") or {}
     npc_facts = []
     for k, v in list(npc.items())[:12]:
+        if is_player_npc(k, v if isinstance(v, dict) else None):
+            continue   # п.13: игрок — не персонаж (свои цифры судье даны строкой выше)
         name = (v.get("name") or k) if isinstance(v, dict) else k
         alive = v.get("alive", True) if isinstance(v, dict) else True
         npc_facts.append(f"{name} — {'мёртв' if not alive else 'жив'}")
     flags = setting.get("flags") or {}
-    flag_line = "; ".join(f"{k}={v}" for k, v in list(flags.items())[:12]) if flags else "нет"
+    flag_line = _flag_line(flags, setting.get("flag_titles"), limit=14) if flags else "нет"
     facts_line = []
     if npc_facts:
         facts_line.append("NPC: " + "; ".join(npc_facts))
@@ -1834,7 +1931,7 @@ def audit_messages(setting: dict, text: str, reply: str = "") -> list[dict]:
             "Верни ТОЛЬКО валидный JSON с директивами (как для game_engine). Все числа — ДЕЛЬТЫ относительно текущего состояния "
             "(например gold: -3 значит минус 3). Если механики нет — верни {}. "
             "Ключи: player ({gold, hp, mp, xp, stats, actions, level}), race_change, class, class_rank, class_evolve, secondary_class, secondary_rank, profession, "
-            "skill_add, skill_rank, skill_remove, title, reputation, effect_add (name — человекочитаемо, desc — описание), effect_remove, "
+            "skill_add, skill_rank, skill_remove, title, reputation, effect_add (name — человекочитаемо, desc — описание; периодическая убыль за ход: damage/heal — HP, mp_damage/mp_heal — MP; длительность — turns числом, у бессрочного turns нет), effect_remove, add_item/remove_item, item_update {{name, desc}}, "
             "add_item, remove_item, enemy_add, enemy_apply, enemy_remove, quest, quest_done, quest_advance, quest_choose, npc_set, npc_kill, "
             "location_add, location_update, move, flag, time, weather, game_over, "
             "shop_add, shop_remove, shop_update, trade_buy, trade_sell, gather, craft_learn, craft_remove, craft, "
@@ -1870,6 +1967,8 @@ def judge_messages(setting: dict, action: str, reply: str, lang: str = "ru") -> 
     npc = setting.get("npc") or {}
     npc_facts = []
     for k, v in list(npc.items())[:14]:
+        if is_player_npc(k, v if isinstance(v, dict) else None):
+            continue   # п.13: игрока сверяют по портрету, а не как персонажа окружения
         name = (v.get("name") or k) if isinstance(v, dict) else k
         alive = v.get("alive", True) if isinstance(v, dict) else True
         location = v.get("location") if isinstance(v, dict) else None
@@ -1878,7 +1977,7 @@ def judge_messages(setting: dict, action: str, reply: str, lang: str = "ru") -> 
     npc_line = "; ".join(npc_facts) if npc_facts else "нет"
 
     flags = setting.get("flags") or {}
-    flag_line = "; ".join(f"{k}={v}" for k, v in list(flags.items())[:14]) if flags else "нет"
+    flag_line = _flag_line(flags, setting.get("flag_titles"), limit=14) if flags else "нет"
 
     loc = (setting.get("locations") or {}).get(setting.get("current_location", "start"), {})
     # Портрет персонажа (биография + роль) — судья сверяет их согласованность
@@ -2033,7 +2132,9 @@ def divine_messages(world: dict, setting: dict, complaint: str,
         "директивы (add_item/remove_item, player hp/mp/gold, effect_add/remove, quest, flag, title и т.п. — как в game_engine), "
         "чтобы после твоего ответа мир стал СОГЛАСОВАННЫМ. При противоречии курса/титула/статуса — приведи их в порядок "
         "директивой title (например «Студентка третьего курса…» вместо «первокурсница») или установи flag, фиксирующий "
-        "верный факт; если в инвентаре/золоте явный разрыв — добавь/спиши предметы. Объяснение — ТОЛЬКО в twist, а реальная "
+        "верный факт; если в инвентаре/золоте явный разрыв — добавь/спиши предметы; если предмет выдан без описания, "
+        "а свойства уже есть в тексте — допиши их item_update {{name, desc}}, не выдавая предмет заново. "
+        "Объяснение — ТОЛЬКО в twist, а реальная "
         "правка — в directives. Не подстраивайся под каприз, но РЕАЛЬНОЕ противоречие обязано быть устранено."
         "3. Отказ (decline: true) применяй ТОЛЬКО если жалоба — каприз без фактической ошибки (просто «дай золото/предмет, "
         "потому что хочу») или если состояние уже корректно и игрок ошибается. Не списывай подлинное противоречие на «так задумано»: "
@@ -2051,6 +2152,7 @@ def divine_messages(world: dict, setting: dict, complaint: str,
         "{\"decline\": false, \"twist\": \"<сюжетное объяснение>\", \"directives\": {..директивы..}}\n"
         "или {\"decline\": true, \"twist\": \"<голос, что игрок ошибся>\", \"directives\": {}}.\n"
         "directives — такой же формат, как game_engine: player {hp/mp/gold}, add_item/remove_item [{{name,qty,desc}}], "
+        "item_update {{name, desc}} (правка уже выданного предмета), "
         "quest/quest_done, flag, effect_add/effect_remove, move и т.п. Все числа как у рассказчика (дельты). "
         f"{lang_instr}"
     )
@@ -2218,10 +2320,10 @@ GAME_ENGINE_TOOL = [{"type": "function", "function": {
         "Изменяет механическое состояние мира по заключительной части ответа рассказчика: "
         "player (hp/mp/gold/xp/stats/actions/level), race_change, class, class_rank, class_evolve, "
         "secondary_class, secondary_rank, profession, skill_add/skill_rank/skill_remove, title, "
-        "reputation, effect_add (name — человекочитаемо, desc — описание)/effect_remove, add_item/remove_item, enemy_add/enemy_apply/enemy_remove, "
+        "reputation, effect_add (name — человекочитаемо, desc — описание; урон/лечение за ход: damage/heal — HP, mp_damage/mp_heal — MP; срок — turns числом, без него эффект бессрочен)/effect_remove, add_item/remove_item (всегда с desc), item_update {{name, desc, weight, value, note}}, enemy_add/enemy_apply/enemy_remove, "
         "quest/quest_done (можно {id, next} — авто-цепочка), quest_advance (ступень), quest_choose (ветка), "
         "quest_success/quest_fail ({id, reason, next} — ИТОГ квеста: success/failed), quest {{id, timer: {{name, turns, desc}}}} (дедлайн квеста), "
-        "npc_set (id,name,mood,alive,desc,faction,schedule,money,notes,voice)/npc_kill, location_add/location_update/move, flag, time, weather, "
+        "npc_set (id,name,mood,alive,desc,faction,location,schedule,money,notes,voice)/npc_kill, location_add/location_update/move, flag {name,value,title [человеческое имя]}, time, weather, "
         "enemy_effect_add/enemy_effect_remove (статусы НА врагах: {{id,name,turns,damage,desc}} — ХРАНИЛИЩЕ, сами не тикают: урон по врагам только твоим enemy_apply), "
         "enemy_mark ({{id, position, initiative, target, stance}} — тактические метки для порядка боя), "
         "timer_add/timer_remove (таймеры-дедлайны мира: {name, turns, desc}), equip/unequip (экипировка по слотам: у предмета должен быть slot), "
@@ -2373,7 +2475,7 @@ def dynamic_event_messages(world: dict, setting: dict) -> list[dict]:
             "Верни ТОЛЬКО валидный JSON без пояснений и без <<ENGINE>>:"
             " {\"event\": \"текст события\", \"directives\": {\"weather\": \"...\", ...}}"
             " Директивы — опциональные механические изменения: weather, time, enemy_add {id,name,hp,dmg}, "
-            "npc_set {id,name,mood}, add_item [{name,qty}], flag {name,value}, player {{gold: -5, hp: -3}}, "
+            "npc_set {id,name,mood}, add_item [{name,qty}], flag {name,value,title}, player {{gold: -5, hp: -3}}, "
             "quest, effect_add. Если изменений не нужно — \"directives\": {}."
         )},
         {"role": "user", "content": "Текущее состояние:" + chr(10) + chr(10) + cur + chr(10) + chr(10) + "Сгенерируй одно событие."},

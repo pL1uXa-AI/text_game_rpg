@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import bg, bus, chroma_client, db, embeddings, llm, narrator, tts
+from . import bg, bus, chroma_client, db, embeddings, flag_titles, graph, llm, memory, narrator, tts
 from .config import get_config
 from .routers import admin, catalog, entities, lore, system, tts as tts_router, worlds
 from .routers.core import FRONTEND_DIR
@@ -66,6 +66,17 @@ async def _tts_cache_keepalive() -> None:
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     bus.attach_loop(asyncio.get_running_loop())   # синхронный код БД публикует через него
+    # п.13: само-исцеление на импорте вырезало карточки «игрока как NPC» из SQLite;
+    # их векторы можно убрать только здесь, когда есть цикл событий (иначе RAG и
+    # дальше доставал бы «Игрока» как персонажа окружения).
+    if memory.PENDING_VECTOR_KEYS:
+        _pending = list(memory.PENDING_VECTOR_KEYS)
+        memory.PENDING_VECTOR_KEYS.clear()
+        try:
+            await chroma_client.delete_by_ids(_pending)
+            log.info("само-исцеление NPC: убрано %s векторных карточек из памяти", len(_pending))
+        except Exception as e:
+            log.warning("чистка векторов удалённых NPC-карточек не удалась: %s", e)
     cfg = get_config()
     log.info("старт: модель=%s контекст_стандарт=%d фон=%s судья=%s мастер=%s враж_ии=%s "
              "события=%s озвучка=%s фоновые_LLM_параллельно=%d", cfg.main_provider,
@@ -236,3 +247,47 @@ try:
             db.update_world(_wid, setting=_s)
 except Exception:
     log.warning("само-исцеление рангов в мирах пропущено", exc_info=True)
+
+# ── Само-исцеление машинных имён в карточках (сессия 40, п.9) ──
+# Прошлые прогоны архивариуса записывали карточки с `name` == внутренний id
+# (`player`, `trail_to_outpost`). Имя правится ТОЛЬКО если состояние мира знает
+# настоящее имя той же сущности — движок ничего не выдумывает. Идемпотентно.
+# П.12 этой же сессии: там же мирам дописываются человекочитаемые названия флагов
+# (`flag_titles`) — их берёт у того же сюжета, из которого мир создан.
+try:
+    _n_fixed = 0
+    _n_flags = 0
+    _n_npc = 0
+    for _w in db.list_worlds():
+        _full = db.get_world(_w["id"]) or {}
+        _s = _full.get("setting")
+        try:
+            _s = json.loads(_s) if isinstance(_s, str) else (_s or {})
+        except Exception:
+            _s = {}
+        if isinstance(_s, dict):
+            _n_fixed += memory.repair_machine_card_names(_w["id"], _s)
+            _w_flags = flag_titles.repair_flag_titles(_s)
+            _n_flags += _w_flags
+            # п.13 этой же сессии: игрок не должен числиться «персонажем окружения»
+            _w_npc = memory.heal_player_as_npc(_w["id"], _s)
+            _n_npc += _w_npc
+            if _w_flags or _w_npc:
+                db.update_world(_w["id"], setting=_s)
+            # карта мира пересобирается из исправленного состояния: узел «npc:Игрок»
+            # пережил бы чистку, пока карту никто не звал (sync ничего не пишет, если
+            # граф уже равен состоянию — проверка дешёвая, два SELECT на мир)
+            try:
+                graph.sync_from_setting(_w["id"], _s)
+            except Exception as _e:
+                log.warning("пересинхронизация карты (world %s) после чистки NPC: %s",
+                            _w["id"], _e)
+    if _n_fixed:
+        log.info("само-исцеление имён карточек: исправлено %s (были машинные id)", _n_fixed)
+    if _n_flags:
+        log.info("само-исцеление названий флагов: подписано %s (были машинные ключи)", _n_flags)
+    if _n_npc:
+        log.info("само-исцеление NPC: убрано %s записей игрока из персонажей (дубль player)",
+                 _n_npc)
+except Exception:
+    log.warning("само-исцеление имён (карточки/флаги/NPC) пропущено", exc_info=True)

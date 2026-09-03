@@ -297,8 +297,8 @@
       }
     ],
     "flags": {
-      "player_awakened": true,
-      "node_sealed": true
+      "player_awakened": { "value": true, "title": "Пробуждение случилось" },
+      "node_sealed": { "value": true, "title": "Нулевой Узел запечатан" }
     }
   },
   "story": {

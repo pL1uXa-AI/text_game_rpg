@@ -137,6 +137,10 @@ class AdminSettingsIn(BaseModel):
     enemy_ai_interval: Optional[str] = None
     tick_effects_enabled: Optional[bool] = None
     tick_needs_enabled: Optional[bool] = None
+    # п.14b/п.16 (сессия 40): авто-часы мира и число повторов дописывания механики
+    auto_time_enabled: Optional[bool] = None
+    auto_time_every: Optional[str] = None
+    mech_narrate_retries: Optional[str] = None
     divine_cooldown_turns: Optional[str] = None
     max_action_chars: Optional[str] = None
     # наблюдаемость и устойчивость (сессия 38, B5): раньше README обещал, что админка

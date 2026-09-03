@@ -172,3 +172,36 @@ def test_quest_cards_no_bio_duplication_and_human_name(api_client, monkeypatch):
     # summary содержит описание (один раз), а bio — пустой/без повторов
     assert desc in (qcard.get("summary") or "")
     assert bio.count("•") <= 1, "bio не должен накапливать маркеры-дубликаты"
+
+
+def test_item_card_gets_description_later(api_client, monkeypatch):
+    """Сессия 40, п.2: предмет выдан без описания → рассказчик закрепил его item_update →
+    карточка знания «предмет» обязана получить это описание и НЕ терять его на следующих
+    ходах (раньше при пустом desc карточке вписывалась заглушка «в инвентаре игрока»)."""
+    client, holder = api_client
+    monkeypatch.setattr(narrator, "ensure_knowledge_cards", memory_mod.ensure_knowledge_cards)
+    from backend import db as db_mod
+
+    wid = client.post("/api/worlds", json={"theme_id": narrator.THEMES[0]["id"], "name": "E2E-item"}).json()["world_id"]
+
+    holder["reply"] = 'Ты поднимаешь кристалл. <<ENGINE>>{"add_item": [{"name": "Синий кристалл", "qty": 1}]}'
+    client.post(f"/api/worlds/{wid}/action", json={"text": "подобрать кристалл"})
+
+    holder["reply"] = ('Внутри — серебристые нити. <<ENGINE>>{"item_update": '
+                       '{"name": "Синий кристалл", "desc": "чистая энергия Порядка"}}}')
+    r = client.post(f"/api/worlds/{wid}/action", json={"text": "изучить кристалл"})
+    assert r.status_code == 200
+    inv = r.json()["state"]["player"]["inventory"]
+    mine = next(x for x in inv if x["name"] == "Синий кристалл")
+    assert mine["desc"] == "чистая энергия Порядка", inv
+
+    card = next((c for c in db_mod.list_entities(wid)
+                 if c["kind"] == "item" and c["entity_key"] == "Синий кристалл"), None)
+    assert card and card["summary"] == "чистая энергия Порядка", card
+
+    # ещё ход с пустым desc в состоянии не должен затереть наведённое описание
+    holder["reply"] = "Ты идёшь дальше."
+    client.post(f"/api/worlds/{wid}/action", json={"text": "идти дальше"})
+    card = next((c for c in db_mod.list_entities(wid)
+                 if c["kind"] == "item" and c["entity_key"] == "Синий кристалл"), None)
+    assert card["summary"] == "чистая энергия Порядка", "описание карточки не должно перезаписываться заглушкой"

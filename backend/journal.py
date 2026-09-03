@@ -140,11 +140,16 @@ def notable_diff(prev: dict, now: dict, action: str = "", sys_msgs: Optional[lis
                         "text": "", "subject": str(name)[:60]})
 
     # ── флаги-истины: только новые (поворотные по определению) ──
+    # п.12 (сессия 40): в заголовок — человекочитаемое название из `flag_titles`, если мастер
+    # или сюжет его дали; машинный ключ — в тексте (он остаётся и для поиска, и для сверки).
     pf, nf = _as_dict(prev.get("flags")), _as_dict(now.get("flags"))
+    ftitles = _as_dict(now.get("flag_titles"))
     for k in nf:
         if k not in pf and nf[k] is not False:
-            out.append({"cat": CAT_FLAG, "title": f"Так в мире и осталось: {k}",
-                        "text": "", "subject": str(k)[:60]})
+            t = str(ftitles.get(k) or "").strip()
+            out.append({"cat": CAT_FLAG,
+                        "title": f"Так в мире и осталось: {t or k}",
+                        "text": "", "subject": (t or str(k))[:60]})
 
     # ── бой: кто повержен (счётчик убийств + исчезновение врага) ──
     pe, ne = _as_dict(prev.get("enemies")), _as_dict(now.get("enemies"))

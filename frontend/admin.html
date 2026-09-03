@@ -146,6 +146,11 @@
     <label>Интервал боевого ИИ (ходов) <input type="number" min="1" max="100" id="a-enemy-ai-interval" placeholder="2"></label>
     <label class="check"><input type="checkbox" id="a-tick-enabled"> 🌀 Авто-тик статус-эффектов</label>
     <label class="check"><input type="checkbox" id="a-tick-needs-enabled"> 🍖 Авто-тик потребностей и рассудка</label>
+    <!-- п.14b/п.16 (сессия 40): часы мира идут сами; сколько раз дописывать прозу, если
+         модель вернула только механику -->
+    <label class="check"><input type="checkbox" id="a-auto-time-enabled"> 🕐 Авто-часы мира (утро/день/вечер/ночь)</label>
+    <label>Ходов на часть суток <input type="number" min="0" max="50" id="a-auto-time-every" placeholder="4"></label>
+    <label>Повторов «дописать текст» (ходов механики) <input type="number" min="1" max="5" id="a-mech-retries" placeholder="2"></label>
     <label>Кулдаун Провидения (ходов, 0 = без) <input type="number" min="0" max="100" id="a-divine-cd" placeholder="3"></label>
     <label>Макс. длина действия игрока (символов) <input type="number" min="50" max="10000" id="a-max-action" placeholder="640"></label>
   </div>
@@ -423,6 +428,9 @@ async function load() {
   setAg("a-enemy-ai-interval", "ENEMY_AI_INTERVAL", ag.enemy_ai_interval);
   setAgCheck("a-tick-enabled", "TICK_EFFECTS_ENABLED", ag.tick_effects_enabled);
   setAgCheck("a-tick-needs-enabled", "TICK_NEEDS_ENABLED", ag.tick_needs_enabled);
+  setAgCheck("a-auto-time-enabled", "AUTO_TIME_ENABLED", ag.auto_time_enabled);
+  setAg("a-auto-time-every", "AUTO_TIME_EVERY", ag.auto_time_every);
+  setAg("a-mech-retries", "MECH_NARRATE_RETRIES", ag.mech_narrate_retries);
   setAg("a-divine-cd", "DIVINE_COOLDOWN_TURNS", ag.divine_cooldown_turns);
   setAg("a-max-action", "MAX_ACTION_CHARS", ag.max_action_chars);
   // Переносимость и наблюдаемость (сессия 33)
@@ -604,6 +612,9 @@ function collect() {
   const ei = valOr("a-enemy-ai-interval"); if (ei !== null) payload.enemy_ai_interval = ei;
   payload.tick_effects_enabled = boolOr("a-tick-enabled");
   payload.tick_needs_enabled = boolOr("a-tick-needs-enabled");
+  payload.auto_time_enabled = boolOr("a-auto-time-enabled");
+  const ate = valOr("a-auto-time-every"); if (ate !== null) payload.auto_time_every = ate;
+  const mnr = valOr("a-mech-retries"); if (mnr !== null) payload.mech_narrate_retries = mnr;
   // пустое поле = «сбросить к .env» (отсюда !== null), а «0» — значимое «выключить лимит»
   const dc = valOr("a-divine-cd"); if (dc !== null) payload.divine_cooldown_turns = dc;
   const ma = valOr("a-max-action"); if (ma !== null) payload.max_action_chars = ma;
@@ -673,6 +684,7 @@ let ALL_ADMIN_KEYS = [
   "LOGIC_JUDGE_ENABLED", "LOGIC_JUDGE_INTERVAL", "DYNAMIC_EVENTS_ENABLED",
   "EVENT_EVERY_TURNS", "AUTONOMOUS_MASTER_ENABLED", "AUTONOMOUS_MASTER_INTERVAL",
   "ENEMY_AI_ENABLED", "ENEMY_AI_INTERVAL", "TICK_EFFECTS_ENABLED", "TICK_NEEDS_ENABLED",
+  "AUTO_TIME_ENABLED", "AUTO_TIME_EVERY", "MECH_NARRATE_RETRIES",
   "DIVINE_COOLDOWN_TURNS", "MAX_ACTION_CHARS",
   "LOG_LEVEL", "LOG_MAX_BYTES", "LOG_BACKUP_COUNT", "LOG_PROMPT_DUMP",
   "LLM_RETRIES", "LLM_RETRY_BACKOFF", "LLM_TIMEOUT", "CHROMA_RETRIES", "EMBEDDING_RETRIES",

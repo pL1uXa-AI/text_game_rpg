@@ -429,8 +429,8 @@
       }
     ],
     "flags": {
-      "player_awakened": true,
-      "core_sealed": true
+      "player_awakened": { "value": true, "title": "Пробуждение случилось" },
+      "core_sealed": { "value": true, "title": "Сердце Фрактала запечатано" }
     }
   },
   "story": {

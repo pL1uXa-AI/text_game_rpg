@@ -427,6 +427,15 @@ function renderWorldClock(s) {
   el.title = parts.join(", ") || "время и погода мира";
 }
 
+/* П.6 (сессия 40): ЕДИНАЯ формулировка перехода. Компас, карта и быстрые действия обязаны
+ * слать в чат ОДНО И ТО ЖЕ человекочитаемое действие («Я иду в …» с названием локации) —
+ * раньше компас слал системный id локации («Идти в path_to_architects»), игрок видел
+ * машинное имя в своей реплике, а модель описывала переход по нему. */
+function travelActionText(name) {
+  const n = String(name == null ? "" : name).replace(/\s+/g, " ").trim();
+  return n ? `Я иду в «${n}».` : "";
+}
+
 function renderCompass(s) {
   const el = $("compass-bar");
   if (!el) return;
@@ -434,21 +443,43 @@ function renderCompass(s) {
   const cur = s.current_location;
   const here = cur && locs[cur];
   const conns = (here && Array.isArray(here.connections)) ? here.connections : [];
+  // П.6 (сессия 40): человекочитаемое имя цели. Компас брал `data-loc` — внутренний id,
+  // и в чат уходило «Идти в path_to_architects». Имя ищется в setting.locations, затем
+  // в подписи узла карты (локацию мог завести рассказчик ребром графа).
+  const labels = {};
+  const isLoc = new Set();
+  if (mapGraphWorld === state.currentWorld && mapGraph && mapGraph.nodes) {
+    mapGraph.nodes.forEach((n) => {
+      if (!n.id) return;
+      // компас — только про локации: в графе есть ещё npc:/shop:/faction: узлы
+      if (n.kind === "location") isLoc.add(n.id);
+      if (n.label) labels[n.id] = n.label;
+    });
+  }
+  const niceName = (id) => (locs[id] && locs[id].name) || labels[id] || id;
+  // Ребро считается висячим (и кнопкой не делается), только если цели нет ни в одной
+  // карте мира: ни в setting.locations, ни локацией в графе. Безымянная локация остаётся
+  // видимой под своим id — механика `move` валидирует переход именно по id, так что это
+  // единственный работающий вариант, а не «системное имя вместо названия».
+  const known = (id) => Boolean(locs[id]) || isLoc.has(id);
   // подстраховка: если рёбер в состоянии нет — возьмём из кэша карты (граф) при его наличии
-  let items = conns.map((id) => ({ id, name: (locs[id] && locs[id].name) || id }))
-    .filter((x) => x.id !== cur);
-  if (!items.length && state.mapGraph && state.mapGraph.edges) {
-    items = state.mapGraph.edges
-      .filter((e) => e[0] === cur || e[1] === cur)
-      .map((e) => { const id = e[0] === cur ? e[1] : e[0]; return { id, name: (locs[id] && locs[id].name) || id }; });
+  let items = conns.map((id) => ({ id, name: niceName(id) }))
+    .filter((x) => x.id !== cur && known(x.id));
+  if (!items.length && mapGraph && mapGraph.edges) {
+    items = mapGraph.edges
+      .filter((e) => isLoc.has(e.source) && isLoc.has(e.target))
+      .filter((e) => e.source === cur || e.target === cur)
+      .map((e) => { const id = e.source === cur ? e.target : e.source; return { id, name: niceName(id) }; })
+      .filter((x) => x.id !== cur && known(x.id));
   }
   if (!items.length) { el.style.display = "none"; return; }
   el.style.display = "";
   el.innerHTML = `<span class="compass-label">🧭 рядом:</span> ` + items.slice(0, 6).map((it) =>
-    `<button class="btn small compass-btn" data-loc="${esc(it.id)}" title="Идти в ${esc(it.name)}">→ ${esc(it.name)}</button>`
+    `<button class="btn small compass-btn" data-loc="${esc(it.id)}" data-name="${esc(it.name)}" title="Идти в ${esc(it.name)}">→ ${esc(it.name)}</button>`
   ).join("");
   el.querySelectorAll(".compass-btn").forEach((b) => {
-    b.onclick = () => sendAsAction(`Идти в ${b.dataset.loc}`);
+    // П.6: берём ЧЕЛОВЕЧЕСКОЕ имя из data-name (id остаётся в data-loc — сверить цель)
+    b.onclick = () => { const t = travelActionText(b.dataset.name); if (t) sendAsAction(t); };
   });
 }
 
@@ -492,11 +523,60 @@ async function loadJournal() {
   }
 }
 
-function scrollToSeq(seq) {
-  const msg = document.querySelector(`.msg[data-seq="${seq}"]`);
-  if (msg) { msg.scrollIntoView({ block: "center" }); msg.classList.add("flash-seq"); return; }
-  // если события ещё не загружены (пагинация) — открываем историю
-  alert(`Событие хода ${seq} не в загруженной части лога. Поднимись в начало и нажми «⬆ Показать ранние события».`);
+/* П.10 (сессия 40): переход из дневника к ходу.
+ * РАНЬШЕ `scrollToSeq` искал событие СРЕДИ ОТРИСОВАННОГО и, не найдя, отправлял игрока
+ * «поднимись в начало и нажми «⬆ Показать ранние события»» — то есть дневник молча
+ * ломался ровно на тех записях, которые в нём интересны: при открытии мира в чат грузится
+ * только хвост лога (`worlds.py::world_detail`, limit=60), так что в мире длиннее страницы
+ * ЛЮБАЯ ранняя запись давала этот тупик. Были и другие пути в никуда: ход мог исчезнуть
+ * (перемотка/`↻` удаляют события) или не рисоваться (служебная роль, свёртка).
+ * Теперь переход сам догружает ранние страницы, а если точного хода нет — ЧЕСТНО говорит
+ * почему и ведёт к ближайшему сохранившемуся, а не к мёртвой кнопке. */
+async function scrollToSeq(seq) {
+  const want = Number(seq) || 0;
+  if (!want) { alert("У этой записи нет привязки к ходу."); return; }
+  if (_focusSeqMsg(want)) return;
+  // догружаем ранние страницы, пока самый ранний загруженный ход не опустится до want
+  for (let i = 0; i < _SEQ_JUMP_MAX_PAGES; i++) {
+    const min = Number(state.logMinSeq || 0);
+    if (!min || min <= want) break;
+    if (!await loadEarlier()) break;        // больше нечего догружать (или сеть отказала)
+    if (_focusSeqMsg(want)) return;
+  }
+  // точного хода в чате нет: ведём к ближайшему видимому событию и объясняем
+  const near = _nearestSeqMsg(want);
+  if (near) {
+    near.scrollIntoView({ block: "center" });
+    near.classList.add("flash-seq");
+    alert(`Хода ${want} в логе уже нет (перемотка, или он не показывается в чате). ` +
+          `Открыл ближайший сохранившийся — #${near.dataset.seq}.`);
+    return;
+  }
+  alert(`События хода ${want} в логе нет — возможно, они стёрты перемоткой.`);
+}
+
+const _SEQ_JUMP_MAX_PAGES = 40;
+
+/* Найти отрисованное сообщение с этим seq, подсветить и прокрутить к нему. */
+function _focusSeqMsg(seq) {
+  const msg = document.querySelector(`.msg[data-seq="${Number(seq) || 0}"]`);
+  if (!msg) return false;
+  msg.scrollIntoView({ block: "center" });
+  msg.classList.add("flash-seq");
+  return true;
+}
+
+/* Ближайшее по номеру отрисованное сообщение (для «хода больше нет в логе»). */
+function _nearestSeqMsg(seq) {
+  const want = Number(seq) || 0;
+  let best = null, bestGap = Infinity;
+  document.querySelectorAll(".msg[data-seq]").forEach((m) => {
+    const s = Number(m.dataset.seq);
+    if (!s) return;
+    const gap = Math.abs(s - want);
+    if (gap < bestGap) { bestGap = gap; best = m; }
+  });
+  return best;
 }
 
 /* ─────────────── C1: перемотка к ходу ─────────────── */
@@ -833,7 +913,7 @@ function renderSetting(s) {
     const progress = Object.entries(p.progress || {});
     const achievements = (p.achievements || []);
     if (progress.length) {
-      H.push(`<div class="char-row"><span class="char-label">📊 Статистика</span><span>${progress.map(([k, v]) => `${esc(ucfirst(k))} ${v}`).join(" · ")}</span></div>`);
+      H.push(`<div class="char-row"><span class="char-label">📊 Статистика</span><span>${progress.map(([k, v]) => `${esc(progressLabel(k))} ${v}`).join(" · ")}</span></div>`);
     }
     if (achievements.length) {
       const achHtml = achievements.map((a) => {
@@ -882,11 +962,13 @@ function renderSetting(s) {
     let tick = "";
     if (ef.damage) tick += ` −${ef.damage} HP/ход`;
     if (ef.heal) tick += ` +${ef.heal} HP/ход`;
+    if (ef.mp_damage) tick += ` −${ef.mp_damage} MP/ход`;
+    if (ef.mp_heal) tick += ` +${ef.mp_heal} MP/ход`;
     if ((ef.stacks || 1) > 1) tick += ` ×${ef.stacks}`;
     const mods = ef.mods || {};
     if (Object.keys(mods).length) tick += ` (моды: ${Object.entries(mods).map(([k, v]) => `${esc(k)}${v > 0 ? "+" : ""}${v}`).join(", ")})`;
     const desc = ef.desc ? trunc(ef.desc, 120) : "";
-    const cls = (ef.damage || 0) > 0 ? " bad" : (ef.heal || 0) > 0 ? " good" : "";
+    const cls = ((ef.damage || 0) + (ef.mp_damage || 0)) > 0 ? " bad" : ((ef.heal || 0) + (ef.mp_heal || 0)) > 0 ? " good" : "";
     return `<li class="eff${cls} item-clickable" data-click="showEffect" data-arg="${numAttr(ei)}" title="${esc(ef.desc || "")}">${esc(label)}<small>${desc ? esc(desc) + " " : ""}(${t}${kind}${tick})</small></li>`;
   }).join("") || `<li>нет</li>`;
   $("inventory").innerHTML = (p.inventory || []).map((i, idx) =>
@@ -974,7 +1056,17 @@ function renderSetting(s) {
   }).join("") || `<li>нет</li>`;
   $("enemies").innerHTML = Object.entries(s.enemies || {}).map(([k, e]) =>
     `<li class="item-clickable" data-click="showEnemy" data-arg="${attrArg(k)}">${e.desc ? `<small class="desc">${trunc(e.desc, 80)}</small>` : ``}⚔ ${esc(e.name)} — HP ${e.hp}/${e.max_hp}${e.money ? ` <em class="val">🪙${e.money}</em>` : ``}</li>`).join("") || `<li>нет</li>`;
-  $("npc-list").innerHTML = Object.entries(s.npc || {}).map(([k, n]) => {
+  // Сессия 40, п.13: игрок — не NPC (в мире №103 он стоял в этом списке рядом с
+  // торговцем). Своё состояние он видит вверху сайдбара. Так же как и движок
+  // (mechanics.is_player_npc), отсеиваем запись по ключу или имени «Игрок».
+  const _self = (k, n) => ["player", "pc", "protagonist", "hero", "игрок", "герой"]
+    .includes(String(k).toLowerCase()) ||
+    ["player", "pc", "protagonist", "игрок", "герой"].includes(String(n && n.name || "").trim().toLowerCase());
+  const _here = s.current_location || "";
+  // рядом стоящие — первыми: у NPC может быть поле location (npc_set/карточка)
+  const _far = (n) => (n.location && n.location !== _here) ? 1 : 0;
+  $("npc-list").innerHTML = Object.entries(s.npc || {}).filter(([k, n]) => !_self(k, n))
+    .sort((a, b) => _far(a[1]) - _far(b[1])).map(([k, n]) => {
     let sch = "";
     const schedule = n.schedule;
     if (schedule && typeof schedule === "object" && n.alive !== false && s.time) {
@@ -983,6 +1075,11 @@ function renderSetting(s) {
         const kk = String(k2).toLowerCase();
         if (t.includes(kk) || kk.includes(t)) { sch = ` <small class="sch">⏰ ${esc(act)}</small>`; break; }
       }
+    }
+    // «не рядом» — только когда место известно и оно не текущее
+    if (n.location && n.location !== _here) {
+      const lname = ((s.locations || {})[n.location] || {}).name || n.location;
+      sch += ` <small class="sch">📍 ${esc(lname)}</small>`;
     }
     return `<li class="item-clickable" data-click="showNpc" data-arg="${attrArg(k)}">${n.alive === false ? "🪦 " : "🗣 "}${esc(n.name)} (${trunc(n.mood || n.desc || "", 40)}${n.faction ? ", " + esc(factionName(n.faction)) : ""}${n.money ? ", 🪙" + esc(n.money) : ""})${sch}</li>`;
   }).join("") || `<li>нет</li>`;
@@ -1025,6 +1122,9 @@ async function refreshMapGraph() {
       mapGraph = g;
       mapGraphWorld = state.currentWorld;
       renderMap();
+      // П.6: подписи локаций пришли с графом — перерисуем компас (без него цели, которых
+      // нет в setting.locations, показывались бы системным id либо пропадали)
+      if (state.setting) renderCompass(state.setting);
     }
   } catch (e) {
     // граф недоступен — остаёмся на прежних данных / фолбэк setting.locations
@@ -1234,7 +1334,7 @@ function renderMap() {
       const name = g.dataset.name;
       if (id0 === cur) { quickAction("Осмотреться вокруг."); return; }
       const isNear = connected.has(id0);
-      if (isNear) { quickAction(`Я иду в «${name}».`); return; }
+      if (isNear) { quickAction(travelActionText(name)); return; }
       // дальняя локация → подсветить кратчайший путь из текущей
       _mapPath = _mapPathIds(cur, id0, adj, ids);
       renderMap();
@@ -1368,11 +1468,14 @@ function renderSuggestionBar() {
   // соседние локации (карта)
   (loc.connections || []).forEach((cid) => {
     const l = (s.locations || {})[cid];
-    if (l && cid !== s.current_location) add(`🚶 Идти в ${l.name}`, `Я иду в «${l.name}».`);
+    if (l && cid !== s.current_location) add(`🚶 Идти в ${l.name}`, travelActionText(l.name));
   });
-  // живые NPC
-  Object.values(s.npc || {}).forEach((n) => {
-    if (n.alive !== false) add(`🗣 Поговорить с ${n.name}`, `Поговорить с ${n.name}.`);
+  // живые NPC (п.13: сам игрок в списке не «рядом» — он не NPC; своё имя он вводит сам)
+  Object.entries(s.npc || {}).forEach(([k, n]) => {
+    if (n.alive === false || ["player", "pc", "protagonist", "игрок", "герой"].includes(String(k).toLowerCase())) return;
+    if (["player", "pc", "protagonist", "игрок", "герой"].includes(String(n.name || "").trim().toLowerCase())) return;
+    if (n.location && n.location !== (s.current_location || "")) return;  // далеко — не предлагать
+    add(`🗣 Поговорить с ${n.name}`, `Поговорить с ${n.name}.`);
   });
   // враги рядом
   Object.values(s.enemies || {}).forEach((e) => {
@@ -1468,7 +1571,9 @@ function factionName(id) {
   return (f[fr] && f[fr].name) ? f[fr].name : (fr || "?");
 }
 
-// Читаемый ярлык флага: известные ключи → фразы, иначе id → слова с заглавной
+// Читаемый ярлык флага. п.12 (сессия 40): главный источник — `setting.flag_titles`
+// (человеческое имя, которое дал мастер директивой `flag {name,value,title}` или сюжет);
+// дальше — словарь известных ключей; дальше — id как есть (движок НЕ выдумывает имена).
 const FLAG_LABELS = {
   first_contract_broken: "Первый контракт сорван",
   known_heretic: "Известен как еретик",
@@ -1483,6 +1588,9 @@ const FLAG_LABELS = {
   allied_with_blades: "Союз с Клинками",
 };
 function flagLabel(k) {
+  const ft = (state.setting && state.setting.flag_titles) || {};
+  const t = String(ft[k] || "").trim();
+  if (t) return t;
   if (FLAG_LABELS[k]) return FLAG_LABELS[k];
   const s = String(k || "").replace(/_/g, " ");
   return s ? ucfirst(s) : k;
@@ -1545,6 +1653,20 @@ function actionNameWithProg(a, c, curProf) {
 function ucfirst(s) {
   s = String(s == null ? "" : s);
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+// п.11 (сессия 40): ярлык счётчика пути. Движок ведёт moves/kills/quests_done/
+// discoveries машинными ключами — игроку показываем игровое слово (синхронно с
+// backend.mechanics.PROGRESS_LABELS). Прочие ключи заданы мастером на языке мира —
+// их не перефразируем (закон 3), только возвращаем как есть.
+const PROGRESS_LABELS = {
+  kills: "Побед",
+  quests_done: "Квестов выполнено",
+  moves: "Переходов",
+  discoveries: "Открыто локаций",
+};
+function progressLabel(k) {
+  const key = String(k == null ? "" : k).trim();
+  return PROGRESS_LABELS[key] || key || "?";
 }
 // Ступень репутации игрока у фракции (число → ярлык), синхронна с backend.mechanics.reputation_standing
 function repStanding(v) {
@@ -1669,6 +1791,8 @@ function showEffect(idx) {
   let meta = `${esc(ef.kind ? ucfirst(ef.kind) : "особый")} · ${t}`;
   if (ef.damage) meta += ` · −${ef.damage} HP/ход`;
   if (ef.heal) meta += ` · +${ef.heal} HP/ход`;
+  if (ef.mp_damage) meta += ` · −${ef.mp_damage} MP/ход`;
+  if (ef.mp_heal) meta += ` · +${ef.mp_heal} MP/ход`;
   if ((ef.stacks || 1) > 1) meta += ` · ×${ef.stacks}`;
   const mods = ef.mods || {};
   if (Object.keys(mods).length) meta += ` · моды: ${Object.entries(mods).map(([k, v]) => `${esc(k)}${v > 0 ? "+" : ""}${v}`).join(", ")}`;
@@ -1705,6 +1829,8 @@ function showFlag(idx) {
   openModal("🚩 " + flagLabel(k),
     `<p class="item-big">${esc(flagLabel(k))} <span class="muted">(${flagWord(v)})</span></p>` +
     `<p class="muted">Ключ: ${esc(k)}</p>` +
+    (((state.setting || {}).flag_titles || {})[k] ? ""
+      : `<p class="muted">У флага нет человекочитаемого названия — движок показывает ключ. Мастер задаёт его вместе с флагом директивой flag полем title.</p>`) +
     `<p class="muted">Флаг — факт мира, который помнит движок (открытые двери, выборы, события).</p>`,
     () => {});
 }
@@ -1794,6 +1920,7 @@ function showEnemy(key) {
 /* ─────────────── Лог сообщений ─────────────── */
 function msgClass(role) {
   if (role === "player") return "player";
+  if (role === "narrator") return "narrator";
   if (role === "dice") return "dice";
   if (role === "system") return "system";
   if (role === "summary") return "summary";
@@ -1851,6 +1978,10 @@ function buildMsg(e) {
   div.className = `msg ${msgClass(e.role)}`;
   div.dataset.id = e.id || "";
   div.dataset.seq = e.seq || "";
+  // П.5 (сессия 40): «Вы #» без номера. У оптимистичных (локальных) сообщений seq нет —
+  // раньше рисовался голый «#», который превращался в номер только после перезагрузки
+  // страницы. Пустой номер не показываем вовсе, а живой id/seq подставляет adoptPlayer.
+  const seqHtml = (e.seq === 0 || e.seq) ? `<span class="muted">#${esc(String(e.seq))}</span>` : "";
   const ttsBtn = ttsButtonHTML(e);
   const actions = (e.role === "narrator" || e.role === "dice") && e.id
     ? `<div class="actions">
@@ -1861,7 +1992,7 @@ function buildMsg(e) {
       </div>`
     : "";
   div.innerHTML = `<div class="who">${esc(WHO[e.role] || e.role || "?")}
-    <span class="muted">#${esc(String(e.seq || ""))}</span></div>
+    ${seqHtml}</div>
     <div class="body">${esc(e.content)}</div>${actions}`;
   // Прозрачность RAG: плашка «🧠 Память» у ответа рассказчика. Данные подхваченных
   // фрагментов хранятся в meta события (переживают перезагрузку/пагинацию/опрос).
@@ -1893,6 +2024,46 @@ function buildMsg(e) {
   return div;
 }
 
+// E3: счётчик id для локально нарисованных (оптимистичных) сообщений
+let _localMsgId = 0;
+
+/* П.5 (сессия 40): «удочерение» оптимистичного сообщения игрока.
+ * Локальный пузырь рисуется раньше ответа сервера (мгновенный отклик) и потому не знает
+ * ни id, ни seq события. Здесь подставляем их в уже нарисованный элемент: номер «#N»
+ * появляется сразу, а appendMsg/шина не дублируют ход (дедюп идёт по data-id).
+ * Ищем СОВПАДЕНИЕМ ТЕКСТА с конца (пробелы/`<<ENGINE>>` нормализуем), а не «последний
+ * локальный»: пузыри слэш-команд не имеют серверного player-события и помечаются
+ * data-local, так что «последний» мог бы оказаться не тем ходом. Если совпадения нет,
+ * а пузырь ровно один — берём его (текст серверного события может разойтись с тем, что
+ * набрал игрок: сервер срезает механику и лишние пробелы), иначе не угадываем. */
+function adoptPlayer(e) {
+  const nodes = document.querySelectorAll('.msg.player[data-id^="local-"]:not([data-local])');
+  const norm = (s) => String(s || "").replace(/<<ENGINE>>/g, "").replace(/\s+/g, " ").trim();
+  const want = norm(e.content);
+  let el = null;
+  if (want) {
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const body = nodes[i].querySelector(".body");
+      if (body && norm(body.textContent) === want) { el = nodes[i]; break; }
+    }
+  }
+  // страховка: текст серверного события мог разойтись (сервер вырезает <<ENGINE>>, усекает
+  // длину) — во время хода «в полёте» ровно один пузырь, брать нечего, кроме него
+  if (!el && nodes.length === 1) el = nodes[0];
+  if (!el) return false;
+  el.dataset.id = String(e.id);
+  el.dataset.seq = String(e.seq || "");
+  const who = el.querySelector(".who");
+  if (who && (e.seq || e.seq === 0) && !who.querySelector(".muted")) {
+    const span = document.createElement("span");
+    span.className = "muted";
+    span.textContent = `#${e.seq}`;
+    who.appendChild(span);
+  }
+  if (+e.seq > (state.seenSeq || 0)) state.seenSeq = +e.seq;
+  return true;
+}
+
 function appendMsg(e, scroll = true) {
   // E3 (аудит 38): дедюплицируем ПО ID события, а не по seq. Серверные id уникальны и
   // есть всегда, а seq у локальных (оптимистичных) сообщений пустой — раньше второе
@@ -1916,8 +2087,6 @@ function appendMsg(e, scroll = true) {
 
 /* ─── Пагинация лога: подгрузка более ранних событий ─── */
 let logPagerBtn = null;
-// E3: счётчик id для локально нарисованных (оптимистичных) сообщений
-let _localMsgId = 0;
 
 function showLogPager(show) {
   if (!logPagerBtn) {
@@ -1935,7 +2104,7 @@ function showLogPager(show) {
 }
 
 async function loadEarlier() {
-  if (!state.currentWorld || state.loadingEarlier) return;
+  if (!state.currentWorld || state.loadingEarlier) return false;
   state.loadingEarlier = true;
   const btn = $("btn-load-earlier");
   if (btn) { btn.disabled = true; btn.textContent = "⏳ Загрузка…"; }
@@ -1945,7 +2114,7 @@ async function loadEarlier() {
     if (!older.length) {
       showLogPager(false);   // больше ранних событий нет
       if (btn) btn.textContent = "⬆ Показать ранние события";
-      return;
+      return false;
     }
     const insertBefore = logPagerBtn ? logPagerBtn.nextSibling : $("log").firstChild;
     const prevHeight = $("log").scrollHeight;
@@ -1955,8 +2124,10 @@ async function loadEarlier() {
     const newHeight = $("log").scrollHeight;
     $("log").scrollTop += newHeight - prevHeight;
     if (btn) btn.textContent = "⬆ Показать ранние события";
+    return true;
   } catch (_) {
     if (btn) btn.textContent = "⬆ Показать ранние события";
+    return false;
   } finally {
     state.loadingEarlier = false;
   }
@@ -2324,10 +2495,13 @@ async function sendAction() {
   const text = input.value.trim();
   if (!text || state.streaming) return;
   input.value = "";
-  appendMsg({ role: "player", content: text, seq: "" });
+  const bubble = appendMsg({ role: "player", content: text, seq: "" });
 
   const isSlash = text.startsWith("/");
   if (isSlash) {
+    // П.5: пузыри слэш-команд не имеют серверного player-события и не должны попадать
+    // в выборку adoptPlayer (иначе «съели» бы номер чужого хода).
+    if (bubble) bubble.dataset.local = "1";
     try {
       const res = await API(`/api/worlds/${state.currentWorld}/action`,
         { method: "POST", body: JSON.stringify({ text }) });
@@ -2339,6 +2513,12 @@ async function sendAction() {
 }
 
 function handleActionResult(res, typerDiv, skipPlayer = false) {
+  // П.5 (сессия 40): оптимистичный «пузырь» игрока обязан получить реальные id/seq из
+  // серверного события, иначе номер «#» проставляется только после перезагрузки страницы,
+  // а сам ход невозможно соотнести с дневником/перемоткой. Дедюп по id в appendMsg при
+  // этом не сработает: локальному сообщению выдан временный id `local-N`.
+  const pe = (res.events || []).find((e) => e && e.role === "player");
+  if (pe) adoptPlayer(pe);
   // Перегенерация: убираем старые сообщения заменённого хода (не копим «копии ответа»)
   if (Array.isArray(res.replaced_events) && res.replaced_events.length) {
     const gone = new Set(res.replaced_events.map(String));

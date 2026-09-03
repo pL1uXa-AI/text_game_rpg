@@ -169,6 +169,15 @@ class Config:
     divine_cooldown_turns: int = 3    # минимум ходов между воззваниями (0 = без кулдауна)
     tick_effects_enabled: bool = True  # авто-тик статус-эффектов в начале хода («физический движок»)
     tick_needs_enabled: bool = True    # авто-тик потребностей/рассудка (голод/усталость/жажда/рассудок/стресс/мораль)
+    # п.16 (сессия 40): сколько раз просить модель дописать прозу, если она вернула
+    # только механику без текста (перед тем как показывать служебную строку).
+    mech_narrate_retries: int = 2
+    # п.14b (сессия 40): часы мира идут сами (ход × N → утро/день/вечер/ночь). Причина —
+    # «вечер» из сюжета залипал навсегда: время меняет только директива time, а мастер
+    # её не давал, и расписания NPC («ночью таверна закрыта») противоречили тексту.
+    # Погоду авто-часы НЕ трогают — это творческое решение мастера (закон 3).
+    auto_time_enabled: bool = True
+    auto_time_every: int = 4           # ходов игрока на одну часть суток (сутки ≈ 16 ходов)
 
     # ── Автономный «мастер» (сессия 25) ──
     # Фоновый сюжетный агент: когда игрок «застрял» (повторяет одно действие / без активных
@@ -424,6 +433,9 @@ class Config:
             divine_cooldown_turns=it(3, "DIVINE_COOLDOWN_TURNS"),
             tick_effects_enabled=get("TICK_EFFECTS_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             tick_needs_enabled=get("TICK_NEEDS_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
+            mech_narrate_retries=it(2, "MECH_NARRATE_RETRIES"),
+            auto_time_enabled=get("AUTO_TIME_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
+            auto_time_every=it(4, "AUTO_TIME_EVERY"),
             autonomous_master_enabled=get("AUTONOMOUS_MASTER_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             autonomous_master_interval=it(6, "AUTONOMOUS_MASTER_INTERVAL"),
             enemy_ai_enabled=get("ENEMY_AI_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),

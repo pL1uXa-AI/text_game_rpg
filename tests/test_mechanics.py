@@ -127,6 +127,90 @@ def test_heal_effect(setting):
     assert setting["player"]["hp"] == 53
 
 
+def test_player_mp_message(setting):
+    """Сессия 40, п.1: трата MP директивой `player.mp` обязана быть видна игроку
+    (раньше hp/gold/xp давали системку, а mp — молча, отсюда «эффекты не применяются»)."""
+    before = setting["player"]["mp"]
+    msgs = apply_directives(setting, {"player": {"mp": -5}})
+    assert setting["player"]["mp"] == before - 5
+    assert any("Энергия" in m for m in msgs), msgs
+
+
+def test_tick_effect_mp_drain(setting):
+    """Сессия 40, п.1: тик эффекта списывает энергию (mp_damage), а не только HP."""
+    p = setting["player"]
+    p["effects"] = {"Кристальная лихорадка": {"turns": -1, "damage": 5, "mp_damage": 20}}
+    msgs = tick_effects(setting)
+    assert p["mp"] == p["max_mp"] - 20, "тик снял 20 MP"
+    assert p["hp"] == 45, "тик снял 5 HP"
+    assert any("MP" in m for m in msgs), "убыль MP видна в системном сообщении"
+    # MP не уходит в минус
+    p["mp"] = 3
+    tick_effects(setting)
+    assert p["mp"] == 0
+
+
+def test_tick_effect_mp_from_desc(setting):
+    """Сессия 40, п.1: старые миры — убыль описана только текстом, каналов нет.
+    Тик добирает её из desc (и не трогает явные числа рассказчика)."""
+    p = setting["player"]
+    p["effects"] = {"Кристальная лихорадка": {"turns": -1, "damage": 0, "heal": 0,
+                                              "desc": "рвёт узор: -30 HP, -20 MP за ход"}}
+    tick_effects(setting)
+    assert p["effects"]["Кристальная лихорадка"]["mp_damage"] == 20
+    assert p["mp"] == p["max_mp"] - 20 and p["hp"] == 50 - 30
+    # явные числа не перетираются: damage: 1 + «−99 HP за ход» → тикает 1
+    p["effects"] = {"X": {"turns": -1, "damage": 1, "desc": "−99 HP за ход"}}
+    tick_effects(setting)
+    assert p["effects"]["X"]["damage"] == 1, "явное число канала важнее текста"
+    # без фразы «за ход» текст в числа не превращается
+    p["effects"] = {"Y": {"turns": -1, "desc": "урон отравления 25 MP"}}
+    tick_effects(setting)
+    assert p["effects"]["Y"].get("mp_damage") in (None, 0)
+
+
+def test_effect_add_mp_damage_and_label(setting):
+    """effect_add хранит mp_damage/mp_heal и показывает тикающие каналы в системке."""
+    msgs = apply_directives(setting, {"effect_add": {"name": "Лихорадка",
+                                                    "damage": 5, "mp_damage": 20,
+                                                    "desc": "энергия рвёт узор"}})
+    ef = setting["player"]["effects"]["Лихорадка"]
+    assert ef["mp_damage"] == 20 and ef["damage"] == 5
+    assert any("−20 MP/ход" in m for m in msgs), msgs
+
+
+def test_item_update_desc(setting):
+    """Сессия 40, п.2: свойства, раскрытые после выдачи предмета, закрепляются item_update
+    (раньше такой директивы не было — карточка предмета оставалась без описания)."""
+    apply_directives(setting, {"add_item": [{"name": "Кристалл", "qty": 1}]})
+    it = setting["player"]["inventory"][0]
+    assert not it.get("desc")
+    msgs = apply_directives(setting, {"item_update": {"name": "Кристалл",
+                                                     "desc": "чистая энергия Порядка"}})
+    it = setting["player"]["inventory"][0]
+    assert it["desc"] == "чистая энергия Порядка"
+    assert any("Кристалл" in m for m in msgs), msgs
+    # дописывается, а не затирается; дубликат не плодится
+    apply_directives(setting, {"item_update": {"name": "Кристалл", "desc": "клеймо Ковена внутри"}})
+    assert "чистая энергия Порядка" in it["desc"] and "клеймо" in it["desc"]
+    n = len(it["desc"])
+    apply_directives(setting, {"item_update": {"name": "Кристалл", "desc": "клеймо Ковена внутри"}})
+    assert len(it["desc"]) == n, "повтор того же текста не дублирует описание"
+    # нет предмета — внятный отказ, а не тихий пропуск
+    msgs = apply_directives(setting, {"item_update": {"name": "Несть", "desc": "х"}})
+    assert any("Нет предмета" in m for m in msgs), msgs
+
+
+def test_item_update_normalization(setting):
+    """item_update переживает кривые формы LLM: список, `item` вместо `name`, мусор."""
+    apply_directives(setting, {"add_item": [{"name": "Амулет", "qty": 1}]})
+    d = normalize_directives({"item_update": [{"item": "Амулет", "desc": "греет"}, "строка", 7]})
+    assert len(d["item_update"]) == 1 and d["item_update"][0]["name"] == "Амулет", d
+    apply_directives(setting, d)
+    assert setting["player"]["inventory"][0]["desc"] == "греет"
+    assert normalize_directives({"item_update": "мусор"}) == {}
+
+
 # ── apply_directives: игрок ───────────────────────────────────────
 
 def test_player_gold_and_hp(setting):

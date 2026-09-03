@@ -231,7 +231,7 @@
       }
     ],
     "flags": {
-      "known_heretic": true
+      "known_heretic": { "value": true, "title": "Тебя знают как еретика" }
     }
   },
   "story": {

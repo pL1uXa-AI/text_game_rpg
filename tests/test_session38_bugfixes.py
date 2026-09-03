@@ -880,3 +880,63 @@ def test_prompt_rules_numbering(fake_config):
             # строку по номеру — дубль заголовка вернул бы вырезанное правило обратно)
             assert p.count("ФРАКЦИИ → ПУТЬ ИГРОКА") == 1, \
                 "маркер правила 26 продублирован в другом правиле"
+
+
+# ══════════ сессия 40, п.3: вступление не должно быть обрывком ══════════
+def test_ends_sentence_russian_quotes():
+    """Закрывающая кавычка «…» концом мысли не является: именно из-за этого обрывок
+    вступления («…в свободной колонии «Осколок Рассвета») проходил как законченный."""
+    from backend.character_generator import _ends_sentence
+    assert _ends_sentence('Так кончается фраза.')
+    assert _ends_sentence('Что ты делаешь?')
+    assert _ends_sentence('Он ушёл…')
+    assert _ends_sentence('Сказал: «да».')
+    assert not _ends_sentence('Ты родился в колонии «Осколок Рассвета»')
+    assert not _ends_sentence('оборвано без знака')
+    assert not _ends_sentence("")
+
+
+def test_opening_retries_truncated_text(monkeypatch):
+    """generate_opening: обрывок (нет конца фразы) → повтор генерации, а не тихий вывод
+    в чат; вторая, законченная попытка и уходит игроку."""
+    import asyncio
+    from backend import character_generator as cg
+
+    seen = {"n": 0}
+
+    async def _fake(messages, **kw):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return "Ты — Кайден. Ты родился в колонии «Осколок Рассвета»"   # обрыв
+        return "Ты — Кайден. Вот сцена целиком. Что ты делаешь?"
+
+    monkeypatch.setattr(cg.llm, "complete", _fake)
+    theme = narrator_mod.THEMES[0]
+    st = narrator_mod.default_setting(theme, "normal")
+    w = {"id": 1, "name": "t", "language": "ru", "genre": theme["genre"],
+         "theme": theme["id"], "custom_hook": ""}
+    out = asyncio.run(cg.generate_opening(w, st))
+    assert seen["n"] == 2, "обрывок обязан был вызвать повтор"
+    assert out == "Ты — Кайден. Вот сцена целиком. Что ты делаешь?"
+
+
+def test_opening_never_returns_fragment(monkeypatch):
+    """Все попытки оборваны — игрок получает или последнее ПОЛНОЕ предложение, или
+    завязку сюжета; оборванный хвост в чат не уходит ни в одном из вариантов."""
+    import asyncio
+    from backend import character_generator as cg
+    from backend.character_generator import _ends_sentence
+
+    long_cut = ("Первое предложение сцены целиком. " * 6) + "а вот вторая мысль обрывается посередине"
+
+    async def _fake(messages, **kw):
+        return long_cut
+
+    monkeypatch.setattr(cg.llm, "complete", _fake)
+    theme = narrator_mod.THEMES[0]
+    st = narrator_mod.default_setting(theme, "normal")
+    w = {"id": 1, "name": "t", "language": "ru", "genre": theme["genre"],
+         "theme": theme["id"], "custom_hook": ""}
+    out = asyncio.run(cg.generate_opening(w, st))
+    assert _ends_sentence(out), f"в чат ушёл оборванный текст: {out!r}"
+    assert "обрывается посередине" not in out

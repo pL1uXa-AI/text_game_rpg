@@ -22,6 +22,7 @@ import json
 from typing import Any, Optional
 
 from . import db
+from .mechanics import is_player_npc
 
 LOCATION_KIND = "location"
 FACTION_KIND = "faction"
@@ -178,6 +179,9 @@ def build_graph(setting: dict) -> tuple[list[dict], list[tuple]]:
     # 3) живые NPC
     for nid, n in npcs.items():
         if not isinstance(n, dict) or n.get("alive") is False:
+            continue
+        # Сессия 40, п.13: игрок — не персонаж окружения, на карте он не «NPC рядом»
+        if is_player_npc(nid, n):
             continue
         key = entity_node_id(NPC_KIND, nid)
         if not key:

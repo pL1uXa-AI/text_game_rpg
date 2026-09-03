@@ -17,6 +17,7 @@ normalize_directives / tick_effects / check_profession_advance, чтобы ро�
 from __future__ import annotations
 
 import json
+import difflib
 import logging
 
 import re
@@ -318,6 +319,14 @@ def _safe_int(v, default=0):
         return default
 
 
+def _safe_float(v, default=0.0):
+    """Безопасный float(): то же, что `_safe_int`, для дробных величин (вес/цена)."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 # ══════════════════════════════════════════════════════════════
 # Динамическая сложность (сессия 24): сила врагов и частота событий
 # подстраиваются под уровень игрока.
@@ -416,6 +425,48 @@ def _bump(p: dict, key: str, delta: int = 1) -> None:
     """Приращивает счётчик статистики пути игрока (убийства/квесты/локации)."""
     prog = p.setdefault("progress", {})
     prog[key] = prog.get(key, 0) + max(0, delta)
+
+
+# Сессия 40, п.11 (мир «Новый мир»): машинные ярлыки статистики пути.
+# Движок сам ведёт счётчики `moves`/`kills`/`quests_done`/`discoveries`
+# (`_bump`), но игрок видел их дословно: «Moves 1 · Discoveries 1» в карточке и
+# «Пройдено: moves 1» в /stats — системное имя вместо игрового (тот же класс дефекта,
+# что п.9 про карточки). Лечится только отображением (закон 2): переименовываем то,
+# что уже умеем считать; новые ключи (progress_add) остаются как есть — их придумал
+# мастер и на языке мира, перефразировать чужое имя право не имеем (закон 3).
+PROGRESS_LABELS = {
+    "kills": "Побед",
+    "quests_done": "Квестов выполнено",
+    "moves": "Переходов",
+    "discoveries": "Открыто локаций",
+}
+
+
+def progress_label(key: Any) -> str:
+    """Человекочитаемый ярлык счётчика пути (машинный id движка → игровое слово)."""
+    k = str(key or "").strip()
+    if k in PROGRESS_LABELS:
+        return PROGRESS_LABELS[k]
+    return k or "?"
+
+
+# ── Игрок — не NPC (сессия 40, п.13) ─────────────────────────────────
+# Симптом мира №103: в разделе NPC стоял «player = Игрок», и его же биография
+# («Проглотил кристалл…») текла в промпт рассказчику как карточка персонажа, а
+# модели приходилось описывать саму себя со стороны. Состояние игрока живёт в
+# `setting.player`; раздел NPC — про окружающих. Код НЕ выдумывает и не решает
+# за мастера (закон 3): он только не даёт заводитого персонажа смешивать с
+# игроком, и честно сообщает об этом системкой.
+NPC_SELF_KEYS = frozenset({"player", "pc", "protagonist", "hero", "герой", "игрок"})
+NPC_SELF_NAMES = frozenset({"player", "pc", "protagonist", "игрок", "герой"})
+
+
+def is_player_npc(npc_id: Any, npc: Any = None) -> bool:
+    """Этот «персонаж» — сам игрок? По ключу (`player`) или по имени («Игрок»)."""
+    if str(npc_id or "").strip().lower() in NPC_SELF_KEYS:
+        return True
+    name = (npc if isinstance(npc, dict) else {}).get("name") if npc is not None else None
+    return str(name or "").strip().lower() in NPC_SELF_NAMES
 
 
 def _norm_item(item: Any) -> dict:
@@ -623,9 +674,155 @@ def normalize_directives(d) -> dict:
     return _normalize_directives(d)
 
 
+def _ticks_from_desc(desc: str) -> tuple[int, int, int, int]:
+    """Само-исцеление (сессия 40, п.1): если периодическая убыль/лечение описаны только
+    текстом («−30 HP, −20 MP за ход»), а числовых каналов нет — читаем их из desc.
+    Срабатывает ТОЛЬКО при явной фразе «за ход»/«каждый ход»/«/ход» и только на нулевых
+    каналах: явные числа рассказчика не перетираются (закон 3 — код ничего не решает).
+    Возвращает (hp_damage, hp_heal, mp_damage, mp_heal)."""
+    d = str(desc or "")
+    if not d or not re.search(r"(за\s+ход|/\s*ход|каждый\s+ход)", d, re.I):
+        return 0, 0, 0, 0
+    hp_d = hp_h = mp_d = mp_h = 0
+    for m in re.finditer(r"([-−+]?\s*\d+)\s*(HP|MP|МР)\b", d, re.I):
+        try:
+            n = abs(int(re.sub(r"\D", "", m.group(1)) or 0))
+        except ValueError:
+            continue
+        loss = "-" in m.group(1) or "\u2212" in m.group(1)
+        if m.group(2).upper() == "HP":
+            if loss:
+                hp_d += n
+            else:
+                hp_h += n
+        elif loss:
+            mp_d += n
+        else:
+            mp_h += n
+    return hp_d, hp_h, mp_d, mp_h
+
+
+def desc_compact(desc: str, limit: int | None = None) -> str:
+    """Нормализует (и при желании ужимает) описание для промпта с СОХРАНЕНИЕМ ХВОСТА.
+
+    `limit=None` (по умолчанию) — текст отдаётся ЦЕЛИКОМ, сжатие выключено: срок/условие
+    снятия эффекта должны доходить до мастера полностью (сессия 40, п.7 — раньше
+    `format_state` резал `desc` жёстко `[:70]`, и вторая половина фразы «…Требуется ещё
+    1-2 сессии медитации для полного закрепления» терялась, из-за чего рассказчик
+    перекладывал эффект бессрочным, не видя причины).
+    Если `limit` задан явно — режем по предложениям: последнее остаётся ЦЕЛИКОМ
+    (условие снятия почти всегда в конце), а начало ужимается под остаток бюджета
+    (итог ≤ limit+1)."""
+    d = re.sub(r"\s+", " ", str(desc or "")).strip()
+    if limit is None or len(d) <= limit:
+        return d
+    sents = [s.strip() for s in re.split(r"(?<=[.!?…])\s+", d) if s.strip()]
+    if len(sents) > 1:
+        last = sents[-1]
+        if len(last) > limit - 1:               # одно «предложение» на весь лимит
+            sents = []
+        else:
+            budget = limit - len(last) - 1
+            prefix = ""
+            for s in sents[:-1]:
+                if len(prefix) + len(s) + 1 > budget:
+                    break
+                prefix = f"{prefix} {s}".strip()
+            if len(prefix) < budget * 2 // 3:   # целых предложений не влезло — добираем знакоместо
+                prefix = " ".join(sents[:-1])[:budget].rstrip()
+            if prefix:
+                return f"{prefix}…{last}"[:limit + 1]
+    keep_head = limit * 2 // 3
+    keep_tail = limit - keep_head
+    return d[:keep_head].rstrip() + "…" + d[-keep_tail:]
+
+
+def _effect_tokens(name: str) -> list[str]:
+    """Значимые «корни» имени эффекта: слова от 4 букв, усечённые до 5 (Стабилизация →
+    стаби, родового → родов). Суффиксы русской морфемики за 5 символами обычно ещё
+    различимы, а окончания («-а/-ого/-у») — как раз то, что расходится у одного и того же
+    состояния, названного моделью два раза по-разному."""
+    return [w[:5] for w in re.findall(r"[а-яa-zё]+", str(name or "").lower()) if len(w) >= 4]
+
+
+def _same_effect_name(a: str, b: str) -> bool:
+    """Одно ли это состояние названо двумя именами (сессия 40, п.8).
+
+    Симптом мира №103: «Стабилизация фрактала», «Стабилизация родового канала» и
+    «Стабилизация узора» — три хода одного и того же процесса, заведённые ОТДЕЛЬНЫМИ
+    ключами словаря эффектов, поэтому каждое «обновление» выглядело новым эффектом,
+    а старые висели бессрочно.
+
+    Это ТОЛЬКО сигнал (закон 2): разрешать ли спор — решает мастер (закон 3), движок
+    не сливает и не переименоывает эффекты сам. Порог намеренно узкий: общее первое
+    слово-заголовок (головное существительное русского названия) плюс похожая форма
+    имени. «Ярость берсерка»/«Покой берсерка», «Ледяная броня»/«Ледяной щит» — разные
+    заголовки/разная форма, они не склеиваются. Отличить «одно состояние под новым
+    именем» от «двух разных состояний с похожим именем» («Резонанс Порядка»/«Резонанс
+    Хаоса») по одной строке НЕЛЬЗЯ — поэтому подсказка формулируется как вопрос.
+    """
+    wa, wb = _effect_tokens(a), _effect_tokens(b)
+    if not wa or not wb:
+        return False
+    similar = difflib.SequenceMatcher(None, str(a).lower(), str(b).lower()).ratio()
+    if wa[0] != wb[0]:
+        # заголовок разный — это другое состояние (или почти одно и то же имя целиком)
+        return similar >= 0.9
+    return similar >= 0.6
+
+
+def find_similar_effect(p: dict, name: str) -> list[str]:
+    """Имена уже висящих эффектов, похожие на `name` (для системки-подсказки)."""
+    out: list[str] = []
+    for existing in (p.get("effects") or {}):
+        ex = str(existing)
+        if ex != str(name) and _same_effect_name(ex, name):
+            out.append(ex)
+    return out
+
+
+def effect_needs_turns(ef: dict) -> bool:
+    """Эффект бессрочен (turns -1/нет), но в его описании есть срок/условие снятия.
+    Такой противоречивый эффект никогда не спадёт сам (сессия 40, п.7). Проверка —
+    не решение: снять или задать turns может только мастер (закон 3)."""
+    if not isinstance(ef, dict):
+        return False
+    return ef.get("turns", -1) in (-1, None) and _duration_hint(str(ef.get("desc") or ""))
+
+
+def _duration_hint(desc: str) -> bool:
+    """Похоже ли описание эффекта на НЕбессрочный: срок/отсчётка/условие снятия
+    (сессия 40, п.7: «Стабилизация родового канала — требуется ещё 1-2 сессии
+    медитации» висела вечно, потому что рассказчик написал срок только в desc,
+    а turns не задал → эффект стал бессрочным).
+    Ничего НЕ решает: только замечает противоречие, чтобы движок показал его
+    мастеру в системке (закон 2: проверка и отображение, закон 3: решает мастер)."""
+    d = str(desc or "")
+    if not d:
+        return False
+    return bool(re.search(
+        r"(ещ[её]\s*\d|ещ[её]\s+\d+[-–]?\d*\s*(ход|сесс|сек|минут|час|дн|нед|шаг|медитац|ритуал|процедур|практик)"
+        r"|\d+\s*[-–]\s*\d+\s*(ход|сесс|сек|минут|час|дн|нед|шаг|медитац|ритуал|процедур|практик)"
+        r"|через\s+\d+\s*(ход|сесс|сек|минут|час|дн|нед|шаг)|после\s+\d+\s*(хода|ходу|сесс|сек|минут|час|дн|нед|шаг)"
+        r"|для\s+(заверш|закреп|оконч|снятия|закрытия|успоко|стабилиз)|требуется\s+ещ[её]|когда\s+(заверш|закреп|выполн|оконч))",
+        d, re.I))
+
+
+# Порядок частей суток для авто-часов (`tick_time`). Совпадает с ключами
+# `ENV_TIME_RULES`/расписаний NPC, чтобы смена часа не ломала «кого искать где».
+TIME_CYCLE = ["утро", "день", "вечер", "ночь"]
+
+
 def tick_effects(setting: dict) -> list[str]:
-    """Начало хода: применяет периодические эффекты (урон/лечение ×стаки), уменьшает
-    длительность и убирает истёкшие. Возвращает системные сообщения."""
+    """Начало хода: применяет периодические эффекты (урон/лечение HP и MP ×стаки),
+    уменьшает длительность и убирает истёкшие. Возвращает системные сообщения.
+
+    Сессия 40 (п.1 мира «Новый мир»): у эффекта был только канал HP (`damage`/`heal`),
+    поэтому «Кристальная лихорадка: −30 HP, −20 MP за ход» выжигала понемногу HP, а MP
+    не трогала вовсе — модель честно писала убыль в `desc`, но движку там брать было
+    нечего. Добавлен второй ресурсный канал `mp_damage`/`mp_heal` (тот же «физический
+    движок», что и у HP): движок списывает/восстанавливает и сообщает — последствия и
+    сюжет по-прежнему на рассказчике (закон 3)."""
     msgs: list[str] = []
     p = setting.get("player", {})
     effects = p.get("effects") or {}
@@ -636,8 +833,23 @@ def tick_effects(setting: dict) -> list[str]:
         if not isinstance(ef, dict):
             effects.pop(name, None)
             continue
-        dmg = int(ef.get("damage", 0) or 0) * max(1, int(ef.get("stacks", 1) or 1))
-        heal = int(ef.get("heal", 0) or 0) * max(1, int(ef.get("stacks", 1) or 1))
+        stk = max(1, int(ef.get("stacks", 1) or 1))
+        # Мелкая само-исцеляющая правка: у эффектов, наложенных до появления MP-канала
+        # (и у тех, где модель оставила числа только в тексте), пустые каналы добираются
+        # из desc — только нули, явные числа рассказчика не перетираются.
+        hp_d0, hp_h0, mp_d0, mp_h0 = _ticks_from_desc(ef.get("desc", ""))
+        if not int(ef.get("damage", 0) or 0) and hp_d0:
+            ef["damage"] = hp_d0
+        if not int(ef.get("heal", 0) or 0) and hp_h0:
+            ef["heal"] = hp_h0
+        if not int(ef.get("mp_damage", 0) or 0) and mp_d0:
+            ef["mp_damage"] = mp_d0
+        if not int(ef.get("mp_heal", 0) or 0) and mp_h0:
+            ef["mp_heal"] = mp_h0
+        dmg = int(ef.get("damage", 0) or 0) * stk
+        heal = int(ef.get("heal", 0) or 0) * stk
+        mp_dmg = int(ef.get("mp_damage", 0) or 0) * stk
+        mp_heal = int(ef.get("mp_heal", 0) or 0) * stk
         if dmg:
             hp0 = max(0, p.get("hp", 0) - dmg)
             p["hp"] = hp0
@@ -646,13 +858,74 @@ def tick_effects(setting: dict) -> list[str]:
             hp1 = min(p.get("max_hp", 100), p.get("hp", 0) + heal)
             p["hp"] = hp1
             msgs.append(f"⏳ Эффект «{name}»: +{heal} HP → {hp1}/{p.get('max_hp', 0)}")
+        if mp_dmg:
+            mx_mp = int(p.get("max_mp", 0) or 0)
+            mp0 = max(0, int(p.get("mp", 0) or 0) - mp_dmg)
+            mp0 = min(mp0, mx_mp) if mx_mp else mp0
+            p["mp"] = mp0
+            msgs.append(f"⏳ Эффект «{name}»: −{mp_dmg} MP → {mp0}/{mx_mp}")
+        if mp_heal:
+            mx_mp = int(p.get("max_mp", 0) or 0)
+            mp1 = int(p.get("mp", 0) or 0) + mp_heal
+            mp1 = min(mp1, mx_mp) if mx_mp else mp1
+            p["mp"] = mp1
+            msgs.append(f"⏳ Эффект «{name}»: +{mp_heal} MP → {mp1}/{mx_mp}")
+        timed: list[str] = []
         if "turns" in ef and ef.get("turns") not in (-1, None):
             ef["turns"] = max(0, int(ef["turns"]) - 1)
             if ef["turns"] <= 0:
                 expired.append(name)
+            else:
+                timed.append(f"«{name}» осталось {ef['turns']}")
+        if timed:
+            # п.15 (сессия 40): обратный отсчёт временного эффекта раньше был НЕВИДИМ —
+            # системка выходила только при уроне/лечении, и «эффект не сработал» было
+            # неотличимо от «эффект тикает, но молча». Теперь тик показан всегда (закон 2:
+            # только показ; длительность по-прежнему считает и снимает движок).
+            msgs.append("⏳ " + "; ".join(timed[:6]) + " ходов")
     for name in expired:
         effects.pop(name, None)
         msgs.append(f"⌛ Эффект «{name}» закончился.")
+    return msgs
+
+
+def tick_time(setting: dict, every: int = 4) -> list[str]:
+    """Начало хода: часы мира идут сами. Движок двигает ТОЛЬКО время суток по циклу
+    утро → день → вечер → ночь (календарь, а не сюжет) и сообщает о смене — ровно так же,
+    как уже тикает длительность эффектов, потребности и таймеры мира. Что означает эта
+    смена (закрытая таверна, патрули, холода, ночные твари) — решает рассказчик
+    (закон 3); он же может сбить стрелки директивой `time` в любую секунду.
+
+    Погоду функция НЕ трогает: «рассеял туман»/«пошёл дождь» — творческое решение мастера
+    (по нему format_state даёт ⚠-подсказку, если среда залипла — см. п.14).
+
+    `every` — сколько ходов игрока на одну часть суток (4 — сутки ≈ 16 ходов).
+    Впервые вызванный на мире без счётчика `_player_turns` (свежий/старый мир) — молчит:
+    пока нет сыгранных ходов, двигать нечего.
+    """
+    msgs: list[str] = []
+    try:
+        step = int(every)
+    except (TypeError, ValueError):
+        step = 4
+    if step < 1:
+        return msgs
+    cycle = TIME_CYCLE
+    cur = str(setting.get("time") or "").strip().lower()
+    if cur not in cycle:
+        return msgs                     # своё, авторское время — не лезем в календарь
+    turns = _safe_int(setting.get("_player_turns"), 0)
+    anchor = _safe_int(setting.get("_time_anchor_turn"), -1)
+    if anchor < 0:                       # первый ход с часами — заводим якорь, не двигаем
+        setting["_time_anchor_turn"] = turns
+        return msgs
+    if turns - anchor < step:
+        return msgs
+    nxt = cycle[(cycle.index(cur) + 1) % len(cycle)]
+    setting["time"] = nxt
+    setting["_time_anchor_turn"] = turns
+    setting["_time_last_turn"] = turns
+    msgs.append(f"🕐 Часы мира: {cur} → {nxt}")
     return msgs
 
 
@@ -886,11 +1159,15 @@ def apply_location_effects(setting: dict, loc_id: str, apply: bool = True) -> li
         if apply:
             new_ef = {
                 "turns": -1,  # постоянно, пока игрок в зоне
-                "damage": int(fx.get("damage", 0) or 0),
-                "heal": int(fx.get("heal", 0) or 0),
+                "damage": max(0, _safe_int(fx.get("damage")), 0),
+                "heal": max(0, _safe_int(fx.get("heal")), 0),
+                "mp_damage": max(0, _safe_int(fx.get("mp_damage")), 0),
+                "mp_heal": max(0, _safe_int(fx.get("mp_heal")), 0),
                 "kind": str(fx.get("kind", "зона"))[:30],
                 "stacks": max(1, int(fx.get("stacks", 1) or 1)),
-                "desc": str(fx.get("desc", ""))[:200],
+                # П.7 (сессия 40): 500 вместо 200 — как у effect_add: зональный эффект тоже
+                # может нести срок/условие в конце описания, обрезать его = терять смысл
+                "desc": str(fx.get("desc", ""))[:500],
                 "tag": "zone",
             }
             mods = fx.get("mods")
@@ -1104,7 +1381,14 @@ class PlayerHandler(DirectiveHandler):
                         p["hp"] = max(0, min(p.get("max_hp", 100), p.get("hp", 0) + v))
                         msgs.append(f"Здоровье: {p['hp']}/{p['max_hp']}" + (f" (−{abs(v)})" if v < 0 else f" (+{v})"))
                     elif k == "mp":
-                        p["mp"] = max(0, min(p.get("max_mp", 50), p.get("mp", 0) + v))
+                        m0 = p.get("mp", 0)
+                        p["mp"] = max(0, min(p.get("max_mp", 50), m0 + v))
+                        # Сессия 40, п.1: раньше MP менялась МОЛЧА (у hp/gold/xp сообщение
+                        # есть, у mp — нет), поэтому «кристальная лихорадка выкачивает MP,
+                        # а HP не трогает» выглядела как поломанный тик эффектов.
+                        if v and p["mp"] != m0:
+                            msgs.append(f"Энергия: {p['mp']}/{p.get('max_mp', 0)}"
+                                        + (f" (−{abs(v)})" if v < 0 else f" (+{v})"))
                     elif k == "gold":
                         p["gold"] = max(0, p.get("gold", 0) + v)
                         msgs.append(f"Золото: {p['gold']}" + (f" (+{v})" if v >= 0 else f" (−{abs(v)})"))
@@ -1370,11 +1654,16 @@ class EffectHandler(DirectiveHandler):
                 turns = _safe_int(_turns_raw, -1)
                 new_ef = {
                     "turns": turns,
-                    "damage": int(ea.get("damage", 0) or 0),
-                    "heal": int(ea.get("heal", 0) or 0),
+                    "damage": max(0, _safe_int(ea.get("damage"), 0)),
+                    "heal": max(0, _safe_int(ea.get("heal"), 0)),
+                    # энергия (MP) — второй тикающий ресурс (сессия 40, п.1)
+                    "mp_damage": max(0, _safe_int(ea.get("mp_damage", ea.get("mp_cost_per_turn")), 0)),
+                    "mp_heal": max(0, _safe_int(ea.get("mp_heal", ea.get("mp_restore")), 0)),
                     "kind": str(ea.get("kind", "особый"))[:30],
                     "stacks": max(1, int(ea.get("stacks", 1) or 1)),
-                    "desc": str(ea.get("desc", ""))[:200],
+                    # П.7 (сессия 40): 500 вместо 200 — описание эффекта доходит до мастера
+                    # целиком; при жёстком обрезе теряется как раз хвост со сроком/условием
+                    "desc": str(ea.get("desc", ""))[:500],
                 }
                 if ea.get("tag"):
                     new_ef["tag"] = str(ea["tag"])[:30]
@@ -1382,6 +1671,9 @@ class EffectHandler(DirectiveHandler):
                 if isinstance(mods, dict) and mods:
                     new_ef["mods"] = mods
                 cur = p["effects"].get(name)
+                # п.8: то же состояние под новым именем (сессия 40) — сигнал мастеру,
+                # а не слияние: какое это состояние и что с ним делать, решает он.
+                similar = [] if cur else find_similar_effect(p, name)
                 if cur:
                     if turns != -1 and cur.get("turns", -1) != -1:
                         cur["turns"] = max(cur["turns"], turns)
@@ -1399,8 +1691,41 @@ class EffectHandler(DirectiveHandler):
                     # id-подобное имя (chill_resonance) — показываем читабельно
                     label = (label.replace("_", " ").strip().title() or label)[:60]
                 desc = str(ef_final.get("desc") or "").strip()
-                extra = f" — {desc[:150]}" if desc else ""
+                # П.7: системка при наложении показывает desc ЦЕЛИКОМ (было [:150])
+                extra = f" — {desc}" if desc else ""
+                # тикающие каналы показываем в самой системке: иначе «−20 MP за ход»
+                # живёт только в тексте desc и выглядит как необязательное обещание
+                _hp_d = int(ef_final.get("damage", 0) or 0) * int(ef_final.get("stacks", 1) or 1)
+                _hp_h = int(ef_final.get("heal", 0) or 0) * int(ef_final.get("stacks", 1) or 1)
+                _mp_d = int(ef_final.get("mp_damage", 0) or 0) * int(ef_final.get("stacks", 1) or 1)
+                _mp_h = int(ef_final.get("mp_heal", 0) or 0) * int(ef_final.get("stacks", 1) or 1)
+                _ticks = []
+                if _hp_d:
+                    _ticks.append(f"−{_hp_d} HP/ход")
+                if _hp_h:
+                    _ticks.append(f"+{_hp_h} HP/ход")
+                if _mp_d:
+                    _ticks.append(f"−{_mp_d} MP/ход")
+                if _mp_h:
+                    _ticks.append(f"+{_mp_h} MP/ход")
+                if _ticks:
+                    extra += ("; " if extra else " — ") + ", ".join(_ticks)
                 msgs.append(f"✨ Эффект «{label}» ({ef_final.get('kind','особый')}, {dur}){extra}{' обновлён' if cur else ' наложен'}.")
+                if similar:
+                    _s = "/".join(f"«{x}»" for x in similar[:3])
+                    msgs.append(f"⚠ Имя «{label}» близко к уже висящему {_s}. Если это то же "
+                                f"состояние — не держи дубль: обнови прежний эффект его именем "
+                                f"(effect_add name={similar[0]!r}) либо сними старое effect_remove; "
+                                f"если состояние другое — так и назови его иначе.")
+                # П.7 (сессия 40): срок в описании + бессрочный эффект = противоречие,
+                # которое иначе живёт только в голове рассказчика и висит вечно. Код не
+                # ставит turns сам (закон 3) — он ПОКАЗЫВАЕТ мастеру несоответствие, и
+                # тот в следующем ходе чинит его: effect_add с turns (перезапишет срок)
+                # или effect_remove, когда условие выполнено.
+                if effect_needs_turns(ef_final):
+                    msgs.append(f"⚠ Эффект «{label}» бессрочен (turns не задан), но в описании "
+                                f"есть срок/условие. Сам он не спадёт: повтори effect_add с "
+                                f"turns=N или сними через effect_remove, когда условие выполнено.")
         if "effect_remove" in d:
             er = d["effect_remove"]
             er_name = er.get("name") if isinstance(er, dict) else er
@@ -1413,8 +1738,8 @@ class EffectHandler(DirectiveHandler):
 
 
 class ItemHandler(DirectiveHandler):
-    """Инвентарь: добавление / удаление предметов."""
-    keys = frozenset({"add_item", "remove_item"})
+    """Инвентарь: добавление / удаление / правка предметов."""
+    keys = frozenset({"add_item", "remove_item", "item_update"})
 
     def apply(self, setting: dict, d: dict) -> list[str]:
         msgs: list[str] = []
@@ -1436,6 +1761,56 @@ class ItemHandler(DirectiveHandler):
                     found["qty"] = max(0, found.get("qty", 1) - ri["qty"])
                     if found["qty"] == 0:
                         p["inventory"].remove(found)
+        # ── item_update: дописать то, что рассказчик узнал о ПРЕДМЕТЕ ПОЗЖЕ выдачи ──
+        # (сессия 40, п.2: «изучить кристалл подробнее» дало красивый текст в нарратив,
+        #  но закрепить свойства в инвентаре/карточке было нечем — описания у предмета
+        #  так и не появилось). Код не решает ЗА мастера: он правит ровно те поля,
+        #  которые названы, и лишь по уже существующему в инвентаре предмету.
+        if "item_update" in d:
+            for up in d["item_update"]:
+                if not isinstance(up, dict):
+                    continue
+                nm = str(up.get("name") or "").strip()
+                if not nm:
+                    continue
+                found = next((x for x in p["inventory"] if str(x.get("name")) == nm), None)
+                if found is None:
+                    msgs.append(f"⚠ Нет предмета «{nm}» в инвентаре — item_update пропущено")
+                    continue
+                changed: list[str] = []
+                desc = str(up.get("desc") or "").strip()
+                if desc:
+                    old = str(found.get("desc") or "").strip()
+                    # не теряем прежнее описание: дописываем новое, если оно не дубликат
+                    if not old:
+                        found["desc"] = desc[:600]
+                        changed.append("описание")
+                    elif desc[:60] not in old:
+                        found["desc"] = (old + "\n" + desc)[:600]
+                        changed.append("описание")
+                new_name = str(up.get("new_name") or "").strip()
+                if new_name and new_name != nm:
+                    found["name"] = new_name[:120]
+                    changed.append(f"имя → {found['name']}")
+                for key, label in (("weight", "вес"), ("value", "цена")):
+                    if up.get(key) is not None and str(up.get(key)).strip() != "":
+                        num = _safe_float(up.get(key), None)
+                        if num is not None:
+                            found[key] = num
+                            changed.append(f"{label} {num}")
+                if up.get("qty") is not None:
+                    q = _safe_int(up.get("qty"), 0)
+                    if q > 0:
+                        found["qty"] = q
+                        changed.append(f"кол-во {q}")
+                note = str(up.get("note") or "").strip()
+                if note:
+                    notes = found.setdefault("notes", [])
+                    if isinstance(notes, list) and note[:200] not in notes:
+                        notes.append(note[:200])
+                        changed.append("заметка")
+                if changed:
+                    msgs.append(f"📖 Изучено: {found['name']} — {', '.join(changed)}")
         return msgs
 
 
@@ -2029,8 +2404,17 @@ class NpcHandler(DirectiveHandler):
 
     def apply(self, setting: dict, d: dict) -> list[str]:
         msgs: list[str] = []
-        if "npc_set" in d and isinstance(d["npc_set"], dict) and (d["npc_set"].get("id") or "").strip():
-            ns = d["npc_set"]
+        ns = d.get("npc_set") if isinstance(d.get("npc_set"), dict) else None
+        if ns and str(ns.get("id") or "").strip():
+            # Сессия 40, п.13: игрок — не персонаж окружения. Модель иногда заводит
+            # npc_set {id:"player"} (в мире №103 так появился «Игрок» в разделе NPC).
+            # Состояние игрока живёт в setting.player; здесь — отказ с объяснением,
+            # чтобы рассказчик получил обратную связь и не повторял (закон 3).
+            if is_player_npc(ns.get("id"), ns):
+                msgs.append("⚠ Игрок — не NPC: его состояние ведётся через player/stats/"
+                            "effects, не через npc_set.")
+                ns = None
+        if ns and str(ns.get("id") or "").strip():
             existing = setting["npc"].get(ns["id"])
             # ВАЖНО (сессия 37): прежние notes снимаем ДО bulk-update — ниже `existing.update(...)`
             # перезаписал бы их целиком, и «слияние» под notes читало бы уже НОВЫЕ заметки
@@ -2043,6 +2427,10 @@ class NpcHandler(DirectiveHandler):
                                             "mood": ns.get("mood", ""),
                                             "alive": ns.get("alive", True),
                                             "desc": ns.get("desc", ""),
+                                            # п.13: где персонаж стоит (ключ локации) — без
+                                            # этого «рядом» нельзя показать ни где он, ни
+                                            # что он далеко (у модели были только hints)
+                                            "location": str(ns.get("location") or "")[:60],
                                             "faction": ns.get("faction", "")}
             # деньги-у-НПЦ: у персонажа может быть свой кошелёк (bounty/жалованье/долг)
             _npc = setting["npc"][ns["id"]]
@@ -2076,6 +2464,10 @@ class NpcHandler(DirectiveHandler):
         if "npc_kill" in d:
             nid = d["npc_kill"]
             nid = nid if isinstance(nid, str) else nid.get("id")
+            if is_player_npc(nid, setting["npc"].get(nid)):
+                # то же и для убийства: «убить игрока» — это game_over, а не npc_kill
+                msgs.append("⚠ Игрок — не NPC: смерть героя ведётся через game_over, не npc_kill.")
+                return msgs
             if nid in setting["npc"]:
                 _npc = setting["npc"][nid]
                 _npc["alive"] = False
@@ -2212,11 +2604,30 @@ class WorldHandler(DirectiveHandler):
     def apply(self, setting: dict, d: dict) -> list[str]:
         if "flag" in d and isinstance(d["flag"], dict) and str(d["flag"].get("name", "")).strip():
             f = d["flag"]
-            setting["flags"][str(f["name"]).strip()] = f.get("value", True)
-        if "time" in d:
-            setting["time"] = str(d["time"])
-        if "weather" in d:
-            setting["weather"] = str(d["weather"])
+            key = str(f["name"]).strip()
+            setting["flags"][key] = f.get("value", True)
+            # п.12 (сессия 40): у флага может быть человекочитаемое название — оно идёт в
+            # словарь `setting["flag_titles"]` (там же, где и `station:`-флаги), а наружу
+            # — обычная системка. Названия НЕ храним в значении флага: значения читают
+            # `location_stations` (булева станция), дневник и судья («флаг = факт»).
+            title = str(f.get("title") or "").strip()[:120]
+            if title:
+                ft = setting.setdefault("flag_titles", {})
+                if isinstance(ft, dict) and ft.get(key) != title:
+                    ft[key] = title
+        if "time" in d or "weather" in d:
+            # п.14/п.14b (сессия 40): запоминаем ход, когда среда ДВИГАЛАСЬ в последний раз
+            # — отдельно погоду и время суток (вечер/ночь залипают так же верно, как туман).
+            # Счётчик нужен не «запретить туман», а показать мастеру в формате состояния,
+            # что часы в мире не идут (закон 3: менять или нет — решает рассказчик).
+            now = _safe_int(setting.get("_player_turns"), 0)
+            setting["_env_last_turn"] = now
+            if "time" in d:
+                setting["_time_last_turn"] = now
+                setting["time"] = str(d["time"])
+            if "weather" in d:
+                setting["_weather_last_turn"] = now
+                setting["weather"] = str(d["weather"])
         if d.get("game_over"):
             setting["game_over"] = True
         return []

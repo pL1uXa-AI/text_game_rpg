@@ -27,10 +27,15 @@ from typing import Optional
 
 from . import bg, chroma_client, db, embeddings, llm
 from .config import est_tokens, get_config
+from .mechanics import is_player_npc
 
 from .logsetup import get_logger
 
 log = get_logger(__name__)
+
+# Ids векторов, которые само-исцеление п.13 вырезало из SQLite, но не могло убрать из
+# Chroma (на импорте активного цикла событий ещё нет). Чистятся в lifespan приложения.
+PENDING_VECTOR_KEYS: list[str] = []
 
 
 # ══════════════════════════════════════════════════════════════
@@ -242,6 +247,152 @@ async def summarize_and_compress(world_id: int, provider: dict | None = None) ->
 # Карточки сущностей (LLM-архивариус) + знания (детерминированно)
 # ═══════════════════════════════════════════════════════════
 
+# ── человекочитаемое имя карточки ≠ машинный id (сессия 40, п.9) ────────
+# Симптом мира №103: во вкладке «Карточки» появились `player` и `trail_to_outpost`
+# вместо «Игрок» и «Тропа к Форпосту» — фоновый архивариус вернул {kind, key} без
+# `name`, а код подставил ключ: `name = item.get("name") or key`. Машинный id
+# попадает и в контекст модели (compact_entity), так что дефект не только косметический.
+_MACHINE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_.\-]*$")
+
+
+def looks_machine_name(s: object) -> bool:
+    """Похоже ли имя на внутренний id (`trail_to_outpost`, `orin_shop`), а не на
+    название из мира. Критерий conservativный: только латиница/цифры/`_-.` без пробелов
+    — русские названия, «V-28» и «d20» под него НЕ попадают (они и есть человекочитаемые)."""
+    t = str(s or "").strip()
+    return bool(t) and bool(_MACHINE_KEY_RE.match(t))
+
+
+def card_name_from_setting(kind: str, key: str, setting: dict | None) -> str:
+    """Имя сущности из механического состояния мира (последний authoritative источник
+    человекочитаемого названия). '' = в состоянии такого ключа нет — пусть решает мастер.
+    Квест/локация/NPC/магазин/враг/спутник/рецепт живут в своих секциях `setting`."""
+    if not key or not isinstance(setting, dict):
+        return ""
+    sec = {"npc": "npc", "location": "locations", "quest": "quests", "shop": "shops",
+           "enemy": "enemies", "companion": "companions", "craft": "crafts",
+           "faction": "factions"}.get(kind)
+    if not sec:
+        return ""
+    blob = setting.get(sec)
+    if not isinstance(blob, dict):
+        return ""
+    # ключ может отличаться от id: ищем и по ключу словаря, и по полю id
+    v = blob.get(key)
+    if not isinstance(v, dict):
+        v = next((x for x in blob.values()
+                  if isinstance(x, dict) and str(x.get("id") or "") == str(key)), None)
+    if not isinstance(v, dict):
+        return ""
+    if kind == "quest":
+        return str(v.get("title") or "")[:120].strip()
+    return str(v.get("name") or "")[:120].strip()
+
+
+def _parse_setting(world: dict) -> dict:
+    """`setting` мира dict'ом ({} — не читается). В БД лежит строкой/JSON.
+    Только чтение (закон 2); решений не принимает."""
+    raw = (world or {}).get("setting") or "{}"
+    try:
+        st = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return {}
+    return st if isinstance(st, dict) else {}
+
+
+def resolve_card_name(kind: str, key: str, llm_name: str, prev_name: str,
+                      setting: dict | None) -> str:
+    """Как назвать карточку: живой человекочитаемый приоритет, машинный id — крайний.
+
+    Порядок: непустое имя от архивариуса → имя из состояния мира → прежнее имя карточки
+    → сам ключ. additionally: machine-имя НИКОГДА не затирает уже человекочитаемое
+    (поздний проход архивариуса без `name` не должен откатывать «Игрок» → `player`).
+    Решает по-прежнему мастер (закон 3): движок здесь только НЕ выдумывает название,
+    а берёт то, что мир уже знает (закон 2 — отображение).
+    """
+    cand = [llm_name, card_name_from_setting(kind, key, setting), prev_name]
+    human = [c for c in cand if c and not looks_machine_name(c)]
+    if human:
+        return human[0]
+    # все кандидаты — машинные: берём не-пустой (ключ состояния лучше, чем «player»)
+    for c in cand:
+        if c:
+            return c
+    return key
+
+
+def heal_player_as_npc(world_id: int, setting: dict) -> int:
+    """Убирает игрока из списка «персонажей окружения» (сессия 40, п.13).
+
+    В мире №103 рассказчик завёл `npc["player"]` (имя «Игрок»), а архивариус — карточку
+    `npc/player`: в «Состоянии» и в сайдбаре игрок стоял рядом с торговцем, а модель
+    описывала саму себя в треьем лице. Состояние игрока живёт в `setting.player` — там
+    оно и остаётся, удаляется только дубль-персонаж. Идемпотентно, без LLM (закон 2:
+    движок ничего не выдумывает, а раскладывает по своим местам то, что уже записал).
+
+    Возвращает число убраных записей (0 — данных чистые). Ключи удалённых карточек
+    складываются в `PENDING_VECTOR_KEYS`: векторы чистятся в lifespan, где есть цикл
+    событий (правило 14: иначе «память помнит удалённое» стало бы невидимой проблемой).
+    """
+    fixed = 0
+    if isinstance(setting, dict):
+        npc = setting.get("npc")
+        if isinstance(npc, dict):
+            for k in [k for k, v in npc.items() if is_player_npc(k, v)]:
+                npc.pop(k, None)
+                fixed += 1
+    try:
+        cards = db.list_entities(world_id, kind="npc")
+    except Exception as e:
+        log.warning("само-исцеление NPC/игрока (world %s): выборка не удалась: %s", world_id, e)
+        return fixed
+    for c in cards:
+        key = str(c.get("entity_key") or "")
+        if not key or not is_player_npc(key, c):
+            continue
+        try:
+            db.delete_entity(world_id, "npc", key)
+            PENDING_VECTOR_KEYS.append(f"ent_{world_id}_npc_{key}".replace(" ", "_"))
+            fixed += 1
+        except Exception as e:
+            log.warning("само-исцеление карточки npc/%s (world %s): %s", key, world_id, e)
+    return fixed
+
+
+def repair_machine_card_names(world_id: int, setting: dict) -> int:
+    """Чинит уже записанные карточки с машинным именем (сессия 40, п.9).
+
+    Идемпотентная само-исцеляющая правка в том же духе, что `db.prune_orphan_rows`
+    и `normalize_setting_ranks` при старте сервера: прошлые прогоны архивариуса
+    оставили в БД карточки с `name` == внутренний id (`player`, `trail_to_outpost`).
+    Правим ТОЛЬКО там, где состояние мира знает настоящее имя этой же сущности, —
+    движок не выдумывает название, а достаёт существующее (закон 2), и не трогает
+    карточки, у которых имя и так человекочитаемое.
+
+    Возвращает число исправленных карточек (0 — данных чистые)."""
+    fixed = 0
+    try:
+        cards = db.list_entities(world_id)
+    except Exception as e:
+        log.warning("само-исцеление имён карточек (world %s): выборка не удалась: %s",
+                    world_id, e)
+        return 0
+    for c in cards:
+        kind, key = str(c.get("kind") or ""), str(c.get("entity_key") or "")
+        if not key or not looks_machine_name(c.get("name") or ""):
+            continue
+        true_name = card_name_from_setting(kind, key, setting)
+        if not true_name or looks_machine_name(true_name):
+            continue
+        try:
+            db.upsert_entity(world_id, kind, key, name=true_name)
+            fixed += 1
+        except Exception as e:
+            log.warning("само-исцеление имени карточки (world %s, %s/%s): %s",
+                        world_id, kind, key, e)
+    return fixed
+
+
 def compact_entity(e: dict) -> str:
     """Компактная строка карточки для подачи в контекст модели."""
     meta = e.get("meta") or {}
@@ -415,9 +566,10 @@ def _origin_for(name: str, origins: list[str] | None) -> str | None:
 
 
 def _upsert_knowledge(world_id: int, kind: str, key: str, origins: list[str] | None, seq: int, *,
-                      name: str, summary: str = "", meta: dict | None = None,
+                      name: str, summary: Optional[str] = "", meta: dict | None = None,
                       bio_add: str | None = None) -> dict:
-    """Создаёт/обновляет карточку знаний; на новую записывает условие получения (origin)."""
+    """Создаёт/обновляет карточку знаний; на новую записывает условие получения (origin).
+    summary=None — НЕ трогать прежнее описание карточки (см. db._upsert_entity)."""
     was = db.get_entity(world_id, kind, key)
     meta_out = dict(meta or {})
     origin = _origin_for(key, origins)
@@ -506,9 +658,25 @@ def ensure_knowledge_cards(world_id: int, setting: dict, seq: int = 0,
             iname = str(item.get("name") or "").strip()[:120]
             if not iname:
                 continue
-            desc = str(item.get("desc") or "")[:200]
+            desc = str(item.get("desc") or "").strip()[:200]
+            _meta = {}
+            _notes = item.get("notes")
+            if isinstance(_notes, list) and _notes:
+                _meta["notes"] = [str(x)[:200] for x in _notes[-4:]]
+            # Сессия 40, п.2: раньше при пустом desc карточке всегда вписывалась заглушка
+            # «в инвентаре игрока», и она затирала описание, которое мог навести фоновый
+            # архивариус или `item_update` ходом позже. Пустой desc = не трогать summary
+            # (upsert_entity при summary=None оставляет прежнее); заглушка — только новой карте.
+            was = db.get_entity(world_id, "item", iname)
+            isum: Optional[str]
+            if desc:
+                isum = desc
+            else:
+                # пустой desc: новую карту помечаем заглушкой, существующую НЕ трогаем
+                # (summary=None в upsert_entity оставляет прежнее)
+                isum = "в инвентаре игрока" if not was else None
             out.append(_upsert_knowledge(world_id, "item", iname, origins, seq, name=iname,
-                                         summary=desc or "в инвентаре игрока"))
+                                         summary=isum, meta=_meta or None))
         # Квесты из механического состояния — в карточки (чтобы вкладка «Карточки» видела
         # активные квесты на старте/в любой момент, а не только после фонового архивариуса)
         for qid, q in (setting.get("quests") or {}).items():
@@ -544,6 +712,11 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
     # db.list_entities — каждая тянула все карточки мира в память на каждый ход).
     all_cards = db.list_entities(world_id, limit=_SCENE_CARDS_WINDOW)
     current = all_cards[-25:]
+    # п.9 (сессия 40): человекочитаемое имя карточки берём из состояния мира, а не из
+    # ключа — см. resolve_card_name (симптом: карточки «player», «trail_to_outpost»).
+    _st = _parse_setting(world)
+    prev_names = {f"{c.get('kind')}\x00{c.get('entity_key')}": str(c.get("name") or "")
+                  for c in all_cards}
     lang = world.get("language", "ru")
     current_text = "\n\n".join(compact_entity(c) for c in current) or "(карточек пока нет)"
     lang_instr = (
@@ -560,6 +733,8 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
             '"summary":"сейчас в таверне, устал","relationship":"друг, доверяет 7/10","bio_add":"новый факт",'
             '"meta":{"alive":true,"location":"tavern"}}]} '
             "kind: npc|location|faction|quest|item|event|enemy|shop|companion|craft. key — короткий латинский идентификатор. "
+            "Самому игроку карточку npc НЕ заводи (его роль вне карточек): npc — это окружение. "
+            "ОБЯЗАТЕЛЬНО заполняй name — человекочитаемым именем на языке мира (не key и не его перевод: «Тропа к Форпосту», а не trail_to_outpost). "
             "bio_add — один новый факт, которого ещё нет в истории, иначе пропусти. "
             "Если ничего не изменилось — верни {\"entities\":[]}. Обновляй ТОЛЬКО затронутые сущности."
         )},
@@ -606,7 +781,15 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
         if kind not in ("npc", "location", "faction", "quest", "item", "event",
                         "enemy", "shop", "companion", "craft") or not key:
             continue
-        name = str(item.get("name") or key)[:120]
+        # Сессия 40, п.13: архивариус рисовал карточку npc с ключом `player` — игрок
+        # оказывался «персонажем окружения» (в промпте, на карте, в сайдбаре). Такое
+        # не заводим впринципе: состояние героя живёт в setting.player.
+        if kind == "npc" and is_player_npc(key, item):
+            log.debug("архивариус (world %s): карточка npc/%s пропущена — это игрок",
+                      world_id, key)
+            continue
+        name = resolve_card_name(kind, key, str(item.get("name") or "")[:120].strip(),
+                                prev_names.get(f"{kind}\x00{key}", ""), _st)
         summary = str(item.get("summary") or "")[:400]
         relationship = str(item.get("relationship") or "")[:200]
         bio_add = str(item.get("bio_add") or "").strip()[:500]
@@ -707,6 +890,11 @@ async def update_entity_cards(world_id: int, action: str, reply: str,
         for card in (c for c in all_cards if c.get("kind") == "npc"):
             key = card.get("entity_key") or ""
             if not key or key in npc:
+                continue
+            # Сессия 40, п.13: архивариус заводил карточку npc с ключом `player` — и при
+            # синхронизации в «Состоянии» вновь возникал «Игрок» в списке персонажей.
+            # Состояние игрока живёт в setting.player; здесь такого персонажа не плодим.
+            if is_player_npc(key, card):
                 continue
             meta = _card_meta(card)
             npc[key] = {
