@@ -59,7 +59,8 @@ def test_world_ten_turns_memory_and_state(api_client, monkeypatch):
         assert r.json()["state"]["player"]["hp"] > 0, f"ход {i}: игрок жив"
 
     # ── История: 10 ходов накопились ──
-    hist = client.get(f"/api/worlds/{wid}/history").json()
+    # A8 (аудит 41): /history отдаёт страницу {events, truncated}
+    hist = client.get(f"/api/worlds/{wid}/history").json()["events"]
     players = [e for e in hist if e["role"] == "player"]
     assert len(players) == 10, f"10 действий игрока, получили {len(players)}"
 

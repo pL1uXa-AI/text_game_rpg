@@ -67,6 +67,15 @@ _RUN_TIMEOUT = 120.0
 _stuck_lock = threading.Lock()
 _stuck_count = 0
 
+# D12 (аудит 41): признак «на единственном соединении висит незакрытый BEGIN IMMEDIATE».
+# Ставится корутиной _begin_now (оптимистично, ДО await — отменённая `_run`-таймаутом
+# корутина всё равно может дойти до соединения через очередь aiosqlite) и снимается
+# _commit_now/_rollback_now. Нужен для обработчика таймаута в _run: см. _rescue_transaction.
+_tx_open = False
+# Потолок ожидания СПАСАТЕЛЬНОГО отката: он идёт сразу после полного _RUN_TIMEOUT, поэтому
+# держать вызывающий поток ещё на две минуты нельзя (ход и так уже упал по таймауту).
+_RESCUE_TIMEOUT = 10.0
+
 # Атомарные группы записей: пока _tx_depth > 0, внутренние _maybe_commit() ничего не коммитят,
 # финальный COMMIT/ROLLBACK делает верхний уровень db.transaction().
 _tx_depth = 0
@@ -103,7 +112,13 @@ def _run(factory: Callable[[], Any]) -> Any:
         цикла, который заблокирован этим же потоком). Раньше такое зависало молча и
         навечно; теперь — явная ошибка с контекстом (правило 14).
       * потолок ожидания: «БД не отвечает» превращается в понятное исключение с логом,
-        а не в вечный стоп хода/задач."""
+        а не в вечный стоп хода/задач;
+      * D12 (аудит 41): если таймаут пришёлся на закрытие транзакции (COMMIT/ROLLBACK),
+        соединение оставалось в открытом `BEGIN IMMEDIATE` — теперь его дозакрывает
+        `_rescue_transaction` (с `log.error`; см. её docstring).
+
+    Вне группы (`_tx_depth > 0` не был, `transaction()` не открывал `BEGIN IMMEDIATE`) ничего
+    не дозакрывается: флаг `_tx_open` ставит только `_begin_now`, поэтому ложных откатов нет."""
     _ensure_loop()
     if _loop_thread is not None and threading.current_thread() is _loop_thread:
         # рекурсивный вызов с собственного цикла: выполнить нельзя, зависнем навсегда
@@ -111,7 +126,8 @@ def _run(factory: Callable[[], Any]) -> Any:
             "db._run() вызван из потока фонового цикла БД — это взаимоблокировка. "
             "Фоновые задачи должны обращаться к БД из своего цикла (asyncio), а не из "
             "корутины, поставленной на цикл db.py.")
-    fut = asyncio.run_coroutine_threadsafe(factory(), _loop)  # type: ignore[arg-type]
+    fut0 = factory()
+    fut = asyncio.run_coroutine_threadsafe(fut0, _loop)  # type: ignore[arg-type]
     try:
         return fut.result(timeout=_RUN_TIMEOUT)
     except FuturesTimeout:
@@ -119,14 +135,52 @@ def _run(factory: Callable[[], Any]) -> Any:
         with _stuck_lock:
             global _stuck_count
             _stuck_count += 1
-        log.error("БД не ответила за %s с (одновременных зависаний: %d) — запрос отменён",  # noqa: E501
-                  _RUN_TIMEOUT, _stuck_count, exc_info=True)
-        raise RuntimeError(f"База данных не отвечает (ждём >{_RUN_TIMEOUT}с)")
+        op = getattr(fut0, "__qualname__", repr(fut0))
+        log.error("БД не ответила за %s с (запрос: %s, одновременных зависаний: %d) — "
+                  "запрос отменён", _RUN_TIMEOUT, op, _stuck_count, exc_info=True)
+        if _tx_open and _tx_depth == 0:
+            # D12: таймаут на COMMIT/ROLLBACK оставляет соединение в открытом BEGIN
+            # IMMEDIATE, а _tx_depth к этому моменту уже 0 — никто больше эту транзакцию
+            # не закроет, и следующий игрок вписался бы в ЧУЖОЙ незакрытый BEGIN (его данные
+            # ушли бы при ближайшем откате). Таймаут на записи внутри тела (_tx_depth > 0)
+            # чинит сам `transaction()`: исключение доходит до его except-ветки и та зовёт
+            # ROLLBACK (и, если он тоже встанет, попадёт сюда же). Молча не оставляем (правило 14).
+            _rescue_transaction(op)
+        raise RuntimeError(f"База данных не отвечает (ждём >{_RUN_TIMEOUT}с, запрос: {op})")
+
+
+def _rescue_transaction(op: str) -> None:
+    """D12 (аудит 41): закрыть транзакцию, которую таймаут оставил открытой.
+
+    Вызывается из `_run` только когда на единственном соединении реально висит незакрытый
+    `BEGIN IMMEDIATE` (`_tx_open`) и группы уже нет (`_tx_depth == 0`). Откат идёт той же
+    корутиной `_rollback_now`, что и штатный (она же снимает `_tx_open`). Буфер
+    `_pending_events` метётся: событий этой транзакции в БД нет, рассылать их в шину живого
+    чата нельзя (тот же смысл, что и в except-ветке `transaction()` — раньше при таймауте
+    COMMIT они оставались висеть в буфере и уходили к читателям со СЛЕДУЮЩИМ коммитом).
+
+    `Исключение отката не поднимается` (первая ошибка — таймаут — важнее): оно пишется в лог,
+    а флаг остаётся взведённым, чтобы следующая операция попробовала откататься снова.
+    """
+    log.error("БД: таймаут транзакции (%s) — принудительный ROLLBACK незакрытого "
+              "BEGIN IMMEDIATE (событий в буфере: %d)", op, len(_pending_events))
+    _pending_events.clear()
+    loop = _loop
+    if loop is None:  # цикла БД нет — откатывать негде (соединение тоже закрыто)
+        log.error("БД: спасательный ROLLBACK пропущен — фоновый цикл БД не поднят")
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_rollback_now(), loop).result(timeout=_RESCUE_TIMEOUT)
+        log.error("БД: транзакция после таймаута откатана, соединение снова свободно")
+    except Exception as e:
+        log.error("БД: принудительный ROLLBACK не прошёл за %s с — соединение может держать "
+                  "write-lock до следующей операции: %s", _RESCUE_TIMEOUT, e, exc_info=True)
 
 
 async def _shutdown() -> None:
     """Закрыть единственное соединение (работает на фоновом цикле)."""
-    global _conn
+    global _conn, _tx_open
+    _tx_open = False   # соединения больше нет — «висеть» транзакции не на чём (D12)
     if _conn is not None:
         await _conn.close()
         _conn = None
@@ -135,19 +189,30 @@ async def _shutdown() -> None:
 def close() -> None:
     """Корректно закрыть соединение aiosqlite и остановить фоновый цикл.
     Используется в тестах/скриптах для освобождения файла БД при завершении.
-    Повторный вызов любой функции БД лениво поднимет цикл и соединение заново."""
+    Повторный вызов любой функции БД лениво поднимет цикл и соединение заново.
+
+    A6 (аудит 41, правило 14): раньше обе ветки глотали ошибку молча (`except: pass`).
+    На Windows залоченный кем-то `game.db` даёт отказ именно здесь — и игрок не узнавал,
+    что файл не освобождён (следующий запуск стартует с «database is locked» в логе).
+    Теперь каждый шаг пишет warning; сам `close()` по-прежнему не бросает (он вызывается
+    на shutdown, где исключение только замажет реальную причину остановки)."""
     global _loop, _loop_thread
     if _loop is not None:
         try:
             asyncio.run_coroutine_threadsafe(_shutdown(), _loop).result(timeout=10)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("БД: закрытие соединения не удалось — файл %s может остаться "
+                        "залоченным: %s", get_config().db_path, e, exc_info=True)
         try:
             _loop.call_soon_threadsafe(_loop.stop)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("БД: фоновый цикл не остановлен (остановка потока пропущена): %s",
+                        e, exc_info=True)
         if _loop_thread is not None:
             _loop_thread.join(timeout=10)
+            if _loop_thread.is_alive():
+                log.warning("БД: поток цикла жив через 10 с после stop() — соединение "
+                            "может ещё держать файл %s", get_config().db_path)
             _loop_thread = None
         _loop = None
 
@@ -212,8 +277,10 @@ async def _maybe_commit() -> None:
 
 
 async def _commit_now() -> None:
+    global _tx_open
     conn = await _open()
     await conn.commit()
+    _tx_open = False
     if _tx_depth == 0:
         _flush_pending_events()
 
@@ -270,13 +337,21 @@ def transaction() -> Iterator[None]:
 
 
 async def _begin_now() -> None:
+    global _tx_open
     conn = await _open()
-    await conn.execute("BEGIN IMMEDIATE")
+    _tx_open = True   # оптимистично — см. комментарий у флага (D12)
+    try:
+        await conn.execute("BEGIN IMMEDIATE")
+    except BaseException:
+        _tx_open = False
+        raise
 
 
 async def _rollback_now() -> None:
+    global _tx_open
     conn = await _open()
     await conn.rollback()
+    _tx_open = False
 
 
 async def _init_schema(conn: aiosqlite.Connection) -> None:
@@ -520,6 +595,18 @@ async def _list_worlds() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def world_ids() -> set[int]:
+    """Множество id живых миров — дешёвая точка сверки для чистки векторов (аудит 41, [A1 §5])."""
+    with _lock:
+        return _run(_world_ids)
+
+
+async def _world_ids() -> set[int]:
+    conn = await _open()
+    cur = await conn.execute("SELECT id FROM worlds")
+    return {int(r[0]) for r in await cur.fetchall()}
+
+
 def get_world(world_id: int) -> Optional[dict]:
     with _lock:
         return _run(lambda: _get_world(world_id))
@@ -537,6 +624,16 @@ def update_world(world_id: int, **fields: Any) -> None:
         return
     allowed = {"name", "setting", "gen_settings", "narrator_id", "provider_settings", "snapshot",
                "tts_settings"}
+    # D11 (аудит 41): раньше неизвестный ключ просто отсеивался в цикле ниже (`if k in allowed`),
+    # а если он был единственным — сюда доходил пустой `sets` и функция делала ранний `return`.
+    # Опечатка в имени поля (`setings=`, `snaptshot=`) означала «молча ничего не записать» —
+    # ни строки в журнале, ни ошибки (правило 14: тихий no-op запрещён). Теперь каждый лишний
+    # ключ виден. ПОВЕДЕНИЕ НЕ МЕНЯЕТСЯ: неизвестные поля по-прежнему не идут в SQL (белый
+    # список — защита от подстановки имени колонки), запись известных — как была.
+    for k in fields:
+        if k not in allowed:
+            log.warning("update_world(world %s): неизвестное поле %r — НЕ записано "
+                        "(допустимы: %s)", world_id, k, ", ".join(sorted(allowed)))
     if "setting" in fields:
         fields["setting"] = json.dumps(fields["setting"], ensure_ascii=False)
     if "gen_settings" in fields:
@@ -631,7 +728,7 @@ def add_event(world_id: int, role: str, content: str, seq: int | None = None,
 # доходили до вкладки мгновенно, а не через поллинг раз в 15 секунд.
 _event_listeners: list = []
 # Внутри db.transaction() события копятся и рассылаются ТОЛЬКО после успешного COMMIT:
-# иначе при откате половины хода клиент получил бы «фantomные» сообщения, которых в БД нет.
+# иначе при откате половины хода клиент получил бы «фантомные» сообщения, которых в БД нет.
 _pending_events: list[dict] = []
 
 
@@ -770,21 +867,28 @@ async def _get_events(world_id: int, limit: int | None, since_seq: int,
     return [_event_obj(r) for r in rows]
 
 
-def get_history_page(world_id: int, before_seq: int = 0, limit: int = 60,
-                     roles: tuple[str, ...] | None = None) -> list[dict]:
+def get_history_page(world_id: int, before_seq: int = 0, limit: int = 0,
+                     roles: tuple[str, ...] | None = None) -> tuple[list[dict], bool]:
     """Страница истории (сессия 34, B5): последние `limit` событий раньше before_seq —
     ОГРАНИЧЕННО в SQL. Раньше роутер тянул ВЕСЬ лог мира и резал его в Python, поэтому
     открытие длинного прохождения тем медленнее, чем дальше прошёл игрок.
 
     `roles` (A10, аудит 38): если задан — только эти роли (роль `summary` и прочие
     служебные строки не должны попадать в чат/лог игрока). Фильтр — в SQL, а не в Python,
-    иначе «последние N» резались бы до фильтрации и счётчик пагинации врал."""
+    иначе «последние N» резались бы до фильтрации и счётчик пагинации врал.
+
+    A8 (аудит 41): возвращает `(события, truncated)`. `truncated=True` — в логике
+    «раньше показанного» остались события, страница подрезана потолком
+    `HISTORY_PAGE_MAX` (или запрошенным `limit`). «Нет лимита» больше НЕ означает
+    «весь лог»: `limit` <= 0 или пустой = `HISTORY_PAGE_DEFAULT`, а любое большее
+    значение режется общим потолком страницы — ровно как `_EVENTS_PAGE_LIMIT` у /events.
+    Лишняя строка вычитывается одним `LIMIT n+1` в SQL, без COUNT по всему логу."""
     with _lock:
         return _run(lambda: _get_history_page(world_id, before_seq, limit, roles))
 
 
 async def _get_history_page(world_id: int, before_seq: int, limit: int,
-                            roles: tuple[str, ...] | None = None) -> list[dict]:
+                            roles: tuple[str, ...] | None = None):
     conn = await _open()
     args: list[Any] = [world_id]
     where = "world_id = ?"
@@ -794,12 +898,15 @@ async def _get_history_page(world_id: int, before_seq: int, limit: int,
     if roles:
         where += " AND role IN (" + ",".join("?" * len(roles)) + ")"
         args.extend(roles)
-    n = max(1, int(limit or 0)) if limit else 100000
-    args.append(n)
+    want = int(limit) if limit and int(limit) > 0 else HISTORY_PAGE_DEFAULT
+    n = min(want, HISTORY_PAGE_MAX)
+    args.append(n + 1)                                  # +1 — чтобы честно сказать о подрезке
     cur = await conn.execute(
         f"SELECT * FROM (SELECT * FROM events WHERE {where} ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC",
         args)
-    return [_event_obj(r) for r in await cur.fetchall()]
+    rows = [_event_obj(r) for r in await cur.fetchall()]
+    truncated = len(rows) > n
+    return (rows[1:] if truncated else rows), truncated  # лишняя — САМАЯ ранняя (rows[0])
 
 
 def mark_folded(world_id: int, up_to_seq: int,
@@ -867,6 +974,14 @@ async def _set_feedback(event_id: int, value: int, world_id: int | None) -> bool
 #   1 = FOLD_SUMMARY  — свёрнуто в сводку (summarize_and_compress), покрыто ролью summary;
 #   2 = FOLD_HIDDEN   — вынуто из таймлайна перемоткой/загрузкой, сводки о нём удалены.
 # В промпт recent не попадают ни 1, ни 2 (фильтр folded = 0).
+
+# A8 (аудит 41): единый потолок СТРАНИЦЫ истории. Раньше `limit` = 0/пустой означал
+# «весь лог» (в SQL уходило 100000), и GET /history?limit=0 вытаскивал всё прохождение
+# одним JSON-ответом — тот же класс B5/A14, что уже закрыли для /events (`_EVENTS_PAGE_LIMIT`).
+# Меньше страницы не становится: `limit` <= 0 = дефолт, большее режется потолком,
+# а «не всё влезло» клиент узнаёт из честного флага truncated.
+HISTORY_PAGE_DEFAULT = 60
+HISTORY_PAGE_MAX = 500
 
 FOLD_VISIBLE = 0
 FOLD_SUMMARY = 1
@@ -1283,7 +1398,15 @@ async def _upsert_entity(world_id: int, kind: str, entity_key: str, *,
     row = await cur.fetchone()
     now = time.time()
     if row:
-        cur_meta = json.loads(row["meta"] or "{}")
+        try:
+            # meta обязана оставаться валидным JSON: на битой строке json.loads упал бы
+            # 500-м, а запросы с json_valid=0 (дневник, A7) обошли бы карточку молча
+            cur_meta = _as_json_obj(row["meta"])
+        except Exception as e:
+            log.warning("БД: карточка %s/%s (world %s): meta не разборётся (%s) — "
+                        "перезаписываю заново", row["kind"], row["entity_key"],
+                        world_id, e)
+            cur_meta = {}
         if meta:
             cur_meta.update(meta)
         bio = row["bio"] or ""
@@ -1357,6 +1480,67 @@ async def _list_entities(world_id: int, kind: Optional[str],
 def get_entity(world_id: int, kind: str, entity_key: str) -> Optional[dict]:
     with _lock:
         return _run(lambda: _get_entity(world_id, kind, entity_key))
+
+
+# ───────────── карточки: выдача и счётчики на стороне SQLite (A7, аудит 41) ─────────────
+# Категория карточки живёт в meta (JSON). Раньше «горячие» пути (дневник, фильтры UI)
+# забирали ВСЕ строки мира и разбирали meta в Python: на длинном прохождении дневник —
+# карточка на каждое значимое событие хода, т.е. ровно тот же класс B5, что уже чинили
+# для events. Фильтр/потолок/группировку делает SQLite; JSON больше не парсится в Python.
+_CAT_SQL = ("COALESCE(NULLIF(CASE WHEN json_valid(e.meta) = 1 AND json_type(e.meta) = 'object' "
+            "THEN json_extract(e.meta, '$.cat') END, ''), 'world')")
+
+
+def _as_json_obj(raw) -> dict:
+    """meta из строки БД → dict (пусто/не-объект/битый JSON → {})."""
+    obj = json.loads(raw or "{}")
+    return obj if isinstance(obj, dict) else {}
+
+
+def list_cards(world_id: int, kind: str, limit: int = 0, cat: str = "") -> list[dict]:
+    """Карточки мира `kind`, последние `limit` (ORDER BY seq DESC, id DESC LIMIT ?).
+
+    `limit <= 0` — все карточки (экспорт/индексация). `cat` — точный фильтр по категории
+    (`meta.$.cat`, пустая/битая meta считается 'world'). Возвращаются только нужные поля:
+    id, seq, entity_key, name, summary, cat — без `meta` целиком.
+    """
+    with _lock:
+        return _run(lambda: _list_cards(world_id, kind, limit, cat))
+
+
+async def _list_cards(world_id: int, kind: str, limit: int, cat: str) -> list[dict]:
+    conn = await _open()
+    q = ("SELECT e.id, e.seq, e.entity_key, e.name, e.summary, " + _CAT_SQL + " AS cat "
+         "FROM entities e WHERE e.world_id = ? AND e.kind = ?")
+    args: list[Any] = [world_id, kind]
+    if cat:
+        q += " AND " + _CAT_SQL + " = ?"
+        args.append(cat)
+    q += " ORDER BY e.seq DESC, e.id DESC"
+    n = int(limit) if limit and int(limit) > 0 else None
+    if n:
+        q += " LIMIT ?"
+        args.append(n)
+    cur = await conn.execute(q, args)
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_cards_by_cat(world_id: int, kind: str) -> dict[str, int]:
+    """Сколько карточек `kind` в каждой категории (GROUP BY по meta.$.cat — без перебора)."""
+    with _lock:
+        return _run(lambda: _count_cards_by_cat(world_id, kind))
+
+
+async def _count_cards_by_cat(world_id: int, kind: str) -> dict[str, int]:
+    conn = await _open()
+    cur = await conn.execute(
+        "SELECT " + _CAT_SQL + " AS cat, COUNT(*) AS n FROM entities e "
+        "WHERE e.world_id = ? AND e.kind = ? GROUP BY cat",
+        (world_id, kind),
+    )
+    rows = await cur.fetchall()
+    return {str(r["cat"]): int(r["n"]) for r in rows}
 
 
 async def _get_entity(world_id: int, kind: str, entity_key: str) -> Optional[dict]:

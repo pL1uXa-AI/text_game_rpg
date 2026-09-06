@@ -89,19 +89,36 @@ def _provider() -> dict:
     return get_config().get_provider("main")
 
 
-async def check_available(provider: dict) -> bool:
-    """Проверка доступности провайдера: GET {base_url}/models (короткий таймаут)."""
-    base = (provider.get("base_url") or "").rstrip("/")
+async def probe(provider: dict) -> tuple[bool, bool, str]:
+    """ЕДИНСТВЕННАЯ точка истины «жива ли модель»: GET {base_url}/models (таймаут 8 с).
+
+    Возвращает (up, needs_key, detail):
+      * up        — сервер ОТВЕТИЛ (< 500). 401/403/404 тоже «жив»: llama.cpp с --api-key
+                    и облачные шлюзы отвечают так на служебный /models, а ход при этом
+                    работает нормально — считать такое «сервер мёртв» нельзя (A12, аудит 41);
+      * needs_key — ответ требует ключа (401/403): отдельно от «не отвечает», чтобы UI
+                    подсказал «проверь MAIN_API_KEY», а не «запусти llama.cpp»;
+      * detail    — короткая строка для диагностики (код ответа или имя исключения).
+
+    Ключ ОТПРАВЛЯЕМ всегда, когда он есть: без `Authorization` защищённый сервер даёт 401,
+    и «проверка без ключа» вракала о недоступности ровно там, где ключ включили.
+    """
+    base = (provider.get("base_url") or "").strip().rstrip("/")
     if not base:
-        return False
+        return False, False, "base_url пуст"
     headers = {}
     if provider.get("api_key"):
         headers["Authorization"] = f"Bearer {provider['api_key']}"
     try:
         r = await _get_client().get(f"{base}/models", headers=headers, timeout=8)
-        return r.status_code < 500
-    except Exception:
-        return False
+    except Exception as e:
+        return False, False, f"{type(e).__name__}"
+    return (r.status_code < 500), r.status_code in (401, 403), str(r.status_code)
+
+
+async def check_available(provider: dict) -> bool:
+    """Доступность провайдера — то же, что `probe` (одна точка истины, без второго критерия)."""
+    return (await probe(provider))[0]
 
 
 # ── Авто-детект реального размера контекста модели (сессия 33) ──────────────

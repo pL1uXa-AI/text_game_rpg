@@ -6,12 +6,14 @@ backend/admin_settings.py (отдельное соединение, без ре�
 Здесь только HTTP-слой: валидация, маскировка ключей, сброс кэша конфига."""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from .. import db
-from ..config import (get_config, hidden_admin_keys, invalidate_config, KEY_MASK,
-                    PROVIDER_OPTIONS, overridable_env_keys)
+from .. import memory
+from ..config import (clamp_num, get_config, hidden_admin_keys, invalidate_config, KEY_MASK,
+                    num_kind, overridable_env_keys, PROVIDER_OPTIONS)
 from ..logsetup import get_logger
+from ..ratelimit import guard_for, require_local
 from ..schemas import AdminSettingsIn
 from .core import _mask_provider
 
@@ -20,8 +22,33 @@ router = APIRouter(tags=["Админка"])
 log = get_logger(__name__)
 
 
+def _admin_num(field: str, raw: str) -> str:
+    """Числовое поле админки → та же строка, но в границах `config.NUM_RANGES` (A9).
+
+    Админка шлёт числа СТРОКАМИ, и раньше проверка была одна: «`int()`/`float()` упадёт →
+    дефолт» (в `config.load`), т.е. диапазон не валидировался нигде: `TURN_SNAPSHOT_KEEP=0`
+    («перемотка умерла»), `LOG_MAX_BYTES=1` («ротация съела журнал»), `LLM_TIMEOUT=0.01`
+    (таймаут на каждом ходу) сохранялись как ни в чём не бывало и ломали игру после
+    перезагрузки вкладки. Теперь: мусор вместо числа → 400 (раньше — тихий дефолт), число
+    вне границ → подрезается с warning-ом в журнале. Границы общие с .env/пер-мир.
+    """
+    key = field.upper()
+    kind = num_kind(key)
+    if kind is None or raw == "":
+        return raw
+    try:
+        val = int(raw) if kind == "int" else float(raw)
+    except (TypeError, ValueError):
+        what = "целым числом" if kind == "int" else "числом"
+        raise HTTPException(400, f"{key} должно быть {what}, получено «{raw}»")
+    clamped = clamp_num(key, val, integer=kind == "int", label=f"админка: {key}")
+    return str(clamped)
+
+
 @router.get("/api/admin/settings")
-async def admin_settings_get():
+async def admin_settings_get(request: Request,
+                             _loc: None = Depends(require_local),
+                             _rl: None = Depends(guard_for("admin"))):
     cfg = get_config()
     admin = db.get_admin_settings()
     stored = {k: v for k, v in admin.items() if v.strip()}
@@ -29,8 +56,16 @@ async def admin_settings_get():
     masked_stored = {k.upper(): (KEY_MASK if k.upper().endswith("API_KEY") and v.strip() else v)
                      for k, v in stored.items()}
     prov = cfg.resolve_world_providers({})
+    # B5 (аудит 41): строки, которым в конфиге делать нечего (ручку сняли, а запись в таблице
+    # осталась — ровно так пережил A17 `RERANK_TOP_N`). Их обязан видеть и игрок, и «сбросить
+    # всё к .env»: раньше reset принимал только ЖИВЫЕ имена, а мёртвая строка стала бы
+    # недостижимой («опечатка в имени ключа = сброс не сработал», но и осколок снятой ручки
+    # тоже). Отдаём отдельно: переопределять их нельзя, удалять — можно.
+    known = set(overridable_env_keys())
+    stale = sorted(k for k in masked_stored if k not in known)
     return {
         "stored": masked_stored,
+        "stale": stale,
         # Единый список ключей, которые админка умеет переопределять. Фронт строит по нему
         # «сбросить всё к .env» — раньше список был продублирован ТРЕТЬИМ местом (RESET_KEYS
         # в admin.html) и мог разойтись (B5.2).
@@ -98,12 +133,24 @@ async def admin_settings_get():
                      "cache_enabled": bool(cfg.tts_cache_enabled),
                      "cache_ttl_days": cfg.tts_cache_ttl_days,
                      "max_chars": cfg.tts_max_chars},
+            # [A1 §5] (аудит 41): итог последнего прохода сводки сиротских векторов — счётчик,
+            # а не полный обход коллекции на каждый GET (админка опрашивается часто).
+            "vector_memory": dict(memory.LAST_VECTOR_SWEEP),
         },
     }
 
 
 @router.post("/api/admin/settings")
-async def admin_settings_save(body: AdminSettingsIn):
+async def admin_settings_save(body: AdminSettingsIn,
+                              request: Request,
+                              # B2 (аудит 41): админка ПЕРЕПИСЫВАЕТ провайдеров, включая
+                              # MAIN_BASE_URL и ключи. Открыть её всей локальной сети —
+                              # значит отдать чужому перехват промптов и живые ключи, а
+                              # rate-limit от этого не спасает (аппарет-подмена адреса всё
+                              # равно остаётся хозяйкой API). Поэтому: только localhost,
+                              # явно наружу — ADMIN_ALLOW_LAN=true в .env.
+                              _loc: None = Depends(require_local),
+                              _rl: None = Depends(guard_for("admin"))):
     # валидация провайдеров
     for kind in ("main", "embedding", "rerank"):
         pid = getattr(body, f"{kind}_provider")
@@ -160,7 +207,7 @@ async def admin_settings_save(body: AdminSettingsIn):
         if v is None:
             continue
         v = str(v).strip()
-        payload[f.upper()] = v
+        payload[f.upper()] = v if f == "log_level" else _admin_num(f, v)
     # выключатели фоновых агентов и мира
     for f, env in (("logic_judge_enabled", "LOGIC_JUDGE_ENABLED"),
                    ("dynamic_events_enabled", "DYNAMIC_EVENTS_ENABLED"),
@@ -197,7 +244,7 @@ async def admin_settings_save(body: AdminSettingsIn):
                     raise HTTPException(400, "METRICS_MAX_BYTES не может быть отрицательным")
             except ValueError:
                 raise HTTPException(400, "METRICS_MAX_BYTES должен быть целым числом байт")
-        payload[f.upper()] = "" if v == "" else v
+        payload[f.upper()] = "" if v == "" else _admin_num(f, v)
     # TTS: булевы + строки
     if body.tts_enabled is not None:
         payload["TTS_ENABLED"] = "true" if body.tts_enabled else "false"
@@ -214,16 +261,20 @@ async def admin_settings_save(body: AdminSettingsIn):
         if v is None:
             continue
         v = str(v).strip()
-        payload[f.upper()] = "" if v == "" else v
+        payload[f.upper()] = "" if v == "" else _admin_num(f, v)
     # Явный сброс ключей к .env (пустое значение = удалить строку из admin_settings).
     # Позволяет кнопке «сбросить к .env» НЕ трогать булевы тумблеры как false.
     allowed = set(overridable_env_keys())
+    # B5: «сбросить всё к .env» обязан снимать и ОСКОЛКИ — строки админки, под которые в
+    # конфиге уже нет поля (так пережил снятие ручки строка RERANK_TOP_N). Иначе такая строка не чистится НИКАК:
+    # живое имя её не накрывает, а неизвестный ключ роутер отбивал как опечатку.
+    stale_rows = {str(k).strip().upper() for k in db.get_admin_settings()}
     unknown: list[str] = []
     for k in (body.reset or []):
         key = str(k).strip().upper()
         if not key:
             continue
-        if key not in allowed:
+        if key not in allowed and key not in stale_rows:
             unknown.append(key)
             continue
         payload[key] = ""

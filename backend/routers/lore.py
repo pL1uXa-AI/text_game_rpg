@@ -7,10 +7,11 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from .. import db, narrator
 from ..logsetup import get_logger
+from ..ratelimit import guard_for
 from ..schemas import LoreIn
 from .core import _json_object
 
@@ -31,7 +32,8 @@ async def lore_list(world_id: int):
 
 
 @router.post("/api/worlds/{world_id}/lore")
-async def lore_create(world_id: int, body: LoreIn):
+async def lore_create(world_id: int, body: LoreIn,
+                      _rl: None = Depends(guard_for("lore_write"))):
     _world_or_404(world_id)
     title = (body.title or "").strip()
     content = (body.content or "").strip()
@@ -51,7 +53,8 @@ async def lore_create(world_id: int, body: LoreIn):
 
 
 @router.patch("/api/worlds/{world_id}/lore/{lore_id}")
-async def lore_update(world_id: int, lore_id: int, body: LoreIn):
+async def lore_update(world_id: int, lore_id: int, body: LoreIn,
+                      _rl: None = Depends(guard_for("lore_write"))):
     _world_or_404(world_id)
     try:
         entry = db.update_lore(lore_id,
@@ -95,7 +98,7 @@ async def lore_delete(world_id: int, lore_id: int):
 
 
 @router.get("/api/worlds/{world_id}/lore/search")
-async def lore_search(world_id: int, q: str):
+async def lore_search(world_id: int, q: str, _rl: None = Depends(guard_for("lore_search"))):
     """RAG-поиск по лору: набор релевантных фрагментов (для UI предпросмотра)."""
     from .core import _world_providers as _wp
     # A4 (аудит 38): состояние берём из уже проверенного мира — раньше мир перечитывался

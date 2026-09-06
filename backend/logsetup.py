@@ -11,8 +11,12 @@
     всё, что написано внутри `turn_context(...)`, помечено этим ходом автоматически;
   * **файл** `data/logs/game.log` c ротацией (`LOG_FILE`/`LOG_MAX_BYTES`/`LOG_BACKUP_COUNT`)
     плюс обычный человекочитаемый вывод в консоль (stderr), чтобы не ломать привычный запуск;
-  * **тихие `except: pass` становятся видимыми** — хелпер `quiet()`/`log_debug_once()` для
-    легальных фолбэков, которые не должны засорять warning-уровень, но остаются в debug.
+  * **тихие `except: pass` становятся видимыми** — хелпер `log_once()` для легальных
+    фолбэков, которые не должны молчать (правило 14), но и не должны заливать журнал
+    на каждом ходе (фоновые агенты живут каждый ход). Ключ — короткая метка места.
+    ⚠ Прежде этот абзац обещал ещё два хелпера для тихих фолбэков (по именам из аудита 38);
+    таких функций в модуле не было никогда (A6, аудит 41): обещание снято, а не реализовано —
+    расхождение док↔код сторожит `test_logsetup_docstring_promises_only_real_helpers`.
 
 Правила проекта: настройки LLM/ключей в лог не пишутся (секреты — правило 3); в JSON поля
 `msg` обрезается до разумной длины, `exc` — traceback одной строкой.
@@ -196,6 +200,35 @@ def _cfg_value(name: str, default):
         return _env(name, str(default))
 
 
+def _clamped_int_env(name: str, default: str) -> int:
+    """Число из env/.env в границах `config.NUM_RANGES` (A9, аудит 41).
+
+    Ротор журнала настраивается ДО первого чтения конфига (config→db→config — рекурсия
+    опасна), поэтому `LOG_MAX_BYTES`/`LOG_BACKUP_COUNT` читаются здесь напрямую, минуя
+    кламп `Config.load`. Без этого строка «LOG_MAX_BYTES=1» в .env молча сжирала журнал
+    при первой же записи. Границы берём из того же реестра, что и конфиг (одна точка
+    истины); если config ещё недоступен — значение как есть, но целое.
+    """
+    try:
+        val = int(float(_env(name, default) or 0))
+    except (TypeError, ValueError):
+        val = int(float(default))
+    try:
+        from .config import NUM_RANGES
+        rng = NUM_RANGES.get(name)
+    except Exception:
+        rng = None
+    if rng is None:
+        return val or int(float(default))
+    lo, hi = rng
+    out = int(min(hi, max(lo, val)))
+    if out != val:
+        # НЕ get_logger(): он зовёт configure(), а мы находимся внутри него (рекурсия)
+        logging.getLogger("textgame").warning(
+            "%s=%s подрезано до %s (допустимо %s…%s)", name, val, out, lo, hi)
+    return out
+
+
 def configure(level: str | None = None) -> logging.Logger:
     """Настраивает логгер `textgame` (идемпотентно — повторные вызовы не плодят хендлеры).
 
@@ -235,8 +268,8 @@ def configure(level: str | None = None) -> logging.Logger:
             if not path.is_absolute():
                 path = ROOT / path
             path.parent.mkdir(parents=True, exist_ok=True)
-            max_bytes = int(_env("LOG_MAX_BYTES", "5242880") or 0) or 5_242_880
-            backups = int(_env("LOG_BACKUP_COUNT", "3") or 0) or 3
+            max_bytes = _clamped_int_env("LOG_MAX_BYTES", "5242880")
+            backups = _clamped_int_env("LOG_BACKUP_COUNT", "3")
             fh = logging.handlers.RotatingFileHandler(
                 path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8")
             fh.setFormatter(JsonFormatter())
@@ -295,19 +328,24 @@ def get_logger(name: str | None = None) -> logging.Logger:
 _seen: set[str] = set()
 
 
-def log_once(logger: logging.Logger, key: str, level: int, fmt: str, *args: Any) -> None:
+def log_once(logger: logging.Logger, key: str, level: int, fmt: str, *args: Any,
+             exc_info: Any = None) -> None:
     """Логирует конкретную повторяющуюся проблему ОДИН раз за процесс.
 
     Нужен для легальных фолбэков, которые иначе либо молча глотаются (`except: pass` —
     запрещёно правилом 14), либо заливают лог на каждом ходе (например «Chroma не отвечает»
     при выключенной базе). Ключ — короткая метка места.
+
+    `exc_info` (A6, аудит 41) — traceback к первой записи: у «тихих» `except Exception:
+    return None` в фоных агентах именно он и есть единственная диагностика, но второй
+    раз за процесс он не пишется — шторм тот же.
     """
     if key in _seen:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[once:%s] повтор", key)
         return
     _seen.add(key)
-    logger.log(level, fmt + "  (дальше это не повторяется в логе)", *args)
+    logger.log(level, fmt + "  (дальше это не повторяется в логе)", *args, exc_info=exc_info)
 
 
 def reset_once() -> None:

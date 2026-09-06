@@ -33,8 +33,17 @@ os.environ["RERANK_PROVIDER"] = "none"
 os.environ["RERANK_ENABLED"] = "false"
 # Rate-limit в тестах выключен: тестовый клиент гоняет десятки действий с одного IP
 # (127.0.0.1) за секунды — это легитимная нагрузка теста, а не «залипание» UI.
+# B2 (аудит 41): выключается ОДНИМ путём с реальным запуском — через env-ключ
+# RATE_LIMIT_ENABLED (его читает Config, а `_lifespan` применяет через configure()).
+# Без него тест lifespan (`test_session53_startup_heal`) включал бы лимитер обратно и
+# все последующие API-тесты ловили бы 429.
+os.environ["RATE_LIMIT_ENABLED"] = "false"
 import backend.ratelimit as _rl_mod  # noqa: E402
 _rl_mod.configure(enabled=False)
+# B2 (аудит 41): адрес тестового клиента по умолчанию — ("testclient", 50000), то есть
+# «чужой хост», и `require_local` (админка только с localhost) отсекал бы все тесты
+# админки 403-м. Игрок сидит на самом хосте — моделируем именно это; чужой адрес
+# ставится явно там, где проверяется доступ из сети.
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -42,6 +51,20 @@ from backend import chroma_client as chroma_mod  # noqa: E402
 from backend import llm as llm_mod  # noqa: E402
 from backend import narrator as narrator_mod  # noqa: E402
 from backend.app import app  # noqa: E402
+
+
+# ── A13 (аудит 41): само-исцеление и сид больше НЕ делаются на импорте backend.app ────
+# Раньше `import backend.app` сидил рассказчиков, бэкапил БД и обходил все миры; теперь это
+# старт приложения (`_lifespan` → `app.self_heal()`, фоновой задачей). TestClient без
+# контекстного менеджера lifespan НЕ поднимает, поэтому тесты, которым нужен сид (а таких
+# большинство: миры создаются с `narrator_id` по умолчанию), делают его явно — ровно один
+# сид, а не всю тяжёлую процедуру. Тестам, нужным реально на стартовый проход, доступен
+# `app.self_heal()`.
+@pytest.fixture(scope="session", autouse=True)
+def _seed_narrators_like_server_start() -> None:
+    from backend import db as _db
+    from backend import narrator as _nr
+    _db.seed_narrators(_nr.NARRATOR_PRESETS)
 
 
 @pytest.fixture
@@ -106,7 +129,7 @@ def api_client(monkeypatch):
         if hasattr(chroma_mod, _name):
             monkeypatch.setattr(chroma_mod, _name, _noop_list if _name in ("query", "count") else _noop)
     try:
-        yield TestClient(app), holder
+        yield TestClient(app, client=("127.0.0.1", 54321)), holder
     finally:
         # D7: планировщик фоновых задач глобален — убираем его состояние ПОСЛЕ теста,
         # иначе отменённые воркеры/heap переходят в следующий прогон со своим циклом.

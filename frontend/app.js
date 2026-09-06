@@ -4,6 +4,7 @@
 const $ = (id) => document.getElementById(id);
 const state = { worlds: [], themes: [], genres: [], selectedGenres: [], plots: [], narrators: [], providers: null, providersEffective: null,
                 currentWorld: null, setting: null, gen: {}, streaming: false, seenSeq: 0, pollTimer: null,
+                reloading: false, 
                 tts: null, ttsStatus: null, ttsSettingsRaw: {}, playingTts: null, memoryDefaults: {}, eventSource: null };
 
 const API = (path, opts = {}) =>
@@ -177,11 +178,11 @@ function renderPlotsHighlight() {
 
 function plotModal(p) {
   openModal(p ? "✎ Правка сюжета" : "➕ Новый сюжет", `
-    <label>Название <input id="pl-name" value="${esc(p?.name || "")}" placeholder="Мой сюжет"></label>
+    <label>Название <input id="pl-name" maxlength="120" value="${esc(p?.name || "")}" placeholder="Мой сюжет"></label>
     <label>Сюжет/завязка
-      <textarea id="pl-plot" rows="6" placeholder="Опиши мир, завязку и интригу. Рассказчик превратит это в игру.">${esc(p?.plot || "")}</textarea></label>
+      <textarea id="pl-plot" rows="6" maxlength="100000" placeholder="Опиши мир, завязку и интригу. Рассказчик превратит это в игру.">${esc(p?.plot || "")}</textarea></label>
     <label>Лор мира (необязательно)
-      <textarea id="pl-lore" rows="6" placeholder="Статьи лора: строки «## Заголовок» начинают новую статью.\n## География\nКонтинент расколот на три королевства...">${esc(p?.lore || "")}</textarea></label>
+      <textarea id="pl-lore" rows="6" maxlength="200000" placeholder="Статьи лора: строки «## Заголовок» начинают новую статью.\n## География\nКонтинент расколот на три королевства...">${esc(p?.lore || "")}</textarea></label>
     <p class="muted">Лор — «библия» мира (история, системы, фракции): подаётся рассказчику через RAG, дополняется в игре. Сохранённый сюжет появится в списке «Мои сюжеты».</p>`, async () => {
     const name = $("pl-name").value.trim();
     const plot = $("pl-plot").value.trim();
@@ -388,6 +389,9 @@ function startLiveBus() {
     es.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);
+        // A11 (аудит 41): откат таймлайна — не «ещё одно сообщение», а сигнал, что весь
+        // локальный лог устарел. Без этой ветки вторая вкладка держала удалённые ходы до F5.
+        if (data && data.type === "rewound") { applyRewound(data); return; }
         if (!data || data.type !== "event" || !data.event) return;
         const e = data.event;
         if (e.seq > (state.seenSeq || 0)) state.seenSeq = +e.seq;
@@ -405,6 +409,37 @@ function startLiveBus() {
 
 function stopLiveBus() {
   if (state.eventSource) { try { state.eventSource.close(); } catch (_) {} state.eventSource = null; }
+}
+
+/* Метка отката на служебной строке перемотки/загрузки (rewind.py: meta.rewound). */
+function isRewoundEvent(e) {
+  return !!(e && e.meta && e.meta.rewound);
+}
+
+/* A11 (аудит 41): мир откатили (⏪ перемотка или 💾 загрузка сохранения) — возможно, из
+ * ДРУГОЙ вкладки. Этот лог устарел целиком: ходы после точки удалены/сокрыты, а новые
+ * события дорисовываются к несуществующему прошлому. Поэтому — полная перезагрузка мира
+ * (тот же путь, что при открытии), а не «догони хвост»: догоном исчезнувшие строки не лечатся.
+ * `rewind.py` публикует `rewound` по шине (вкладки с живой SSE), а запасной путь (поллинг)
+ * читает ту же метку из события — иначе без EventSource сигнал терялся. */
+async function applyRewound(payload) {
+  if (!state.currentWorld) return;
+  const wid = payload && payload.world_id;
+  if (wid && +wid !== +state.currentWorld) return;    // событие чужого мира
+  await reloadWorld();
+}
+
+/* Одна перезагрузка мира «под замком»: вкладка, которая сама дёрнула ⏪/💾, занимает флаг
+ * заранее, иначе шина вернёт ей же её `rewound`, и мир перезагрузится дважды. */
+async function reloadWorld() {
+  if (!state.currentWorld || state.reloading) return false;
+  state.reloading = true;
+  try {
+    await openWorld(state.currentWorld);
+    return true;
+  } catch (_) { /* сеть легла — переподключение SSE/поллинг догонят */
+    return false;
+  } finally { state.reloading = false; }
 }
 
 /* E4 (аудит 38): жива ли SSE-лента — по ней решаем, нужен ли запасной поллинг.
@@ -596,10 +631,22 @@ async function openRewindModal() {
     if (!btn) { alert("Выбери ход из списка."); throw new Error("no-seq"); }
     const seq = btn.dataset.seq;
     if (!confirm(`Точно вернуть мир к ходу ${seq}? Ходы после него будут удалены.`)) throw new Error("cancel");
-    const res = await API(`/api/worlds/${state.currentWorld}/rewind`, {
-      method: "POST", body: JSON.stringify({ seq: +seq, mode: "delete" }),
-    });
-    await openWorld(state.currentWorld);   // перезагрузка лога/состояния/памяти
+    // A5 (аудит 41): сервер может отказать честно (409: по миру идёт ход/↻/другая перемотка).
+    // Молча проглотить это — значит оставить игрока с впечатлением, что «перемотка не работает».
+    state.reloading = true;      // A11: свой же сигнал `rewound` из шины не должен грузить мир дважды
+    let res;
+    try {
+      res = await API(`/api/worlds/${state.currentWorld}/rewind`, {
+        method: "POST", body: JSON.stringify({ seq: +seq, mode: "delete" }),
+      });
+    } catch (err) {
+      state.reloading = false;
+      alert("Перемотка не удалась: " + err.message); throw err;
+    }
+    try {
+      await openWorld(state.currentWorld);   // перезагрузка лога/состояния/памяти
+    } finally { state.reloading = false; }
+    return res;
   });
 }
 
@@ -634,6 +681,17 @@ async function pollEvents() {
     // truncated = догон не влез целиком → пересоединяемся, а не молча теряем сообщения.
     const body = await API(`/api/worlds/${state.currentWorld}/events?since=${state.seenSeq || 0}`);
     const evs = (body && body.events) || [];
+    // A11 (аудит 41): откат без живой SSE-ленты — два носителя одного сигнала:
+    //  (a) служебное событие перемотки/загрузки с меткой meta.rewound — доезжает в hide-режиме,
+    //      где строка отката — самая свежая);
+    //  (b) `latest_seq` сервера меньше нашего курсора — значит хвост лога УДАЛЁН (delete-
+    //      перемотка или ↻ из чужой вкладки), и догоном `?since=` этого не увидеть.
+    // В обоих случаях лог не «догоняем», а перезагружаем целиком.
+    if (evs.some(isRewoundEvent)
+        || (body && body.latest_seq != null && +body.latest_seq < (state.seenSeq || 0))) {
+      await applyRewound(null);
+      return;
+    }
     let maxSeq = state.seenSeq || 0;
     evs.forEach((e) => { if (+e.seq > maxSeq) maxSeq = +e.seq; });
     if (maxSeq > (state.seenSeq || 0)) state.seenSeq = maxSeq;
@@ -705,10 +763,10 @@ async function narratorsModal() {
     </div>
     <hr>
     <h3>Новый рассказчик</h3>
-    <label>Имя <input id="nr-name" placeholder="Мой ведущий"></label>
-    <label>Описание (для списка) <input id="nr-desc" placeholder="Коротко о стиле"></label>
+    <label>Имя <input id="nr-name" maxlength="120" placeholder="Мой ведущий"></label>
+    <label>Описание (для списка) <input id="nr-desc" maxlength="500" placeholder="Коротко о стиле"></label>
     <label>Промпт (персона — как вести игру)
-      <textarea id="nr-prompt" rows="5"
+      <textarea id="nr-prompt" rows="5" maxlength="20000"
         placeholder="Ты — седой бард… (опиши характер и стиль повествования)"></textarea></label>
     <div class="toolbar">
       <button id="btn-nr-save" class="btn small primary">💾 Сохранить</button>
@@ -825,8 +883,8 @@ function renderSetting(s) {
   const needs = Object.entries(p.needs || {});
   const mental = Object.entries(p.mental || {});
   const crit = (v, mx) => Number(v) <= 25 ? " ⚠" : "";
-  if (needs.length) playerRows.push(["🍖 Потребности", needs.map(([k, v]) => `${esc(ucfirst(k))} ${Math.round(Number(v && v.value) || 0)}${crit(v && v.value, v && v.max)}`).join(" · ")]);
-  if (mental.length) playerRows.push(["🧠 Рассудок", mental.map(([k, v]) => `${esc(ucfirst(k))} ${Math.round(Number(v && v.value) || 0)}${crit(v && v.value, v && v.max)}`).join(" · ")]);
+  if (needs.length) playerRows.push(["🍖 Потребности", needs.map(([k, v]) => `${ucfirst(k)} ${Math.round(Number(v && v.value) || 0)}${crit(v && v.value, v && v.max)}`).join(" · ")]);
+  if (mental.length) playerRows.push(["🧠 Рассудок", mental.map(([k, v]) => `${ucfirst(k)} ${Math.round(Number(v && v.value) || 0)}${crit(v && v.value, v && v.max)}`).join(" · ")]);
   // вместимость рюкзака (вес предметов × qty), если есть предметы с весом
   const carryUsed = (p.inventory || []).reduce((a, i) => a + (Number(i.weight) || 0) * (i.qty || 1), 0);
   if (carryUsed > 0) {
@@ -890,7 +948,7 @@ function renderSetting(s) {
       const skHtml = skills.map(([n, sk], si) => {
         if (sk && typeof sk === "object") {
           const d = sk.desc ? trunc(sk.desc, 100) : "";
-          return `<li class="item-clickable" data-click="showSkill" data-arg="${numAttr(si)}" title="${esc(sk.desc || "")}">${esc(ucfirst(n))} (ранг ${esc(sk.rank || "F")}${sk.kind ? ", " + esc(ucfirst(sk.kind)) : ""})${d ? `<small>${esc(d)}</small>` : ""}</li>`;
+          return `<li class="item-clickable" data-click="showSkill" data-arg="${numAttr(si)}" title="${esc(sk.desc || "")}">${esc(ucfirst(n))} (ранг ${esc(sk.rank || "F")}${sk.kind ? ", " + esc(ucfirst(sk.kind)) : ""})${d ? `<small>${d}</small>` : ""}</li>`;
         }
         return `<li class="item-clickable" data-click="showSkill" data-arg="${numAttr(si)}">${esc(ucfirst(n))} ур.${esc(sk)}</li>`;
       }).join("");
@@ -903,7 +961,7 @@ function renderSetting(s) {
     if (abil.length) {
       const abHtml = abil.map(([n, ab], ai) => {
         const school = ab.school ? ` [${esc(ab.school)}]` : "";
-        const cost = ab.cost ? ` <small>энергия ${ab.cost}</small>` : "";
+        const cost = ab.cost ? ` <small>энергия ${esc(ab.cost)}</small>` : "";
         const d = ab.desc ? ` — ${trunc(ab.desc, 100)}` : "";
         return `<li class="item-clickable" data-click="showAbility" data-arg="${numAttr(ai)}" title="${esc(ab.desc || "")}">${esc(ucfirst(n))}${school}${cost}<small>${d}</small></li>`;
       }).join("");
@@ -950,30 +1008,30 @@ function renderSetting(s) {
       });
     });
   })();
-  $("stats-kv").innerHTML = kv(Object.entries(effStats).map(([k, v]) => [ucfirst(k), statMods[k] ? `${v}<em class="mod">(${statMods[k] > 0 ? "+" : ""}${statMods[k]})</em>` : v]))
+  $("stats-kv").innerHTML = kvHtml(Object.entries(effStats).map(([k, v]) => [ucfirst(k), statMods[k] ? `${v}<em class="mod">(${statMods[k] > 0 ? "+" : ""}${statMods[k]})</em>` : v]))
     + (anyMod ? `<p class="muted">Характеристики — с учётом модов эффектов.</p>` : ``) || `<div>—</div><b>?</b>`;
   $("effects-list").innerHTML = Object.entries(p.effects || {}).map(([name, ef], ei) => {
     ef = ef || {};
     // id-подобные имена (chill_resonance) → читабельно
     let label = String(name || "");
     if (/^[A-Za-z0-9_\-]+$/.test(label)) label = (label.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) || label).slice(0, 60);
-    const t = (ef.turns === undefined || ef.turns === null || ef.turns === -1) ? "постоянно" : `${ef.turns} ход.`;
+    const t = (ef.turns === undefined || ef.turns === null || ef.turns === -1) ? "постоянно" : `${esc(ef.turns)} ход.`;
     const kind = ef.kind ? `, ${esc(ef.kind)}` : "";
     let tick = "";
-    if (ef.damage) tick += ` −${ef.damage} HP/ход`;
-    if (ef.heal) tick += ` +${ef.heal} HP/ход`;
-    if (ef.mp_damage) tick += ` −${ef.mp_damage} MP/ход`;
-    if (ef.mp_heal) tick += ` +${ef.mp_heal} MP/ход`;
-    if ((ef.stacks || 1) > 1) tick += ` ×${ef.stacks}`;
+    if (ef.damage) tick += ` −${esc(ef.damage)} HP/ход`;
+    if (ef.heal) tick += ` +${esc(ef.heal)} HP/ход`;
+    if (ef.mp_damage) tick += ` −${esc(ef.mp_damage)} MP/ход`;
+    if (ef.mp_heal) tick += ` +${esc(ef.mp_heal)} MP/ход`;
+    if ((ef.stacks || 1) > 1) tick += ` ×${esc(ef.stacks)}`;
     const mods = ef.mods || {};
     if (Object.keys(mods).length) tick += ` (моды: ${Object.entries(mods).map(([k, v]) => `${esc(k)}${v > 0 ? "+" : ""}${v}`).join(", ")})`;
     const desc = ef.desc ? trunc(ef.desc, 120) : "";
     const cls = ((ef.damage || 0) + (ef.mp_damage || 0)) > 0 ? " bad" : ((ef.heal || 0) + (ef.mp_heal || 0)) > 0 ? " good" : "";
-    return `<li class="eff${cls} item-clickable" data-click="showEffect" data-arg="${numAttr(ei)}" title="${esc(ef.desc || "")}">${esc(label)}<small>${desc ? esc(desc) + " " : ""}(${t}${kind}${tick})</small></li>`;
+    return `<li class="eff${cls} item-clickable" data-click="showEffect" data-arg="${numAttr(ei)}" title="${esc(ef.desc || "")}">${esc(label)}<small>${desc ? desc + " " : ""}(${t}${kind}${tick})</small></li>`;
   }).join("") || `<li>нет</li>`;
   $("inventory").innerHTML = (p.inventory || []).map((i, idx) =>
-    `<li class="item-clickable" data-click="showItem" data-arg="${numAttr(idx)}" title="${esc(i.desc || "нет описания")}">${esc(i.name)} ×${i.qty || 1}` + (i.desc ? `<small>${trunc(i.desc, 60)}</small>` : ``)
-    + (i.value ? ` <em class="val">🪙${i.value}</em>` : ``)
+    `<li class="item-clickable" data-click="showItem" data-arg="${numAttr(idx)}" title="${esc(i.desc || "нет описания")}">${esc(i.name)} ×${esc(i.qty || 1)}` + (i.desc ? `<small>${trunc(i.desc, 60)}</small>` : ``)
+    + (i.value ? ` <em class="val">🪙${esc(i.value)}</em>` : ``)
     + (i.weight ? ` <em class="val">${Number(i.weight)}кг</em>` : ``) + `</li>`).join("") || `<li>пусто</li>`;
   const invSell = (p.inventory || []).reduce((a, i) => a + (Number(i.value) || 0) * (i.qty || 1), 0);
   if (invSell > 0) $("inventory-title").innerHTML = "🧰 Инвентарь <small class=\"muted\">(продать ≈ " + invSell + "🪙)</small>";
@@ -1004,14 +1062,14 @@ function renderSetting(s) {
     + (locDesc ? `<div class="loc-desc">${esc(locDesc).replace(/\n/g, "<br>")}</div>` : `<div class="muted">Описание отсутствует.</div>`)
     + (locConn.length ? `<div class="loc-links"><span class="muted">Рядом:</span> ${locConn.map((c) => esc(c)).join(", ")}</div>` : "")
     + (locStations.length ? `<div class="loc-links"><span class="muted">🔧 Станции:</span> ${locStations.map((x) => esc(x)).join(", ")}</div>` : "")
-    + (loc.effects && loc.effects.length ? `<div class="loc-links zone"><span class="muted">🌫 Зоны:</span> ${loc.effects.map((fx) => esc(fx.name || "") + (fx.damage ? ` −${fx.damage} HP/ход` : "")).join(", ")}</div>` : "")
+    + (loc.effects && loc.effects.length ? `<div class="loc-links zone"><span class="muted">🌫 Зоны:</span> ${loc.effects.map((fx) => esc(fx.name || "") + (fx.damage ? ` −${esc(fx.damage)} HP/ход` : "")).join(", ")}</div>` : "")
     + `</div>`;
   // ⏳ Таймеры мира и 📜 доска (сессия 32)
   const timers = Object.entries(s.timers || {});
   if (timers.length) {
     $("timers-list").innerHTML = timers.map(([name, t]) => {
       const tl = t && t.turns_left;
-      const dur = (tl === undefined || tl === null || tl === -1 || tl === "∞") ? "без срока" : `${tl} ход.`;
+      const dur = (tl === undefined || tl === null || tl === -1 || tl === "∞") ? "без срока" : `${esc(tl)} ход.`;
       return `<li>⏳ ${esc(name)} <small>(${dur})</small>${t && t.desc ? ` <small class="desc">— ${esc(t.desc)}</small>` : ""}</li>`;
     }).join("") || `<li>нет</li>`;
   } else {
@@ -1019,7 +1077,7 @@ function renderSetting(s) {
   }
   const board = (s.board || []);
   if (board.length) {
-    $("board-list").innerHTML = board.slice(-8).map((b) => `<li>📜 <b>${esc(b.title || "")}</b>${b.text ? ` — ${esc(trunc(b.text, 140))}` : ""}</li>`).join("");
+    $("board-list").innerHTML = board.slice(-8).map((b) => `<li>📜 <b>${esc(b.title || "")}</b>${b.text ? ` — ${trunc(b.text, 140)}` : ""}</li>`).join("");
   } else {
     $("board-list").innerHTML = `<li class="muted">пусто</li>`;
   }
@@ -1028,7 +1086,7 @@ function renderSetting(s) {
   if (Array.isArray(visions) && visions.length) {
     $("visions-list").innerHTML = visions.slice(-5).map((v) => {
       const hint = (v && v.hint) || (v && v.text) || "";
-      return `<li>🌙 ${esc(trunc(String(hint), 100))}</li>`;
+      return `<li>🌙 ${trunc(String(hint), 100)}</li>`;
     }).join("");
   } else {
     $("visions-list").innerHTML = `<li class="muted">нет</li>`;
@@ -1046,16 +1104,16 @@ function renderSetting(s) {
   // крафт: помечаем «гот needs» и вовсе недоступные (нет станции/профессии/ингредиентов)
   $("crafts-list").innerHTML = Object.entries(s.crafts || {}).map(([k, c]) => {
     const res = c.result || {};
-    const ing = (c.ingredients || []).map(i => `${esc(i.name)} ×${i.qty}`).join(", ");
+    const ing = (c.ingredients || []).map(i => `${esc(i.name)} ×${esc(i.qty)}`).join(", ");
     let req = "";
     if (c.station) req += ` <small>🔧 ${esc(Array.isArray(c.station) ? c.station.join(", ") : c.station)}</small>`;
     if (c.profession) req += ` <small>⚒ ${esc(c.profession)}</small>`;
     const ready = craftReady(s, c);
     const icon = ready ? `<em class="val">✓</em>` : `<em class="val bad">✗</em>`;
-    return `<li class="item-clickable" data-click="showCraft" data-arg="${attrArg(k)}">${c.desc ? `<small class="desc">${trunc(c.desc, 80)}</small>` : ``}<b>${esc(c.name || k)}</b> → ${esc(res.name || "?")} ×${res.qty || 1} ${icon}${req}<small>${esc(ing || "без вложений")}</small></li>`;
+    return `<li class="item-clickable" data-click="showCraft" data-arg="${attrArg(k)}">${c.desc ? `<small class="desc">${trunc(c.desc, 80)}</small>` : ``}<b>${esc(c.name || k)}</b> → ${esc(res.name || "?")} ×${esc(res.qty || 1)} ${icon}${req}<small>${esc(ing || "без вложений")}</small></li>`;
   }).join("") || `<li>нет</li>`;
   $("enemies").innerHTML = Object.entries(s.enemies || {}).map(([k, e]) =>
-    `<li class="item-clickable" data-click="showEnemy" data-arg="${attrArg(k)}">${e.desc ? `<small class="desc">${trunc(e.desc, 80)}</small>` : ``}⚔ ${esc(e.name)} — HP ${e.hp}/${e.max_hp}${e.money ? ` <em class="val">🪙${e.money}</em>` : ``}</li>`).join("") || `<li>нет</li>`;
+    `<li class="item-clickable" data-click="showEnemy" data-arg="${attrArg(k)}">${e.desc ? `<small class="desc">${trunc(e.desc, 80)}</small>` : ``}⚔ ${esc(e.name)} — HP ${esc(e.hp)}/${esc(e.max_hp)}${e.money ? ` <em class="val">🪙${esc(e.money)}</em>` : ``}</li>`).join("") || `<li>нет</li>`;
   // Сессия 40, п.13: игрок — не NPC (в мире №103 он стоял в этом списке рядом с
   // торговцем). Своё состояние он видит вверху сайдбара. Так же как и движок
   // (mechanics.is_player_npc), отсеиваем запись по ключу или имени «Игрок».
@@ -1084,7 +1142,7 @@ function renderSetting(s) {
     return `<li class="item-clickable" data-click="showNpc" data-arg="${attrArg(k)}">${n.alive === false ? "🪦 " : "🗣 "}${esc(n.name)} (${trunc(n.mood || n.desc || "", 40)}${n.faction ? ", " + esc(factionName(n.faction)) : ""}${n.money ? ", 🪙" + esc(n.money) : ""})${sch}</li>`;
   }).join("") || `<li>нет</li>`;
   $("companions-list").innerHTML = Object.entries(s.companions || {}).map(([k, c]) =>
-    `<li class="item-clickable" data-click="showCompanion" data-arg="${attrArg(k)}">${c.hp <= 0 ? "💀 " : "🤝 "}<b>${esc(c.name || k)}</b> ⚔ ${c.hp}/${c.max_hp || c.hp} Lv${c.level || 1}${c.loyalty ? ` · верность ${esc(c.loyalty)}` : ""}<small>${trunc(c.desc, 80)}</small></li>`).join("") || `<li>нет</li>`;
+    `<li class="item-clickable" data-click="showCompanion" data-arg="${attrArg(k)}">${c.hp <= 0 ? "💀 " : "🤝 "}<b>${esc(c.name || k)}</b> ⚔ ${esc(c.hp)}/${esc(c.max_hp || c.hp)} Lv${esc(c.level || 1)}${c.loyalty ? ` · верность ${esc(c.loyalty)}` : ""}<small>${trunc(c.desc, 80)}</small></li>`).join("") || `<li>нет</li>`;
   $("flags").innerHTML = Object.entries(s.flags || {}).map(([k, v], fi) =>
     `<span class="item-clickable flag-pill" data-click="showFlag" data-arg="${numAttr(fi)}" title="${esc(k)}=${esc(JSON.stringify(v))}">🚩 ${esc(flagLabel(k))}: ${flagWord(v)}</span>`).join("") || `<span class="flags-none">нет</span>`;
   // E8 (аудит 38): у подсказки про флаги теперь есть смысл — она прячется, когда флагов
@@ -1316,8 +1374,11 @@ function renderMap() {
       const anc = anchor[n.id]; if (!anc || !pos[anc]) return;
       const x = pos[anc].x + 18, y = pos[anc].y + 10;
       const icon = mkIcon[n.kind] || n.kind.slice(0, 1);
+      // A2 (аудит 41): kind узла приходит из графа мира (его рисует мастер/импорт) —
+      // в class-атрибут он обязан попадать экранированным.
+      const nkCls = esc(String(n.kind || ""));
       const desc = (n.data && n.data.desc) ? (" " + n.data.desc) : "";
-      markers += `<g class="node marker m-${n.kind}" data-id="${esc(n.id)}" data-name="${esc(n.label || n.id)}">`;
+      markers += `<g class="node marker m-${nkCls}" data-id="${esc(n.id)}" data-name="${esc(n.label || n.id)}">`;
       markers += `<title>${esc(n.label || n.id)}${esc(desc)}</title>`;
       markers += `<circle cx="${x}" cy="${y}" r="6"/>`;
       markers += `<text class="mkin" x="${x}" y="${y+3}">${icon}</text>`;
@@ -1445,7 +1506,9 @@ function renderSuggestionBar() {
     if (!sug.some((x) => x.a === a && x.t === t)) sug.push({ t, a });
   };
   const render = (label) => {
-    bar.innerHTML = `<span class="sug-label">${label}</span>` +
+    // A2 (аудит 41): ярлык тоже экранируем — пока вызывается константами, но пусть
+    // шаблон не будет дырявым по умолчанию.
+    bar.innerHTML = `<span class="sug-label">${esc(label)}</span>` +
       sug.map((x) => `<button class="btn small sug" data-a="${esc(x.a)}">${esc(x.t)}</button>`).join("");
     bar.style.display = "";
     bar.querySelectorAll(".sug").forEach((b) => {
@@ -1558,10 +1621,11 @@ function handleDivine(res, typer) {
 }
 
 // Человекочитаемая передача значения флага для обычного игрока
+// A2 (аудит 41): значение флага задаёт мастер/модель (в т.ч. строкой) — экранируем.
 function flagWord(v) {
   if (v === true) return "да";
   if (v === false) return "нет";
-  return JSON.stringify(v);
+  return esc(JSON.stringify(v));
 }
 
 // Человекочитаемое имя фракции по id (если фракция есть в состоянии) — иначе сам id
@@ -1596,7 +1660,11 @@ function flagLabel(k) {
   return s ? ucfirst(s) : k;
 }
 
-const kv = (rows) => rows.map(([k, v]) => `<div>${k}</div><b>${v}</b>`).join("");
+// kv — пары «метка → значение» для сайдбара. A2 (аудит 41): значения пишет мастер
+// (директивы time/weather) или модель, поэтому kv экранирует ОБА поля. Куда нужен
+// намеренный HTML (например `<em class="mod">` у модов характеристик) — kvHtml.
+const kv = (rows) => rows.map(([k, v]) => `<div>${esc(k)}</div><b>${esc(v)}</b>`).join("");
+const kvHtml = (rows) => rows.map(([k, v]) => `<div>${esc(k)}</div><b>${v}</b>`).join("");
 
 /* ─────────────── Блок «Персонаж» (справочники и помощники) ─────────────── */
 const CHARACTER_RACE_DESC = {
@@ -1681,16 +1749,27 @@ function repStanding(v) {
   return "Союзник";
 }
 function charRow(label, value) {
-  return value ? `<div class="char-row"><span class="char-label">${label}</span><span class="char-value">${value}</span></div>` : "";
+  // A2 (аудит 41): label — текст из мира, value —разметка, собранная вызывающим
+  // (там каждый фрагмент уже прошёл через esc/trunc). Подписываемся явно:
+  // вызывать только с экранированными частями.
+  return value ? `<div class="char-row"><span class="char-label">${esc(label)}</span><span class="char-value">${value}</span></div>` : "";
 }
 // Обрезка длинного описания по границе слова с многоточием (не режем на полуслове).
+// A2 (аудит 41): trunc ЭКРАНИРУЕТ результат. Все описания/имена в мире пишет LLM или
+// приносит импорт дампа, и они попадают в innerHTML-шаблоны — раньше `trunc(i.desc, 60)`
+// отдавал сырую строку, и `<img src=x onerror=…>` в описании предмета выполнялся во вкладке
+// игрока. Экранирование «внутри» надёжнее дисциплины «не забудь esc»: новый вызов
+// trunc() безопасен по умолчанию. НЕ оборачивать результат в esc повторно (двойное экранирование).
 function trunc(s, n) {
   s = String(s == null ? "" : s);
-  if (s.length <= n) return s;
-  let cut = s.slice(0, n - 1);
-  const sp = cut.lastIndexOf(" ");
-  if (sp > Math.floor(n / 2)) cut = cut.slice(0, sp);
-  return cut.replace(/\s+$/, "") + "…";
+  let cut = s;
+  if (s.length > n) {
+    cut = s.slice(0, Math.max(1, n - 1));
+    const sp = cut.lastIndexOf(" ");
+    if (sp > Math.floor(n / 2)) cut = cut.slice(0, sp);
+    cut = cut.replace(/\s+$/, "") + "…";
+  }
+  return esc(cut);
 }
 // Универсальные справки крафта (только отображение — решает мастер)
 function stationList() {
@@ -1733,8 +1812,8 @@ function showItem(idx) {
     ? ` · Бонусы: ${Object.entries(it.bonus).map(([k, v]) => `${esc(ucfirst(k))}${v > 0 ? "+" : ""}${v}`).join(", ")}`
     : "";
   openModal("🧰 " + (it.name || "Предмет"),
-    `<p class="item-big">${esc(it.name)} ×${it.qty || 1}</p>` +
-    `<p class="muted">${it.weight ? `Вес ${Number(it.weight)} кг` : "Невесомое"}${it.value ? ` · Продажа 🪙${it.value}` : ""}${slotTxt}${bonusTxt}</p>` +
+    `<p class="item-big">${esc(it.name)} ×${esc(it.qty || 1)}</p>` +
+    `<p class="muted">${it.weight ? `Вес ${Number(it.weight)} кг` : "Невесомое"}${it.value ? ` · Продажа 🪙${esc(it.value)}` : ""}${slotTxt}${bonusTxt}</p>` +
     (it.desc ? `<p class="item-full-desc">${esc(it.desc)}</p>` : `<p class="muted">Описание отсутствует.</p>`),
     () => {});
 }
@@ -1787,13 +1866,13 @@ function showEffect(idx) {
   const [name, ef] = en;
   let label = String(name || "");
   if (/^[A-Za-z0-9_\-]+$/.test(label)) label = (label.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) || label);
-  const t = (ef.turns === undefined || ef.turns === null || ef.turns === -1) ? "постоянно" : `${ef.turns} ход.`;
+  const t = (ef.turns === undefined || ef.turns === null || ef.turns === -1) ? "постоянно" : `${esc(ef.turns)} ход.`;
   let meta = `${esc(ef.kind ? ucfirst(ef.kind) : "особый")} · ${t}`;
-  if (ef.damage) meta += ` · −${ef.damage} HP/ход`;
-  if (ef.heal) meta += ` · +${ef.heal} HP/ход`;
-  if (ef.mp_damage) meta += ` · −${ef.mp_damage} MP/ход`;
-  if (ef.mp_heal) meta += ` · +${ef.mp_heal} MP/ход`;
-  if ((ef.stacks || 1) > 1) meta += ` · ×${ef.stacks}`;
+  if (ef.damage) meta += ` · −${esc(ef.damage)} HP/ход`;
+  if (ef.heal) meta += ` · +${esc(ef.heal)} HP/ход`;
+  if (ef.mp_damage) meta += ` · −${esc(ef.mp_damage)} MP/ход`;
+  if (ef.mp_heal) meta += ` · +${esc(ef.mp_heal)} MP/ход`;
+  if ((ef.stacks || 1) > 1) meta += ` · ×${esc(ef.stacks)}`;
   const mods = ef.mods || {};
   if (Object.keys(mods).length) meta += ` · моды: ${Object.entries(mods).map(([k, v]) => `${esc(k)}${v > 0 ? "+" : ""}${v}`).join(", ")}`;
   openModal("⏳ " + label,
@@ -1857,7 +1936,7 @@ function showCompanion(key) {
   const c = comps[key];
   if (!c) return;
   let rows = `<p class="item-big">${esc(c.name || key)} ${c.hp <= 0 ? "💀" : "🤝"}</p>`;
-  rows += `<p class="muted">⚔ HP ${c.hp}/${c.max_hp || c.hp} · Lv${c.level || 1}${c.loyalty ? ` · верность ${esc(c.loyalty)}` : ""}${c.faction ? ` · ${esc(c.faction)}` : ""}</p>`;
+  rows += `<p class="muted">⚔ HP ${c.hp}/${c.max_hp || c.hp} · Lv${esc(c.level || 1)}${c.loyalty ? ` · верность ${esc(c.loyalty)}` : ""}${c.faction ? ` · ${esc(c.faction)}` : ""}</p>`;
   const skills = c.skills || {};
   if (Object.keys(skills).length) rows += `<p class="muted">Навыки:</p><ul class="list">` + Object.entries(skills).map(([sn, sv]) =>
     `<li>${esc(sn)}<small>${sv && typeof sv === "object" ? ` (ранг ${esc(sv.rank || "F")})` : ""}</small></li>`).join("") + `</ul>`;
@@ -1873,8 +1952,8 @@ function showShop(key) {
   if (sh.faction) rows += `<p><span class="muted">Фракция:</span> ${esc(factionName(sh.faction))}</p>`;
   rows += (sh.desc ? `<p class="item-full-desc">${esc(sh.desc)}</p>` : ``);
   rows += `<p class="muted">Товары:</p><ul class="list">` + (sh.items || []).map((i) =>
-    `<li>${esc(i.name)} — ${i.price}🪙 ×${i.qty || 1}`
-    + (i.value ? ` <small title="продажа">🪙${i.value}</small>` : ``)
+    `<li>${esc(i.name)} — ${esc(i.price)}🪙 ×${esc(i.qty || 1)}`
+    + (i.value ? ` <small title="продажа">🪙${esc(i.value)}</small>` : ``)
     + (i.weight ? ` <small>${Number(i.weight)}кг</small>` : ``)
     + (i.desc ? `<small> ${esc(i.desc)}</small>` : ``) + `</li>`
   ).join("") + `</ul>`;
@@ -1890,10 +1969,10 @@ function showCraft(key) {
   const res = c.result || {};
   let rows = `<p class="item-big">${esc(c.name || key)}</p>`;
   rows += `<p class="muted">Ингредиенты:</p><ul class="list">` + (c.ingredients || []).map((i) =>
-    `<li>${esc(i.name)} ×${i.qty}</li>`).join("") + `</ul>`;
-  rows += `<p><b>Результат:</b> ${esc(res.name || "?")} ×${res.qty || 1}`
+    `<li>${esc(i.name)} ×${esc(i.qty)}</li>`).join("") + `</ul>`;
+  rows += `<p><b>Результат:</b> ${esc(res.name || "?")} ×${esc(res.qty || 1)}`
     + (res.weight ? ` <small>${Number(res.weight)}кг</small>` : ``)
-    + (res.value ? ` <small>🪙${res.value}</small>` : ``)
+    + (res.value ? ` <small>🪙${esc(res.value)}</small>` : ``)
     + (res.desc ? `<small> — ${esc(res.desc)}</small>` : ``) + `</p>`;
   let req = "";
   if (c.station) {
@@ -1912,7 +1991,7 @@ function showEnemy(key) {
   const e = enemies[key];
   if (!e) return;
   let rows = `<p class="item-big">⚔ ${esc(e.name || key)}</p>`;
-  rows += `<p class="muted">HP ${e.hp}/${e.max_hp || e.hp}${e.dmg ? ` · урон ${e.dmg}` : ""}${e.money ? ` · 🪙${e.money}` : ""}</p>`;
+  rows += `<p class="muted">HP ${esc(e.hp)}/${esc(e.max_hp || e.hp)}${e.dmg ? ` · урон ${esc(e.dmg)}` : ""}${e.money ? ` · 🪙${esc(e.money)}` : ""}</p>`;
   rows += (e.desc ? `<p class="item-full-desc">${esc(e.desc)}</p>` : `<p class="muted">Описание врага отсутствует.</p>`);
   openModal("⚔ " + (e.name || "Враг"), rows, () => {});
 }
@@ -2088,6 +2167,11 @@ function appendMsg(e, scroll = true) {
 /* ─── Пагинация лога: подгрузка более ранних событий ─── */
 let logPagerBtn = null;
 
+// A8 (аудит 41): размер страницы раннего лога — одна величина на фронт и на проверку
+// тестом; обязана влезать в серверный потолок страницы (db.HISTORY_PAGE_MAX), иначе
+// бэкенд подрежет страницу молча (truncated=True на каждой кнопке).
+const LOG_PAGE_SIZE = 50;
+
 function showLogPager(show) {
   if (!logPagerBtn) {
     logPagerBtn = document.createElement("div");
@@ -2109,7 +2193,10 @@ async function loadEarlier() {
   const btn = $("btn-load-earlier");
   if (btn) { btn.disabled = true; btn.textContent = "⏳ Загрузка…"; }
   try {
-    const evs = await API(`/api/worlds/${state.currentWorld}/history?before=${state.logMinSeq || 0}&limit=50`);
+    const body = await API(`/api/worlds/${state.currentWorld}/history?before=${state.logMinSeq || 0}&limit=${LOG_PAGE_SIZE}`);
+    // A8 (аудит 41): /history больше не «весь лог списком», а страница {events, truncated}.
+    // Голый массив тоже принимается — иначе любой ответ старой формы рухил бы пагинацию.
+    const evs = Array.isArray(body) ? body : (body && body.events) || [];
     const older = evs.filter((e) => e.seq < (state.logMinSeq || Infinity));
     if (!older.length) {
       showLogPager(false);   // больше ранних событий нет
@@ -2609,23 +2696,26 @@ async function loadEntities() {
     try { meta = JSON.parse(e.meta || "{}"); } catch (_) {}
     return `<div class="entity-card">
       <div class="e-head"><span class="e-name">${esc(e.name)}</span>
-        <span class="e-kind">${KIND[e.kind] || e.kind}${meta.alive === false ? " · 🪦" : ""}</span></div>
+        <span class="e-kind">${esc(KIND[e.kind] || e.kind)}${meta.alive === false ? " · 🪦" : ""}</span></div>
       ${e.summary ? `<div class="e-sum">${esc(e.summary)}</div>` : ""}
       ${e.relationship ? `<div class="e-rel">💗 ${esc(e.relationship)}</div>` : ""}
       ${e.bio ? `<div class="e-bio">${esc(e.bio)}</div>` : ""}
       <div class="e-actions">
-        <button class="btn small" data-eid="${esc(e.entity_key)}" data-kind="${e.kind}" data-act="edit">✎ Править</button>
-        <button class="btn small" data-eid="${esc(e.entity_key)}" data-kind="${e.kind}" data-act="del">Удалить</button>
+        <button class="btn small" data-eid="${attrArg(e.entity_key)}" data-kind="${attrArg(e.kind)}" data-act="edit">✎ Править</button>
+        <button class="btn small" data-eid="${attrArg(e.entity_key)}" data-kind="${attrArg(e.kind)}" data-act="del">Удалить</button>
       </div>
     </div>`;
   }).join("") || `<p class="muted">Карточек пока нет — они появятся автоматически по мере игры.</p>`;
   list.querySelectorAll("[data-act]").forEach((b) => {
     b.onclick = () => {
       const k = b.dataset.kind, id = b.dataset.eid;
+      // kind/key приходят от мастера и из импортированного дампа — в URL их гоним кодированными,
+      // иначе «../» или слэш в ключах меняет адрес запроса.
+      const seg = (x) => encodeURIComponent(String(x ?? ""));
       if (b.dataset.act === "del" && confirm("Удалить карточку?")) {
-        API(`/api/worlds/${state.currentWorld}/entities/${k}/${id}`, { method: "DELETE" }).then(loadEntities);
+        API(`/api/worlds/${state.currentWorld}/entities/${seg(k)}/${seg(id)}`, { method: "DELETE" }).then(loadEntities);
       } else if (b.dataset.act === "edit") {
-        API(`/api/worlds/${state.currentWorld}/entities/${k}/${id}`).then(editEntityModal);
+        API(`/api/worlds/${state.currentWorld}/entities/${seg(k)}/${seg(id)}`).then(editEntityModal);
       }
     };
   });
@@ -2668,7 +2758,7 @@ function editEntityModal(e) {
       meta,
     };
     const path = e.id
-      ? `/api/worlds/${state.currentWorld}/entities/${e.kind}/${e.entity_key}`
+      ? `/api/worlds/${state.currentWorld}/entities/${encodeURIComponent(e.kind)}/${encodeURIComponent(e.entity_key)}`
       : `/api/worlds/${state.currentWorld}/entities`;
     await API(path, { method: e.id ? "PATCH" : "POST", body: JSON.stringify(payload) });
     loadEntities();
@@ -2716,14 +2806,14 @@ async function loadLore() {
 
 function editLoreModal(e) {
   const body = e
-    ? `<label>Заголовок <input id="le-title" value="${esc(e.title)}"></label>
-       <label>Теги (через запятую) <input id="le-tags" value="${esc(e.tags || "")}" placeholder="география, магия, фракции"></label>
+    ? `<label>Заголовок <input id="le-title" maxlength="200" value="${esc(e.title)}"></label>
+       <label>Теги (через запятую) <input id="le-tags" maxlength="500" value="${esc(e.tags || "")}" placeholder="география, магия, фракции"></label>
        <label class="check"><input type="checkbox" id="le-core" ${e.is_core ? "checked" : ""}> ⭐ Якорная статья — всегда даётся рассказчику (сжато)</label>
-       <label>Текст лора <textarea id="le-content" rows="10">${esc(e.content || "")}</textarea></label>`
-    : `<label>Заголовок <input id="le-title" placeholder="География мира"></label>
-       <label>Теги (через запятую) <input id="le-tags" placeholder="география, магия, фракции"></label>
+       <label>Текст лора <textarea id="le-content" rows="10" maxlength="200000">${esc(e.content || "")}</textarea></label>`
+    : `<label>Заголовок <input id="le-title" maxlength="200" placeholder="География мира"></label>
+       <label>Теги (через запятую) <input id="le-tags" maxlength="500" placeholder="география, магия, фракции"></label>
        <label class="check"><input type="checkbox" id="le-core"> ⭐ Якорная статья — всегда даётся рассказчику (сжато)</label>
-       <label>Текст лора <textarea id="le-content" rows="10" placeholder="История, системы, имена, правила мира… Может быть очень длинным — в промпт попадёт релевантное через RAG."></textarea></label>`;
+       <label>Текст лора <textarea id="le-content" rows="10" maxlength="200000" placeholder="История, системы, имена, правила мира… Может быть очень длинным — в промпт попадёт релевантное через RAG."></textarea></label>`;
   openModal(e ? "Правка статьи лора" : "Новая статья лора", body, async () => {
     const title = $("le-title").value.trim();
     const content = $("le-content").value.trim();
@@ -2782,7 +2872,9 @@ async function loadSaves() {
         await API(`/api/worlds/${state.currentWorld}/saves/${id}`, { method: "DELETE" });
         loadSaves();
       } else if (b.dataset.act === "load") {
-        await loadSaveSlot(id);
+        try {
+          await loadSaveSlot(id);
+        } catch (err) { alert("Загрузка сохранения не удалась: " + err.message); }
       }
     };
   });
@@ -2839,16 +2931,16 @@ function bindSaveDnD(list) {
 }
 
 async function loadSaveSlot(id) {
-  const res = await API(`/api/worlds/${state.currentWorld}/saves/${id}/load`, { method: "POST" });
-  state.setting = res.setting;
-  renderSetting(res.setting);
-  const d = await API(`/api/worlds/${state.currentWorld}`);
-  $("log").innerHTML = "";
-  d.recent.forEach((e) => appendMsg(e, false));
-  state.seenSeq = 0;
-  d.recent.forEach((e) => { if (e.seq) state.seenSeq = Math.max(state.seenSeq, +e.seq); });
-  requestAnimationFrame(() => { $("log").scrollTop = $("log").scrollHeight; });
-  loadEntities();
+  // A11 (аудит 41): загрузка сохранения — тот же откат таймлайна, что и ⏪: поднимаем
+  // «замок» на время своих запросов, чтобы ответный `rewound` из шины не перезагрузил мир следом.
+  state.reloading = true;
+  try {
+    const res = await API(`/api/worlds/${state.currentWorld}/saves/${id}/load`, { method: "POST" });
+    state.setting = res.setting;
+    renderSetting(res.setting);
+    await openWorld(state.currentWorld);
+    return res;
+  } finally { state.reloading = false; }
 }
 
 /* ─────────────── Настройки ─────────────── */
@@ -2999,7 +3091,7 @@ async function refreshStatus() {
   try {
     const s = await API("/api/system/status");
     const parts = [];
-    if (s.llm.up) parts.push(`🧠 LLM ✓ (${s.llm.base_url.replace("http://", "")})`);
+    if (s.llm.up) parts.push(`🧠 LLM ✓ (${s.llm.base_url.replace("http://", "")})` + (s.llm.needs_key ? " · ключ не принят (401)" : ""));
     else parts.push("🧠 LLM ✗");
     if (s.chroma.up) parts.push(`🗄 Память ✓ (${s.chroma.chunks} чанков)`);
     else parts.push("🗄 Память ✗ (запусти start_chroma.bat)");

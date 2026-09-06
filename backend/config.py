@@ -2,11 +2,13 @@
 """Конфигурация игры: читает .env из корня проекта (переопределяется env процесса)."""
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import admin_settings
+from .logsetup import log_once
 
 ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT / ".env"
@@ -45,6 +47,196 @@ DEFAULT_PROVIDER_ID: dict[str, str] = {"main": "llamacpp", "embedding": "routera
 # маска для секретов при выводе в UI/логи
 KEY_MASK = "••••••••"
 
+# ══════════════════════════════════════════════════════
+# Границы числовых настроек (A9, аудит 41)
+# ══════════════════════════════════════════════════════
+# Раньше «кривое» число проходило насквозь: валидация была только «int()/float() упадёт
+# → дефолт» (config.it/flt), а диапазонов не было ни в .env, ни в админке, ни в настройках
+# мира. Итог: `MAX_TOKENS=0` или `LLM_TIMEOUT=0.01` валились уже МОДЕЛИ на КАЖДОМ ходу, а
+# чинились только повторной правкой настроек.
+# ONE source of truth — этот словарь; он применяется:
+#   * в `Config.load` (env процесса → админка → .env — все три источника разом),
+#   * в `logsetup` (ротор журнала настраивается до первого конфига и читает env напрямую),
+#   * в per-world настройках (`routers/core.py::clamp_gen_settings`, там же и при ЧТЕНИИ —
+#     старые/импортированные миры с кривым gen_settings перестают ломать ходы).
+# Нижняя граница TURN_SNAPSHOT_KEEP = 10: точка перемотки, которой почти нет, бесполезна
+# так же, как её отсутствие (1–9 снапшотов = «назад» работает на пару ходов и молча
+# умирает дальше). «Хранить все» при этом остаётся законным 0 — см. NUM_ZERO_KEYS.
+# Подрезка всегда пишется в журнал (правило 14) — тихой правки нет.
+# Числа вне реестра (порты, размерности эмбеддингов) не трогаются: реестр пополняется
+# осознанно, а не «на всякий».
+NUM_RANGES: dict[str, tuple[float, float]] = {
+    # генерация (те же границы у per-world значений — см. GEN_LIMIT_KEYS)
+    "DEFAULT_TEMP": (0.0, 2.0),
+    "DEFAULT_TOP_P": (0.0, 1.0),
+    "MAX_TOKENS": (16.0, 32768.0),
+    "CONTEXT_TOKENS": (512.0, 262144.0),
+    "MAX_ACTION_CHARS": (16.0, 100000.0),
+    # память/RAG
+    "RECENT_TOKEN_BUDGET": (64.0, 200000.0),
+    "SUMMARY_TOKEN_BUDGET": (64.0, 200000.0),
+    "RAG_MEMORY_K": (0.0, 200.0),
+    "RAG_MEMORY_MAX": (0.0, 200.0),
+    "RAG_CANDIDATES": (1.0, 500.0),
+    "LORE_TOKEN_BUDGET": (0.0, 200000.0),
+    "LORE_TOKEN_BUDGET_MAX": (0.0, 200000.0),
+    "LORE_RAG_K": (0.0, 200.0),
+    "LORE_RAG_K_MAX": (0.0, 200.0),
+    "RERANK_THRESHOLD": (0.0, 1.0),
+    "HYBRID_WEIGHT_BM25": (0.0, 1.0),
+    "COSINE_THRESHOLD": (0.0, 1.0),
+    "COSINE_THRESHOLD_LOCAL": (0.0, 1.0),
+    # частота фоновых агентов (0 у событий = «никогда», интервалы не бывают нулевыми)
+    "EVENT_EVERY_TURNS": (1.0, 10000.0),
+    "LOGIC_JUDGE_INTERVAL": (1.0, 10000.0),
+    "AUTONOMOUS_MASTER_INTERVAL": (1.0, 10000.0),
+    "ENEMY_AI_INTERVAL": (1.0, 10000.0),
+    "DIVINE_COOLDOWN_TURNS": (0.0, 1000.0),
+    "MECH_NARRATE_RETRIES": (0.0, 5.0),
+    "AUTO_TIME_EVERY": (0.0, 1000.0),        # 0 = авто-часы выключены (сессия 40, п.14b)
+    # устойчивость обращений
+    "LLM_RETRIES": (0.0, 5.0),
+    "LLM_RETRY_BACKOFF": (0.0, 10.0),
+    "LLM_TIMEOUT": (5.0, 7200.0),            # ниже 5 с ход не уходит — модель не успевает
+    "CHROMA_RETRIES": (0.0, 5.0),
+    "EMBEDDING_RETRIES": (0.0, 5.0),
+    "LLM_BG_CONCURRENCY": (1.0, 4.0),        # больше 4 фоновых проходов локальная модель не тянет
+    "LLM_BG_MAX_QUEUE": (1.0, 512.0),
+    # журнал/данные
+    "LOG_MAX_BYTES": (1048576.0, 268435456.0),   # минимум 1 МБ: иначе ротация съедает журнал
+    "LOG_BACKUP_COUNT": (0.0, 30.0),
+    "METRICS_TAIL": (10.0, 100000.0),
+    "METRICS_MAX_BYTES": (0.0, 268435456.0),     # 0 = ротация выключена (решение сессии 36)
+    "TURN_SNAPSHOT_KEEP": (10.0, 100000.0),
+    "BACKUP_KEEP": (1.0, 1000.0),
+    "TTS_CACHE_TTL_DAYS": (0.0, 3650.0),         # 0 = вечно
+    "TTS_MAX_CHARS": (100.0, 100000.0),
+}
+
+# Ключи, для которых 0 — НЕ «слишком мало», а осмысленный режим: ниже своего минимума не
+# подрезаем (иначе сломали бы задокументированные выключатели):
+#   TURN_SNAPSHOT_KEEP=0 — хранить все точки (`db._save_turn_snapshot`: `if keep and keep>0`);
+#   AUTO_TIME_EVERY=0    — авто-часы выключены (сессия 40, п.14b);
+#   EVENT_EVERY_TURNS=0  — «никогда» (`narrator.event_chance`); 0 у порогов RAG = «авто»;
+#   METRICS_MAX_BYTES=0  — ротация журнала метрик выключена (решение сессии 36);
+#   TTS_CACHE_TTL_DAYS=0 — кэш озвучки живёт вечно.
+NUM_ZERO_KEYS: frozenset[str] = frozenset({
+    "TURN_SNAPSHOT_KEEP", "AUTO_TIME_EVERY", "EVENT_EVERY_TURNS", "RAG_MEMORY_K",
+    "RAG_MEMORY_MAX", "LORE_RAG_K", "LORE_RAG_K_MAX", "LORE_TOKEN_BUDGET",
+    "LORE_TOKEN_BUDGET_MAX", "METRICS_MAX_BYTES", "TTS_CACHE_TTL_DAYS",
+    "RERANK_THRESHOLD", "HYBRID_WEIGHT_BM25", "COSINE_THRESHOLD",
+    "COSINE_THRESHOLD_LOCAL", "LLM_RETRY_BACKOFF",
+})
+
+_CLAMP_LOG = logging.getLogger("textgame.config")
+
+
+def clamp_num(key: str, value, *, integer: bool = True, label: str | None = None):
+    """Значение настройки в границах `NUM_RANGES[key]`; нет ключа — значение как есть.
+
+    Числовую СТРОКУ (её приносят админка и JSON из БД) нормализуем к числу того же типа,
+    что и границы: потребитель и так отправлял её в модель числом. Совсем не-число
+    ("широко") остаётся как есть — изобретать значение за игрока нечем (закон 3), а
+    тихая подмена дефолтом только прячет проблему.
+
+    Пишет warning при подрезке (`label` — где именно лежит значение: для per-world
+    настроек это не имя env-ключа). Неброско: вызывается на каждом чтении конфига.
+    """
+    rng = NUM_RANGES.get(key)
+    if rng is None:
+        return value
+    lo, hi = rng
+    try:
+        num = int(value) if integer else float(value)
+    except (TypeError, ValueError):
+        return value
+    if num == 0 and key in NUM_ZERO_KEYS:
+        return num                      # 0 = задокументированный режим, а не «слишком мало»
+    out = int(min(hi, max(lo, num))) if integer else float(min(hi, max(lo, num)))
+    text = str(value).strip() if isinstance(value, str) else None
+    if out != num or (text is not None and text != str(out)):
+        # log_once: пер-мир настройки читаются КАЖДЫЙ ход (narrator.world_gen_settings),
+        # и повторяющийся warning превратился бы в лог-шторм (правило 14 + A6, аудит 41):
+        # факт видим ОДИН раз на (ключ, значение), а не молчит вовсе
+        log_once(_CLAMP_LOG, f"clamp:{label or key}={value}", logging.WARNING,
+                 "настройка %s=%s приведена/подрезана до %s (допустимо %s…%s)",
+                 label or key, value, out, lo, hi)
+    return out
+
+
+def clamp_int(key: str, value, *, label: str | None = None) -> int:
+    return clamp_num(key, value, integer=True, label=label)
+
+
+def clamp_float(key: str, value, *, label: str | None = None) -> float:
+    return clamp_num(key, value, integer=False, label=label)
+
+
+def num_kind(key: str) -> str | None:
+    """'int' | 'float' | None — тип числовой настройки по её env-имени (дефолт `Config`).
+
+    Нужен админке, где все числа приходят СТРОКАМИ: по нему решаем, `int()` или `float()`
+    и что отвечать в `400`. None — либо ключ нечисловой, либо границ не задавали."""
+    fld = Config.__dataclass_fields__.get(key.lower())
+    if fld is None:
+        return None
+    dflt = fld.default
+    if isinstance(dflt, bool) or not isinstance(dflt, (int, float)):
+        return None
+    return "int" if isinstance(dflt, int) else "float"
+
+
+# Per-world ключи gen_settings → имена глобальных настроек того же смысла. Одна таблица
+# границ на игру: то, что запрещено в .env/админке, запрещено и в мире (A9, аудит 41).
+GEN_LIMIT_KEYS: dict[str, str] = {
+    "temperature": "DEFAULT_TEMP",
+    "top_p": "DEFAULT_TOP_P",
+    "max_tokens": "MAX_TOKENS",
+    "context_tokens": "CONTEXT_TOKENS",
+    "rag_memory_k": "RAG_MEMORY_K",
+    "lore_rag_k": "LORE_RAG_K",
+    "lore_token_budget": "LORE_TOKEN_BUDGET",
+}
+
+
+def clamp_gen_settings(gen: dict, *, where: str = "настройки мира") -> dict:
+    """Пер-мирные `gen_settings` в общих границах (A9). Возвращает НОВЫЙ dict.
+
+    Нечисловой мусор (строка/None) не трогает — его переводит в дефолт потребитель.
+    Только проверка возможности (закон 2): значения выбирает игрок, код не «улучшает» их.
+    """
+    out = dict(gen or {})
+    for k, env_name in GEN_LIMIT_KEYS.items():
+        v = out.get(k)
+        if v is None:
+            continue
+        out[k] = clamp_num(env_name, v,
+                           integer=env_name not in ("DEFAULT_TEMP", "DEFAULT_TOP_P"),
+                           label=f"{where}: {k}")
+    return out
+
+
+def gen_clamped_before(gen: dict, after: dict) -> dict:
+    """Что именно подрезали/привели в `gen_settings` (для ответа API, A9).
+
+    `{ключ: {sent, used, range}}` — пусто, если трогать было нечего. Числовые строки
+    («"0.7"») считаются тем же числом: они доезжают до модели числом, а вот подмену
+    диапазона игроку обязан показывать UI."""
+    out: dict[str, dict] = {}
+    for k, v in (after or {}).items():
+        old = (gen or {}).get(k)
+        if old is None:
+            continue
+        try:
+            same = float(str(old)) == float(str(v))
+        except (TypeError, ValueError):
+            same = old == v
+        if not same:
+            rng = NUM_RANGES.get(GEN_LIMIT_KEYS.get(k, ""))
+            out[k] = {"sent": old, "used": v,
+                      "range": list(rng) if rng else None}
+    return out
+
 
 def strip_env_comment(value: str) -> str:
     """Отрезает хвостовой комментарий строки `.env`: `KEY=value # пояснение`.
@@ -72,11 +264,46 @@ def strip_env_comment(value: str) -> str:
     return v.strip().strip('"').strip("'")
 
 
+def _warn_dead_keys(env_vals: dict[str, str], admin_over: dict[str, str]) -> None:
+    """B5 (аудит 41): ключ, которого конфиг не читает, обязан быть виден, а не молчать.
+
+    Так в проекте и поселились «мёртвые» настройки: `RERANK_TOP_N` (ручку сняли в A17,
+    а строка осталась в .env И в таблице admin_settings) и `GAME_HOST`/`GAME_PORT` (их
+    читал только сам config.py, реальный bind/port задаёт start_game.bat). Следующая
+    сессия честно искала бы, «куда не применяется настройка». Теперь при старте в журнал
+    идёт список лишних имён — РАЗДЕЛЬНО по источникам: «убери строку в .env» и «такую
+    строку записала админка» — это разные действия (у владельца файл, лезть в него самой
+    игре нельзя).
+
+    Опорный список — `overridable_env_keys()` (производен от dataclass, устареть не может).
+    Пишем через `log_once`: конфиг перечитывается на каждый ход, а шторм в логе — это
+    тот же тихий шум, только громче (правило 14). Вызов только из `Config.load` — на импорте
+    ничего не происходит (A13).
+    """
+    known = set(overridable_env_keys())
+    env_dead = sorted({k.upper() for k in env_vals if k.upper() not in known})
+    admin_dead = sorted({k.upper() for k in admin_over if k.upper() not in known})
+    if not env_dead and not admin_dead:
+        return
+    where = []
+    if env_dead:
+        where.append("в файле .env: " + ", ".join(env_dead))
+    if admin_dead:
+        where.append("в таблице admin_settings (записано админкой): " + ", ".join(admin_dead))
+    log_once(_CLAMP_LOG, "dead-keys:" + ",".join(env_dead + admin_dead), logging.WARNING,
+             "мёртвые ключи настроек — конфиг их НЕ читает, чини код или убирай строку — %s",
+             "; ".join(where))
+
+
 @dataclass
 class Config:
     # API
-    game_host: str = "127.0.0.1"
-    game_port: int = 8002
+    # B5 (аудит 41): полей `game_host`/`game_port` здесь больше нет — их читали из .env, но,
+    # кроме самого config.py, НЕ ТРОГАЛ никто: адрес и порт задаёт `start_game.bat`
+    # (`GAME_BIND` из окружения процесса + жёсткий `--port 8002`, завязанный на фронт и на
+    # проверку портов в scripts/check_start_bat.py). Приложение не выбирает, на каком порту
+    # его подняли (это делает uvicorn-раннер), поэтому «настройка» была обещанием в никуда,
+    # а `hidden_admin_keys()` честно объявляла несуществующую настройку «не для админки».
     db_path: str = str(ROOT / "data" / "game.db")
 
     # ── Провайдер основной модели ──
@@ -140,6 +367,19 @@ class Config:
     lore_token_budget_max: int = 4500 # потолок бюджета лора при большом контексте (динамика)
     lore_rag_k: int = 3               # релевантных статей/чанков из RAG-поиска по лору
     lore_rag_k_max: int = 12          # потолок лор-чанков при большом контексте (динамика)
+
+    # ── Безопасность доступа (B2, аудит 41) ──
+    # У игры НЕТ авторизации: любой, до кого дотянется порт, = владелец админки.
+    # Поэтому /api/admin/settings (правка провайдеров, base_url и ключей) по умолчанию
+    # отвечает только с localhost. Ставить true стоит лишь осознанно (нужен доступ с
+    # телефона при GAME_BIND=0.0.0.0) — через саму админку ключ не включается
+    # (см. hidden_admin_keys): иначе открывший админку мог бы разблокировать себе сеть.
+    admin_allow_lan: bool = False
+
+    # B2: глобальный выключатель rate-limit'а «дорогих» эндпоинтов. Применяется на старте
+    # (`app._lifespan` → `ratelimit.configure`), вранье в .env без этого было бы обещанием
+    # в никуда (ключ читался только docstring'ом модуля, а не кодом).
+    rate_limit_enabled: bool = True
 
     # Динамические события мира (фоновая генерация без действия игрока)
     dynamic_events_enabled: bool = True
@@ -355,6 +595,7 @@ class Config:
                 k, _, v = line.partition("=")
                 vals[k.strip()] = strip_env_comment(v.strip())
         admin_over = admin_settings.read_overrides()
+        _warn_dead_keys(vals, admin_over)
         def get(*keys: str, default=None):
             for k in keys:
                 if k in env and env[k] != "":
@@ -366,20 +607,22 @@ class Config:
             return default
 
         def flt(default, *keys):
+            # A9: после разбора — общий кламп по NUM_RANGES (кривой .env/админка больше
+            # не уезжают в модель и не ломают каждый ход)
             try:
-                return float(get(*keys, default=str(default)))
+                val = float(get(*keys, default=str(default)))
             except (TypeError, ValueError):
-                return default
+                val = float(default)
+            return clamp_float(keys[0], val) if keys else val
 
         def it(default, *keys):
             try:
-                return int(get(*keys, default=str(default)))
+                val = int(get(*keys, default=str(default)))
             except (TypeError, ValueError):
-                return default
+                val = int(default)
+            return clamp_int(keys[0], val) if keys else val
 
         return cls(
-            game_host=get("GAME_HOST", default="127.0.0.1"),
-            game_port=it(8002, "GAME_PORT"),
             db_path=get("DB_PATH", default=str(ROOT / "data" / "game.db")),
             main_provider=get("MAIN_PROVIDER", default="llamacpp"),
             main_base_url=get("MAIN_BASE_URL", default=""),
@@ -419,6 +662,8 @@ class Config:
             lore_token_budget_max=it(4500, "LORE_TOKEN_BUDGET_MAX"),
             lore_rag_k=it(3, "LORE_RAG_K"),
             lore_rag_k_max=it(12, "LORE_RAG_K_MAX"),
+            admin_allow_lan=get("ADMIN_ALLOW_LAN", default="false").lower() in ("1", "true", "yes", "on"),
+            rate_limit_enabled=get("RATE_LIMIT_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             dynamic_events_enabled=get("DYNAMIC_EVENTS_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             event_every_turns=it(10, "EVENT_EVERY_TURNS"),
             max_action_chars=it(640, "MAX_ACTION_CHARS"),
@@ -495,9 +740,16 @@ def hidden_admin_keys() -> tuple[str, ...]:
     Это инфраструктура (путь к данным/порты: нужен перезапуск) и `LOG_FILE`: logsetup
     настраивается до первого чтения конфига и берёт путь из env/.env напрямую
     (config→db→config — рекурсия опасна), поэтому правка пути к журналу через админку
-    молча не применилась бы. README и админка говорят об этом честно (B5)."""
-    return ("DB_PATH", "GAME_HOST", "GAME_PORT", "CHROMA_HOST", "CHROMA_PORT",
-            "CHROMA_COLLECTION", "LOG_FILE")
+    молча не применилась бы. README и админка говорят об этом честно (B5).
+
+    B5 (аудит 41): GAME_HOST/GAME_PORT из списка сняты вместе с самими полями — врать про
+    «настройку, которую нельзя поменять на живую», когда настройки нет вообще, хуже, чем
+    молчать. Список обязан состоять только из РЕАЛЬНЫХ полей Config (следит
+    `tests/test_session58_dead_config.py`)."""
+    return ("DB_PATH", "CHROMA_HOST", "CHROMA_PORT", "CHROMA_COLLECTION", "LOG_FILE",
+            # B2: «открыть админку наружу» не может включаться самой админкой — иначе
+            # доступ к форме превращается в самопроизвольный срыв замка).
+            "ADMIN_ALLOW_LAN")
 
 
 def get_config() -> Config:

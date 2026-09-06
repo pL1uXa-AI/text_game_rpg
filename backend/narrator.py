@@ -7,12 +7,13 @@ narrator.py — движок игры: темы миров, сборка про�
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 from typing import Any, Optional
 
 from . import db, llm
-from .config import est_tokens, get_config
+from .config import clamp_gen_settings, est_tokens, get_config
 
 # Движок директив (механика) живёт в mechanics.py; отсюда реэкспортируется ТОЛЬКО то,
 # на что ссылаются через фасад (narrator.apply_directives, narrator.tick_effects, …).
@@ -33,6 +34,12 @@ from .mechanics import (
     tick_effects, tick_world_timers, tick_needs_mental, tick_time,
     apply_location_effects, normalize_setting_ranks,
 )
+# Сессия 63 («живой мир»): отходы от канвы сюжета — отдельный крошечный модуль состояния
+# (без циклов: plot_deviation никого не импортирует из backend, кроме typing).
+# Правило 37 сознательно НЕ добавлено в _GATED_RULES: в отличие от таймеров/нужд/зон, это
+# не подсистема, которую можно «не использовать в мире», а право мастера отойти от канвы —
+# оно нужно КАЖДОМУ ходу каждого нового мира, иначе мир снова станет рельсовым.
+from .plot_deviation import plot_deviation_text
 
 # ── Фасад (реэкспорт) ────────────────────────────────────────────────
 # narrator.py — тонкий фасад: имена НИЖЕ импортированы не для внутреннего использования,
@@ -47,9 +54,10 @@ __all__ = [
     "NARRATOR_PRESETS",
 ]
 
-from .logsetup import get_logger
+from .logsetup import current_context, get_logger, log_once
 
 log = get_logger(__name__)
+
 
 from . import plots
 # NARRATOR_PRESETS — реэкспорт: на него смотрят app.py и routers/catalog.py
@@ -59,7 +67,27 @@ from .narrators_loader import (
     reload as reload_narrators_impl,
     ensure_fresh as ensure_narrators_fresh_impl,
 )
-from .narrator_data import GENRE_HINTS
+from .narrator_data import GENRE_HINTS, TAIL_RULES, TAIL_RULE_BASE
+
+
+def _agent_quiet(agent: str, why: str, exc: BaseException | None = None) -> None:
+    """A6 (аудит 41, правило 14): отказ фонового агента больше не тихий.
+
+    `generate_*` возвращали `None` по `except Exception` молча — игрок видел просто
+    «ничего не произошло», а в журнале не было ни следа. При этом агент живёт каждый
+    ход, поэтому обычный `log.warning` залил бы журнал одним и тем же текстом (когда
+    модель лежит — падает КАЖДЫЙ проход). Отсюда `log_once` с ключом по (агент, мир):
+    первая запись — с полным трейсбеком, дальше — только в debug.
+
+    `agent` — короткая метка (event/master/enemy_ai/vision/roll); мир берётся из
+    контекста фона (`bg` поднимает `turn_context(world_id=..., agent=...)` перед задачей),
+    поэтому запись в журнале всё равно привязана к конкретному миру.
+    """
+    wid = current_context().get("world_id")
+    log_once(log, f"agent-fail:{agent}:{wid}", logging.WARNING,
+             "агент «%s» (world %s) не сработал: %s", agent, wid, why,
+             exc_info=exc)
+
 
 # Живой список тем взято из загрузчика сюжетов (plots/system + plots/user), а НЕ хардкод.
 # narrator.THEMES == plots.THEMES (тот же список): правки файлов сюжетов видны после reload().
@@ -106,8 +134,10 @@ def theme_from_custom(name: str, plot: str, genres: list[str] | None = None) -> 
         "name": name or "Свой сюжет",
         "genre": genre,
         "desc": plot[:300],
-        "style": "Пиши сочно и атмосферно, строго в русле заявленного сюжета: держи интригу, "
-                  "не противоречь фактам сюжета и логике мира, плавно раскрывай завязку.",
+        "style": ("Пиши живо и атмосферно, в русле этого жанра: держи интригу, "
+                  "не противоречь фактам мира и логике, плавно раскрывай завязку. "
+                  "Заявленный сюжет — СТАРТОВАЯ КАНВА (точка отсчёта), а не обязательный путь: "
+                  "мир живёт по действиям игрока и может свернуть с канвы."),
         "starter": {"gold": 20, "inventory": []},
         "opening": plot,
     }
@@ -133,7 +163,8 @@ def _world_theme(world: dict, setting: dict) -> dict:
         "name": name, "genre": genre, "id": world.get("theme") or "legacy",
         "desc": hook[:300] or name,
         "style": f"Пиши живо и атмосферно в русле этого мира (жанр: {genre}); держи канон и логику мира, "
-                  "не противоречь фактам сюжета.",
+                  "не противоречь установленным фактам. Сюжет/завязка — точка отсчёта, а не обязательный путь: "
+                  "мир меняется под действия игрока.",
         "starter": {}, "opening": hook or "Мир пробуждается. Что ты делаешь?", "lore": [],
     }
 
@@ -328,12 +359,22 @@ MEMORY_EXTRA_BUDGET = MAX_MEMORY_EXTRA_BUDGET   # обратная совмес�
 
 
 def world_gen_settings(world: dict) -> dict:
-    """gen_settings мира как dict (переживают и JSON-строку, и dict)."""
+    """gen_settings мира как dict (переживают и JSON-строку, и dict).
+
+    A9 (аудит 41): значения проходят общий кламп (`config.clamp_gen_settings`) ПРИ ЧТЕНИИ.
+    Причина не в UI: кривое число (`max_tokens: 0`, `temperature: 1e9`) могло попасть в мир
+    из старого сохранения, ручной правки БД или импортированного дампа — и тогда ломался
+    КАЖДЫЙ следующий ход (ошибка модели) или бюджет окна уезжал в минус. Ниже этого места
+    настройки читают и `_gen_params`, и бюджеты памяти (`world_recent_budget` и др.), так что
+    кламп здесь закрывает все пути."""
     try:
         g = world.get("gen_settings") or "{}"
-        return g if isinstance(g, dict) else json.loads(g)
+        g = g if isinstance(g, dict) else json.loads(g)
     except Exception:
-        return {}
+        g = {}
+    if not isinstance(g, dict):
+        g = {}
+    return clamp_gen_settings(g, where=f"мир {world.get('id')}")
 
 
 def world_context_tokens(world: dict) -> int:
@@ -780,6 +821,24 @@ def format_state(setting: dict) -> str:
     _board = board_text(setting, limit=5)
     if _board:
         lines.append("📜 Доска объявлений:\n  " + "\n  ".join(_board.splitlines()[:5]))
+    # ═══ Сессия 63 («живой мир»): счётчик хода и «куда мир уже свернул с канвы» ═══
+    # Оба — чистое отображение (закон 2). Счётчик нужен как ОРИЕНТИР частоты глобальных
+    # сдвигов (правило 37): без него модель не знает, сколько идёт игра, и либо топчет мир
+    # поворотом каждый ход, либо не трогает его никогда. Список отходОв — чтобы через 30
+    # ходов не «реанимировать» арку, от которой мастер уже отказался.
+    _turns = setting.get("_player_turns")
+    _dev_txt = plot_deviation_text(setting)
+    if isinstance(_turns, int) or _dev_txt:
+        _ev: list[str] = [f"ход {int(_turns)}" if isinstance(_turns, int) else "ход —"]
+        _arcs = [q.get("title", k) for k, q in (setting.get("quests") or {}).items()
+                 if isinstance(q, dict) and q.get("status") == "active"]
+        if _arcs:
+            _ev.append("активные арки: " + "; ".join(_arcs[:8]))
+        lines.append("🧭 ЖИВОЙ МИР (" + "; ".join(_ev) + ")")
+        if _dev_txt:
+            lines.append("🧭 Мир уже отходил от канвы сюжета (это РЕАЛЬНОСТЬ, канва — нет; "
+                         "не возвращай игрока в отброшенное и не противоречь этим записям):\n  "
+                         + "\n  ".join(_dev_txt.splitlines()))
     # ═══ Сессия 34 (C9): «ружья Чехова» — что введено и с тех пор не звучало ═══
     # Только подсказка-отображение (закон 2): «выстрелит» намёк или нет, когда и как —
     # решение рассказчика (закон 3).
@@ -1022,6 +1081,10 @@ _GATED_RULES: dict[str, tuple[str, tuple[str, ...], str]] = {
                     "рассуд", "морал", "стресс", "stress", "hungry", "thirst", "rest",
                     "sleep", "sanity"), "потребности и рассудок (needs)"),
     "32": ("zone", ("туман", "радиац", "зон", "ядовит", "проклят", "атмосфер"), "локации-зоны с эффектами"),
+    # ВНИМАНИЕ (сессия 63): правило 37 («живой мир vs канва сюжета») сюда СОЗНАТЕЛЬНО не
+    # внесено. Ярусы режут только правила мёртвых ПОДСИСТЕМ (крафт, магазины, таймеры…).
+    # Право рассказчика гнуть мир под игрока — не подсистема: оно нужно каждому миру и
+    # каждый ход, иначе игра снова становится рельсовой («сюжет — точка отсчёта»).
 }
 
 # Короткий «словарь»: что умеет движок, когда подробности правила убраны.
@@ -1118,6 +1181,35 @@ def trim_prompt(prompt: str, drop: set[str]) -> tuple[str, int]:
     return "\n".join(out), max(0, saved)
 
 
+# ── B3 (аудит 41): потолок длины персоны в промпте ─────────────────────
+# Персона (текст рассказчика) идёт ПЕРВОЙ строкой system-промпта и в ярусах не жертвуется,
+# поэтому её размер — единственная секция, которую раньше не ограничивал вообще никто:
+# лор режет `lore_token_budget`, историю — `recent_token_budget`, а «двухмегабайтная»
+# персона съедала окно модели на КАЖДОМ ходу. Схемы (`schemas.PERSONA_MAX`) не дают
+# откормить её новым POST'ом, а кламп здесь защищает миры, где персона уже лежит в БД
+# (старые записи, импорт дампа, правка файла пресета вручную).
+# 1500 токенов ≈ 4.8 КБ символов: самый длинный штатный пресет — 2.0 КБ (635 токенов),
+# то есть живых персон кламп не касается; обрезается только «нефункциональная» гигантомания.
+PERSONA_TOKEN_BUDGET = 1500
+
+
+def clip_persona(persona: str | None, world: dict | None = None) -> str | None:
+    """Подрезает персону под `PERSONA_TOKEN_BUDGET` (символьно, по той же оценке токенов,
+    что и бюджеты памяти). Отказ видим в журнале (правило 14), тихого обрезания нет."""
+    text = (persona or "").strip()
+    if not text:
+        return persona
+    toks = est_tokens(text)
+    if toks <= PERSONA_TOKEN_BUDGET:
+        return persona
+    keep = int(PERSONA_TOKEN_BUDGET * 3.2)
+    log_once(log, f"persona-clip:{(world or {}).get('id', '-')}", logging.WARNING,
+             "персона рассказчика (мир %s) обрезана в промпте: %d → %d токенов "
+             "(лимит %d) — сократи её в каталоге рассказчиков",
+             (world or {}).get("id"), toks, PERSONA_TOKEN_BUDGET, PERSONA_TOKEN_BUDGET)
+    return text[:keep]
+
+
 def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
                         use_tools: bool = False, action: str = "") -> str:
     theme = _world_theme(world, setting)
@@ -1148,7 +1240,8 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
     char_note = (f" Не превышай объём ответа: максимум примерно {max_chars} символов (~{max_tok} токенов). "
                  "Оборачивай мысль законченной фразой в рамках лимита, не обрывай на полуслове; если лимит тесен — пиши компактнее, но сохраняя живость.")
 
-    persona_line = (persona or "").strip() or \
+    # B3: персона — до сборки промпта (см. `clip_persona` выше).
+    persona_line = clip_persona(persona, world) or \
         "Ты — Рассказчик (Game Master) живой текстовой RPG."
 
     if use_tools:
@@ -1168,7 +1261,7 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
                     "effect_add, effect_remove, add_item, remove_item, enemy_add, enemy_apply, enemy_remove, quest, quest_done (id или {{id, next}} — цепочка), quest_advance, quest_choose, "
                     "quest_success/quest_fail (итог: {{id, reason, next}}), quest {{id, timer: {{name, turns}}}} (дедлайн квеста), "
                     "enemy_effect_add/enemy_effect_remove (статусы на врагах — сами не тикают), enemy_mark (позиция/инициатива/цель), "
-                    "npc_set (name/mood/alive/desc/faction/location [где стоит]/schedule [расписание по времени суток]/notes [что знает и скрывает]), npc_kill, faction_add/faction_update/faction_remove (фракции и их связи), location_add, location_update, move, flag, time, weather, roll, game_over (true/false). "
+                    "npc_set (name/mood/alive/desc/faction/location [где стоит]/schedule [расписание по времени суток]/notes [что знает и скрывает]), npc_kill, faction_add/faction_update/faction_remove (фракции и их связи), location_add, location_update, location_remove (id — мир теряет место), move, flag, time, weather, roll, game_over (true/false). quest_remove — стереть невозможную арку. "
                     "Экономика: shop_add, shop_remove, shop_update, trade_buy, trade_sell. Крафт: gather, craft_learn, craft_remove, craft. "
                     "Компаньоны: companion_add, companion_remove, companion_update, companion_apply. "
                     "Способности: ability_add, ability_remove, ability_update, ability_use. "
@@ -1178,7 +1271,9 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
                     "needs {{голод: {{value: -10}}|{{value: 90}}...}} (потребности/рассудок), board_add {{title, text}} (доска объявлений), "
                     "faction_rank {{faction, rank}} (звания во фракциях), date {{day, month, season}} (календарь/сезоны), "
                     "vision_add {{text, hint}} (видение в очередь — сыграет при отдыхе/сне), trigger_vision (разыграть видение). "
-                    "В roll можно добавить stakes {{success, fail}} — что на кону при успехе/провале.")
+                    "В roll можно добавить stakes {{success, fail}} — что на кону при успехе/провале."
+                    "Сессия 63 (живой мир): world_evolve {{what, why}} — ЯВНО зафиксировать отход "
+                    "от канвы стартового сюжета (правило 37).")
         fmt_tail = ("## Условия\n- Используй инструмент game_engine ТОЛЬКО когда действие меняет механическое состояние "
                     "(урон, предметы, золото, квесты, флаги, перемещение, бросок).\n"
                     "- Для простых описаний инструмент не нужен.\n"
@@ -1223,50 +1318,13 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
         "ПОСТОЯННЫЙ ФАКТ: то, что ты выдумал сам (имя места, правило мира, биография "
         "NPC), становится каноном: перенеси это в состояние (flag/npc_set/location_add) "
         "и не переиначивай без сюжетной причины.\n")) + "\n"
-    # Сессия 32: хвост правил 30…36 (таймеры, нужды, зоны, итоги квестов, тактика, тайны, ружья).
-    # C1 (аудит 38): каждое правило — ОДНИМ ЭЛЕМЕНТОМ и нумеруется от стабильной базы.
-    # Раньше части одного правила склеивались через запятую, и каждое продолжение получало
-    # свой номер («30. …, 31. срок)…») — номера уезжали, и trim_prompt резал не то правило.
-    # Части склеиваются НЕЯВНО (без запятых) — запятая только в конце правила.
-    _tail_rules = (
-        "ТАЙМЕРЫ МИРА: в состоянии могут быть «Таймеры» (дедлайны: бомба, осада, прибытие, срок). Движок сам "
-        "тикает их в начале каждого хода и сообщит «⏰ Таймер истёк» — это ЗНАЧИТ, что время вышло. Что именно"
-        " произошло (взрыв, осада началась, курьер пришёл) — решаешь ты директивами и текстом; не игнорируй и"
-        "стёкший таймер. Новые таймеры заводи директивами timer_add (turns = сколько ходов осталось).\n",
-        "ПОТРЕБНОСТИ/РАССУДОК: у игрока есть шкалы потребностей (голод/жажда/усталость) и рассудка (рассудок/"
-        "стресс/мораль) — они показаны в состоянии и тикают сами. Если шкала на критическом уровне — это важн"
-        "ый сюжетный сигнал: игрок нуждается в еде/воде/отдыхе/разрядке. Последствия (эффекты, штрафы, сюжетн"
-        "ые повороты) применяй директивами (effect_add/player/stats), не позволяй себе игнорировать нужды, но"
-        " и не души ими — это ресурс драмы, а не налог.\n",
-        "ЛОКАЦИИ-ЗОНЫ: если у текущей локации есть «Влияние места» (эффекты зоны: радиация, ядовитый туман, п"
-        "роклятие, невесомость) — оно уже действует на игрока (движок наложил). Учитывай в описаниях и провер"
-        "ках; способ защититься/снять — на твоё усмотрение.\n",
-        "ИТОГ КВЕСТА (сессия 34): у квеста есть исход — quest_success {id, reason, next} или quest_fail {id, "
-        "reason, next} (state: 🏅 выполнен / 💀 провален). Ставь итог явно в момент, когда сюжетно всё решилось"
-        ", и продолжай цепочку через next. Провал — не тупик: предложи путь дальше (долг, последствия, новая "
-        "ветка). Квесту можно дать срок: quest {id, timer: {name, turns, desc}} — движок напомнит «⏳ срок выш"
-        "ел», а провален он или спасён в последний миг — твоё решение (quest_fail/quest_success).\n",
-        "СТАТУСЫ НА ВРАГАХ И ТАКТИКА (сессия 34): enemy_effect_add {id, name, turns, damage, desc} и enemy_ef"
-        "fect_remove заводят статусы на врагах (горение/окоченение/страх), enemy_mark {id, position, initiati"
-        "ve, target, stance} — тактические метки (кто кого держит, порядок схватки). ВАЖНО: эти статусы НЕ ти"
-        "кают сами и урон врагам не списывают — это хранилище правды о поле боя. Реальное изменение HP врага "
-        "применяй директивой enemy_apply в том ходу, где это происходит по тексту (иначе задвоишь урон). В оп"
-        "исаниях опирайся на метки: инициатива/позиция подсказывают, кто бьёт первым и что открыто для фланго"
-        "вого удара.\n",
-        "ТАЙНЫ NPC (сессия 34): у персонажей есть «🗝 Знания и тайны» (npc_set {id, notes: {знает, тайна, хоче"
-        "т, долг}}) — что ОН знает, что скрывает, чего хочет. Держи это в тайне от игрока: раскрывай через на"
-        "мёки, поведение по репутации (см. правило о фракциях), удачные проверки (roll) и цену молчания. Заме"
-        "тки — источник живости мира: NPC помнит, лжёт, торгуется. Не меняй их без сюжетной причины и не прот"
-        "иворечь им (тайну, которую NPC уже выдал игроку, надо обновить в notes).\n",
-        "РУЖЬЯ НА ГОРИЗОНТЕ (сессия 34): в состоянии может быть строка «🏹 На горизонте» — это то, что ты ввёл"
-        " в мир (знакомство, вещь, факт, место) и о чём с тех пор не было речи. Хорошая привычка автора — вер"
-        "нуть такое в сюжет, когда это уместно: вернувшийся персонаж, сработавшая деталь, закрытый долг дают "
-        "ощущение продуманного мира. Но это НЕ обязанность и НЕ очередь: ненужное ружьё имеет право так и не "
-        "выстрелить, а список сам гаснет со временем. Не перечисляй ружья игроку списком — вплетай в повество"
-        "вание.\n",
-    )
-    for _i, _rule in enumerate(_tail_rules):
-        lore_rules += f"{30 + _i}. {_rule}"
+    # Хвост правил 30… — в narrator_data.TAIL_RULES (данные отдельно от сборки промпта).
+    # C1 (аудит 38): каждое правило — ОДНИМ ЭЛЕМЕНТОМ; нумерует цикл ниже от TAIL_RULE_BASE,
+    # потому что ярусы промпта (_GATED_RULES/trim_prompt) ключуются НОМЕРАМИ: дырка или
+    # сдвиг = молчаливое вырезание не того правила. Части одного правила склеиваются
+    # НЕЯВНО (без запятых) — запятая только в конце правила.
+    for _i, _rule in enumerate(TAIL_RULES):
+        lore_rules += f"{TAIL_RULE_BASE + _i}. {_rule}"
     prompt = f"""{persona_line}
 
 Ты ведёшь игру в жанре: {genre_label}.
@@ -1330,6 +1388,7 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
 <<ENGINE>>{{"location_add": {{"id": "cellar", "name": "Подвал", "desc": "Тёмный, пахнет плесенью"}}, "move": "cellar"}}
 <<ENGINE>>{{"flag": {{"name": "door_open", "value": true, "title": "Дверь в склепах открыта"}}, "time": "ночь", "weather": "гроза"}}
 <<ENGINE>>{{"game_over": true}}   — завершить игру (смерть игрока/финал сюжета)
+<<ENGINE>>{{"location_remove": "market", "quest_remove": ["royal_plot", "meet_informant"], "world_evolve": {{"what": "отказ от арки «королевский заговор»: informant мертв", "why": "игрок убил его на 4-м ходу"}}}}   — живой мир: место и квесты СТАЛИ невозможны, канва свёрнута (правило 37)
 Можно комбинировать: <<ENGINE>>{{"player": {{"hp": -3}}, "flag": {{"name": "trapped", "value": true}}}}
 
 <<ENGINE>>{{"class": "Воин", "profession": "Кузнец", "skill": {{"name": "взлом", "value": 1}}}}
@@ -1427,6 +1486,24 @@ def feedback_style_note(world_id: int) -> str:
     return ""
 
 
+def drop_engine_examples(prompt: str) -> tuple[str, int]:
+    """Убрать ВЫВОДНЫЙ блок примеров `<<ENGINE>>` (сессия 63, последний рычаг усечения).
+
+    Примеров в промпте ~25 строк, и это самая избыточная его часть: сами директивы
+    перечислены строкой «Доступные ключи…» и описаны в правилах 7–25, а формат требует
+    ОДНУ строку в конце ответа. Когда жертвовать уже нечем (лор/RAG/карточки/сводки/история
+    срезаны, а окно узкое — обычная локальная 4B-модель), лучше потерять демо-строки, чем
+    потерять историю или состояние: молчаливый переполнение окна = обрезанные ответы (A2,
+    сессия 34). Заголовки блоков и правила не трогаются: режутся ТОЛЬКО строки, начинающиеся
+    с маркера, поэтому нумерация правил (_GATED_RULES/trim_prompt) не сдвигается.
+    """
+    kept = [ln for ln in prompt.splitlines() if not ln.startswith("<<ENGINE>>")]
+    if len(kept) == len(prompt.splitlines()):
+        return prompt, 0
+    out = "\n".join(kept)
+    return out, est_tokens(prompt) - est_tokens(out)
+
+
 def build_messages(world: dict, setting: dict, action: str,
                    recent_events: list[dict], summaries: list[dict],
                    rag_chunks: list[str], entity_cards: list[dict] | None = None,
@@ -1495,6 +1572,13 @@ def build_messages(world: dict, setting: dict, action: str,
     def half(lst: list) -> int:
         return max(1, len(lst) // 2)
 
+    def _scene_cards(cards: list) -> list:
+        """Карточки, которые не выкидываются НИКОГДА: текущая локация и активные квесты."""
+        return [c for c in cards
+                if c.get("kind") == "location" or c.get("entity_key") == setting.get("current_location")
+                or (c.get("kind") == "quest" and
+                    ((setting.get("quests") or {}).get(c.get("entity_key")) or {}).get("status") == "active")]
+
     def shrink_cards(keep: int) -> None:
         """Оставить `keep` карточек, но NEVER без текущей локации/активных квестов —
         без них модель не знает, кто в сцене (select_relevant_entities уже отсортировал
@@ -1503,10 +1587,7 @@ def build_messages(world: dict, setting: dict, action: str,
         cards = list(entity_cards or [])
         if len(cards) <= keep:
             return
-        must = [c for c in cards
-                if c.get("kind") == "location" or c.get("entity_key") == setting.get("current_location")
-                or (c.get("kind") == "quest" and
-                    ((setting.get("quests") or {}).get(c.get("entity_key")) or {}).get("status") == "active")]
+        must = _scene_cards(cards)
         rest = [c for c in cards if c not in must]
         entity_cards = (must + rest)[:max(keep, len(must))]
 
@@ -1517,6 +1598,13 @@ def build_messages(world: dict, setting: dict, action: str,
         ("воспоминания", lambda: bool(rag_chunks), lambda: rag_chunks.clear()),
         ("карточки", lambda: len(entity_cards or []) > 4,
          lambda: shrink_cards(max(2, len(entity_cards or []) // 2))),
+        # Сессия 63: последний рычаг по карточкам — раньше каскад останавливался на «не хуже
+        # 4 штук», а ниже 4 резать не хотел, и в мире с узким окном (локальная 4B) промпт
+        # переполнял окно МОЛЧА: overflow-предупреждение есть, но играть невозможно. Карточки
+        # НЕ-сцены (дальние NPC/завершённые квесты) — самое дешёвое, чем можно пожертвовать:
+        # их уже покрывают RAG и сводки, а «кто рядом» (карточки сцены) остаётся всегда.
+        ("карточки(не из сцены)", lambda: len(entity_cards or []) > len(_scene_cards(entity_cards or [])),
+         lambda: shrink_cards(len(_scene_cards(list(entity_cards or []))))),
         ("сводки", lambda: len(summaries) > 1, lambda: summaries.__delitem__(slice(0, half(summaries)))),
         ("сводки", lambda: bool(summaries), lambda: summaries.clear()),
     )
@@ -1537,6 +1625,15 @@ def build_messages(world: dict, setting: dict, action: str,
         content = assemble()
         over = est_tokens(content) - hard
         meta["trimmed"].append("недавняя история")
+    # Сессия 63, ПОСЛЕДНИЙ рычаг: когда память уже срезана до дня, а примеров механики в
+    # промпте больше 20 строк — жертвуем ИМИ, а не игрой: директивы и без демо-строк
+    # перечислены в блоке формата, а без истории/состояния мир теряет связность.
+    if over > 0:
+        sys_prompt, saved_eg = drop_engine_examples(sys_prompt)
+        if saved_eg:
+            content = assemble()
+            over = est_tokens(content) - hard
+            meta["trimmed"].append(f"примеры механики(-{saved_eg})")
     if over > 0:
         meta["overflow_tokens"] = over
         log.warning("промпт мира %s больше окна модели на %d токенов даже после усечения — "
@@ -2191,20 +2288,20 @@ async def divine_intervene(world_id: int, world: dict, setting: dict, complaint:
     """Провидение: проверяет жалобу, правит мир директивами (если ошибка реальна) и возвращает:
     {"decline": bool, "twist": str, "directives": dict, "sys_msgs": list[str], "state": setting}
     Возвращает None при сбое модели (2 неудачных парсинга) — вызывающий покажет ошибку.
-    Меняет setting на месте (применяет корректирующие директивы)."""
+    Меняет setting на месте (применяет корректирующие директивы).
+
+    D2 (аудит 41, сессия 65): полем `state` вызывающий БОЛЬШЕ НЕ пользуется — записью в БД
+    ведёт `routers/worlds.py::divine`, которое перечитывает свежее состояние и повторно
+    применяет `directives` к нему (снимок начала запроса затирал правки фоновых агентов).
+    `state` оставлен как снимок «что моделилось на входе» для тестов/отладки.
+    """
     if not (complaint or "").strip():
         return None
     msgs = divine_messages(world, setting, complaint, action=action, reply=reply, lang=lang)
-
-    def _parse(text: str) -> dict | None:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if not m:
-            return None
-        try:
-            d = json.loads(m.group(0))
-        except Exception:
-            return None
-        return d if isinstance(d, dict) else None
+    # A6 (аудит 41): раньше здесь лежало замыкание `_parse()` с двумя `except Exception:
+    # return None` — оно НЕ вызывалось ни разу (ответ разбирает `llm_json_tool`, который
+    # сам пишет warning), т.е. было не «тихой веткой», а мёртвым кодом, маскирующим
+    # несуществующие ошибки. Удалено; все реальные выходы отсюда логируются ниже.
 
     data = None
     try:
@@ -2263,15 +2360,8 @@ async def logic_judge(world_id: int, setting: dict, action: str, reply: str,
     if not (action or "").strip() or not (reply or "").strip():
         return None
     msgs = judge_messages(setting, action, reply, lang=lang)
-
-    def _parse(text: str) -> dict | None:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if not m:
-            return None
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
+    # A6 (аудит 41): мёртвое замыкание `_parse()` с тихими `return None` удалено —
+    # разбор JSON делает `llm_json_tool` (он и пишет warning), оба отказа ниже логируются.
 
     def _to_result(data: dict) -> dict | None:
         result: dict = {"twist": None, "corrections": None}
@@ -2323,7 +2413,7 @@ GAME_ENGINE_TOOL = [{"type": "function", "function": {
         "reputation, effect_add (name — человекочитаемо, desc — описание; урон/лечение за ход: damage/heal — HP, mp_damage/mp_heal — MP; срок — turns числом, без него эффект бессрочен)/effect_remove, add_item/remove_item (всегда с desc), item_update {{name, desc, weight, value, note}}, enemy_add/enemy_apply/enemy_remove, "
         "quest/quest_done (можно {id, next} — авто-цепочка), quest_advance (ступень), quest_choose (ветка), "
         "quest_success/quest_fail ({id, reason, next} — ИТОГ квеста: success/failed), quest {{id, timer: {{name, turns, desc}}}} (дедлайн квеста), "
-        "npc_set (id,name,mood,alive,desc,faction,location,schedule,money,notes,voice)/npc_kill, location_add/location_update/move, flag {name,value,title [человеческое имя]}, time, weather, "
+        "npc_set (id,name,mood,alive,desc,faction,location,schedule,money,notes,voice)/npc_kill, location_add/location_update/location_remove (id — мир теряет место: разрушено/затоплено/закрыто навсегда; текущая локация игрока под удалением нельзя)/move, flag {name,value,title [человеческое имя]}, time, weather, "
         "enemy_effect_add/enemy_effect_remove (статусы НА врагах: {{id,name,turns,damage,desc}} — ХРАНИЛИЩЕ, сами не тикают: урон по врагам только твоим enemy_apply), "
         "enemy_mark ({{id, position, initiative, target, stance}} — тактические метки для порядка боя), "
         "timer_add/timer_remove (таймеры-дедлайны мира: {name, turns, desc}), equip/unequip (экипировка по слотам: у предмета должен быть slot), "
@@ -2333,6 +2423,10 @@ GAME_ENGINE_TOOL = [{"type": "function", "function": {
         "companion_add/companion_remove/companion_update/companion_apply, "
         "ability_add/ability_remove/ability_update/ability_use (универсальные способности — заклинания/техно/псионика), "
         "progress_add ({убийства/квесты/локации…}), achievement_add {name, desc}, "
+        "quest_remove (id или [id,...] — стереть квест из мира совсем: арка СТАЛА НЕВОЗМОЖНОЙ "
+        "(участники мертвы, город уничтожен), а не «выполнена»/«провалена»), "
+        "world_evolve ({what, why} — ты ЯВНО отходишь от канвы стартового сюжета: что берёшь/что "
+        "бросаешь и какое действие игрока к этому привело; запись попадёт в состояние и в следующий промпт), "
         "roll (expr/mod/dc/label — бросок куба), game_over. "
         "Когда игрок взял/нашёл/подобрал/получил предмет — обязательно используй add_item; когда использовал/выбросил — remove_item. "
         "Аргументы — валидный JSON с любым набором этих ключей."
@@ -2408,25 +2502,101 @@ async def llm_json_tool(messages: list[dict], tool_name: str, tool_desc: str,
 # ══════════════════════════════════════════════════════════════
 # Кубы
 # ══════════════════════════════════════════════════════════════
-def roll_expr(expr: str, mod: int = 0) -> dict:
-    """Бросает куб вида '2d6+1', 'd20', 'd100'. Возвращает {rolls, total}."""
-    m = re.match(r"(\d*)d(\d+)([+-]\d+)?", expr.strip().lower())
+# A1 (аудит 41): границы кубика. Без них `d0` давал ValueError → HTTP 500 на ход,
+# `0d6` — «бросок без броска» (total 0), а директива модели `99999999d20` — ~2 с
+# и список на ~100 МБ (DoS хода + событие `dice` на миллионы символов).
+DICE_COUNT_MAX = 100        # больше ста кубиков за один бросок никто не кидает
+DICE_SIDES_MIN = 2          # d0/d1 бессмысленны
+DICE_SIDES_MAX = 1000       # d1000 — уже фантастика
+DICE_MOD_MAX = 1000         # |бонус| и |мод| сверх этого — ошибка или попытка сломать итог
+
+# D7 (аудит 41): одна регулярка на «распознали куб» (roll_expr) и на «какой куб бросали»
+# (roll_outcome). Иначе исход спорил с клампом: startswith("d20") не видел ни `1d20`,
+# ни `D20+3`, ни `d20 +5`, и ветвь «крит-провал по dc−10» не срабатывала никогда.
+_DICE_RE = re.compile(r"\s*(\d*)d(\d+)\s*(?:([+-])\s*(\d+))?\s*", re.IGNORECASE)
+
+
+def _dice_shape(expr: Any) -> tuple[int, int] | None:
+    """Форма кубика `(число кубиков, грани)` из любого написания: `d20`, `1d20`, `D20+3`.
+
+    Мусор (`2d6zz`, `d`, пусто) → None. `d0`/`d1` дают форму (1, 0)/(1, 1) — но ниже матчится
+    только одиночный d20, а `roll_expr` такой ввод и так меняет на фолбэк d20. Пробелы
+    терпим — но только вокруг `d` и знака мода: полный совпад строки, а не префикс
+    (иначе `re.match` съедал «хвост» выражения молча).
+    """
+    m = _DICE_RE.fullmatch(str(expr).strip())
     if not m:
-        # непонятное выражение — дефолтный d20 без бонуса
-        return {"rolls": [], "total": random.randint(1, 20) + mod}
+        return None
+    return int(m.group(1) or "1"), int(m.group(2))
+
+
+def _dice_fallback(mod: int, why: str, expr: Any) -> dict:
+    """Невалидный ввод кубика → детерминированный d20 (ход не роняем), но НЕ молча."""
+    log.warning("roll_expr: %r — %s; бросаем фолбэк d20", expr, why)
+    mod = _clamp_dice_int(mod)
+    rolls = [random.randint(1, 20)]
+    return {"rolls": rolls, "total": rolls[0] + mod, "expr": "d20", "mod": mod, "note": why}
+
+
+def _clamp_dice_int(value: int, limit: int = DICE_MOD_MAX) -> int:
+    return max(-limit, min(limit, int(value)))
+
+
+def roll_expr(expr: str, mod: int = 0) -> dict:
+    """Бросает куб вида '2d6+1', 'd20', 'd100'. Возвращает {rolls, total, expr, note}.
+
+    `expr` в ответе — фактически брошенное выражение (после клампов), его и показываем;
+    `note` — чем исходный ввод пришлось подрезать/заменить (пусто, если всё честно).
+    """
+    m = _DICE_RE.fullmatch(str(expr).strip())
+    if not m:
+        return _dice_fallback(mod, "выражение не распознано", expr)
     count = int(m.group(1) or "1")
     sides = int(m.group(2))
-    bonus = int(m.group(3) or "0") if m.group(3) else 0
+    bonus = int(m.group(3) + m.group(4)) if m.group(3) else 0
+    notes: list[str] = []
+    if count < 1:
+        return _dice_fallback(mod, "в выражении ноль кубиков", expr)
+    if sides < DICE_SIDES_MIN:
+        return _dice_fallback(mod, f"у кубика меньше {DICE_SIDES_MIN} граней", expr)
+    if count > DICE_COUNT_MAX:
+        notes.append(f"число кубиков подрезано с {count} до {DICE_COUNT_MAX}")
+        count = DICE_COUNT_MAX
+    if sides > DICE_SIDES_MAX:
+        notes.append(f"число граней подрезано с {sides} до {DICE_SIDES_MAX}")
+        sides = DICE_SIDES_MAX
+    bonus = _clamp_dice_int(bonus)
+    mod = _clamp_dice_int(mod)
     rolls = [random.randint(1, sides) for _ in range(count)]
-    return {"rolls": rolls, "total": sum(rolls) + bonus + mod}
+    eff = f"{count}d{sides}" + (f"{bonus:+d}" if bonus else "")
+    return {"rolls": rolls, "total": sum(rolls) + bonus + mod, "expr": eff, "mod": mod,
+            "note": "; ".join(notes)}
 
 
-def roll_outcome(total: int, dc: int, expr: str) -> str:
+def roll_outcome(total: int, dc: int, expr: str, rolls: list[int] | None = None) -> str:
+    """Оценка броска. `rolls` — выпавшие грани из `roll_expr` (источник истины о nat-1).
+
+    D7 (аудит 41): «крит-провал при 1» раньше сравнивал с единицей ИТОГ, в который уже
+    вошли мод и бонус куба — `d20+5` на честной 1 (total 6) провала не давал, а для `2d6`
+    `total == 1` невозможен в принципе (мёртвая ветка). Натуральная единица считается по
+    фактическому броску одного кубика (правило 8 промпта: «критический провал 1» — это
+    грань, а не сумма). `rolls` не передан — остаётся прежний слабый признак total == 1.
+
+    «Провал на 10+ хуже сложности» — только для одиночного d20: на 3d6 разброс шире и
+    такая планка ссыпалась бы в крит-провалы на каждом среднем провале.
+    """
     if total >= dc + 10:
         return "критический успех"
     if total >= dc:
         return "успех"
-    if total == 1 or (expr.startswith("d20") and total <= dc - 10):
+    if rolls is not None:
+        nat_one = len(rolls) == 1 and rolls[0] == 1
+    else:
+        nat_one = total == 1
+    if nat_one:
+        return "критический провал"
+    shape = _dice_shape(expr)
+    if shape and shape[0] == 1 and shape[1] == 20 and total <= dc - 10:
         return "критический провал"
     return "провал"
 
@@ -2448,7 +2618,7 @@ async def narrate_roll(world_id: int, label: str, expr: str, mod: int, dc: int,
                 f"Опиши, ЧТО ПРОИЗОШЛО в той же сцене — продолжай именно её (выше ты уже начал её описывать). "
                 f"Не меняй действие (не превращай атаку/бросок в словесный спор или другую ситуацию), не "
                 f"вводи новую сцену сбоку. Речь про ТУ ЖЕ дуэль/действие игрока.{ctx}")
-    persona_line = (persona or "").strip()
+    persona_line = (clip_persona(persona) or "").strip()
     sys_text = (f"{persona_line} " if persona_line else "") + \
         f"Ты — рассказчик RPG. Опиши результат броска {lang_instr}, 1–2 абзаца, " \
         "живо, без пересказа правил. Не упоминай числа (кроме общей оценки). Продолжай ровно ту сцену, " \
@@ -2460,7 +2630,9 @@ async def narrate_roll(world_id: int, label: str, expr: str, mod: int, dc: int,
     try:
         return (await llm.complete(messages, temperature=0.9, max_tokens=350,
                                    provider=provider)).strip()
-    except Exception:
+    except Exception as e:
+        # A6: ход с кубиками не падает, но и не остаётся без объяснения в журнале.
+        _agent_quiet("roll", f"описание результата броска не получено: {e}", e)
         return ""
 
 def dynamic_event_messages(world: dict, setting: dict) -> list[dict]:
@@ -2495,6 +2667,7 @@ async def generate_dynamic_event(world: dict, setting: dict,
             },
             ["event"], provider=provider, temperature=0.9, max_tokens=350, max_attempts=2)
         if not data:
+            _agent_quiet("event", "модель не вернула валидный JSON события дважды")
             return None
         ev = str(data.get("event") or "🌍 В мире что-то произошло…").strip()[:700]
         raw_dir = data.get("directives")
@@ -2502,7 +2675,8 @@ async def generate_dynamic_event(world: dict, setting: dict,
             raw_dir = raw_dir[0] if raw_dir else {}
         directives = normalize_directives(raw_dir) if isinstance(raw_dir, dict) else {}
         return ev, directives
-    except Exception:
+    except Exception as e:
+        _agent_quiet("event", f"случайное событие не сгенерировано: {e}", e)
         return None
 
 
@@ -2587,16 +2761,19 @@ async def generate_master_nudge(setting: dict, reason: str, recent_text: str, la
             },
             ["text"], provider=provider, temperature=0.9, max_tokens=300, max_attempts=2)
         if not data:
+            _agent_quiet("master", "мастер не вернул валидный JSON шага дважды")
             return None
         txt = str(data.get("text") or "").strip()[:700]
         if not txt:
+            _agent_quiet("master", "пустой текст шага мастера (JSON без `text`)")
             return None
         raw_d = data.get("directives")
         if isinstance(raw_d, list):
             raw_d = raw_d[0] if raw_d else {}
         directives = normalize_directives(raw_d) if isinstance(raw_d, dict) else {}
         return txt, directives
-    except Exception:
+    except Exception as e:
+        _agent_quiet("master", f"шаг автономного мастера не сгенерирован: {e}", e)
         return None
 
 
@@ -2669,6 +2846,7 @@ async def generate_enemy_ai(setting: dict, recent_text: str, lang: str = "ru",
             },
             ["enemy", "mode", "note"], provider=provider, temperature=0.85, max_tokens=260, max_attempts=2)
         if not data:
+            _agent_quiet("enemy_ai", "боевой ИИ не вернул валидный JSON хода дважды")
             return None
         eid = str(data.get("enemy") or "").strip()
         if not eid:
@@ -2684,7 +2862,8 @@ async def generate_enemy_ai(setting: dict, recent_text: str, lang: str = "ru",
             raw_d = raw_d[0] if raw_d else {}
         directives = normalize_directives(raw_d) if isinstance(raw_d, dict) else {}
         return eid, txt, mode, directives
-    except Exception:
+    except Exception as e:
+        _agent_quiet("enemy_ai", f"ход боевого ИИ не получен: {e}", e)
         return None
 
 
@@ -2727,7 +2906,8 @@ async def generate_vision(setting: dict, vision: dict, lang: str = "ru",
         if idx >= 0:
             txt = txt[:idx]
         return txt[:1600] or None
-    except Exception:
+    except Exception as e:
+        _agent_quiet("vision", f"видение не разыграно: {e}", e)
         return None
 
 

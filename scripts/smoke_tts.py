@@ -32,7 +32,9 @@ async def main():
           "err:", d.get("error"))
     # 5. фоновый синтез события: последнее narrator-событие мира
     h = await c.get(f"{BASE}/api/worlds/{WORLD}/history")
-    evs = h.json()
+    body = h.json()
+    # A8 (аудит 41): /history отдаёт страницу {events, truncated}
+    evs = body["events"] if isinstance(body, dict) else body
     narrator_evs = [e for e in evs if e["role"] == "narrator" and e.get("content", "").strip()]
     if narrator_evs:
         ev = narrator_evs[-1]

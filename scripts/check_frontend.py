@@ -8,6 +8,12 @@ frontend/ — vanilla JS без сборки, поэтому «проверит�
   3) (E1, хвосты сессии 38) в разметке app.js нет JS-литералов внутри HTML-атрибутов:
      карточки состояния зовут обработчик через data-click/data-arg, аргумент экранирован
      esc() — безопасность больше не держится на дисциплине «не забудь jsAttr»;
+  3b) (A2, аудит 41) ни одно текстое поле мира (.desc/.name/.time/…) не вставляется в
+     HTML-шаблон без esc()/trunc(), и помощники фронта реально экранируют грязный ввод
+     (полигон на Node с НАСТОЯЩИМИ esc/trunc/kv/flagWord из app.js);
+  3c) (A11, аудит 41) типы сообщений живой ленты (SSE/шина) сверяются с фронтом: сервер не
+     может публиковать тип, который вкладка не разбирает, и наоборот («rewound» годами жил
+     только в докстринге);
   4) в комментариях нет посторонних CJK-иероглифов и латинских ОМОГЛИФОВ внутри
      кириллических слов («вcё» с латинской c, «копятcя») — опечатки, которые глазами
      не находятся, а проверка находит.
@@ -286,6 +292,189 @@ def omoglyph_check(files: dict) -> list[str]:
     return errors
 
 
+def _markup_templates(code: str):
+    """Шаблонные строки (backtick), в которых есть HTML-тег — «места опасной вставки».
+
+    Нужны ровно они: confirm(`Удалить мир «${w.name}»`) экранирования не требует,
+    а ${trunc(i.desc, 60)} внутри <li>…</li> — требует. Возвращает (start, body).
+    """
+    out = []
+    i = 0
+    while True:
+        i = code.find("`", i)
+        if i < 0:
+            return out
+        j = i + 1
+        while j < len(code):
+            if code[j] == "\\":
+                j += 2
+                continue
+            if code[j] == "`":
+                break
+            j += 1
+        body = code[i + 1:j]
+        if re.search(r"<[a-zA-Z/]", body):
+            out.append((i + 1, body))
+        i = j + 1
+
+
+# A2 (аудит 41): поля, текст в которые пишет LLM (описания, имена, время/погода директивой
+# мастера) или который приходит из импортированного дампа мира.
+_XSS_FIELDS = ("desc|name|title|text|content|summary|mood|time|weather|bio|relationship"
+               "|identity|kind|label|hint|owner|school|loyalty|profession|chosen|progress"
+               "|value|price|qty|money|damage|heal|turns|stacks|level|rank|cost|dmg")
+# Обёртки, после которых вставка безопасна (экранируют или нормализуют до числа).
+_XSS_SAFE = (r"(?:esc|trunc|attrArg|numAttr|Number|String|Math\.max|Math\.round"
+             r"|JSON\.stringify|flagWord|flagLabel|factionName|actionNameWithProg|ucfirst)\b")
+# Не текст, а производные: длина/сравнения/выбор класса — XSS в них нет.
+_XSS_SAFE_EXPR = re.compile(r"\.length\b|===|!==|>=|<=|\?\s*[\"'`]|:\s*[\"'`]")
+_XSS_BARE = re.compile(r"\$\{\s*[^{}]*[A-Za-z_$][\w$.]*\.(" + _XSS_FIELDS + r")\b[^{}]*\}")
+
+
+def xss_check(app_js: str) -> list[str]:
+    """A2: в HTML-шаблоне каждая интерполяция модельного поля обязана быть экранирована.
+
+    Раньше защита держалась на дисциплине «не забудь esc()», и trunc() (самая частая
+    обёртка для описаний) экранировать НЕ умел — `<img src=x onerror=…>` в описании
+    предмета или в `time: "ночь\"><img…>"` выполнялся во вкладке игрока. Теперь
+    trunc/kv/flagWord экранируют сами, а чекер не даёт новому месту в разметке
+    вставить поле сырым.
+    """
+    errors: list[str] = []
+    code = app_js          # без стрипа комментариев: номера строк в отчёте обязаны совпадать
+    lines = app_js.splitlines()
+    n_bad = 0
+    for _start, body in _markup_templates(code):
+        for m in _XSS_BARE.finditer(body):
+            frag = m.group(0)
+            # безопасные формы: поле обернуто в esc/trunc/attrArg/numAttr/Number/…
+            if re.search(_XSS_SAFE, frag) or _XSS_SAFE_EXPR.search(frag):
+                continue
+            n_bad += 1
+            ln = code[:_start + m.start()].count("\n") + 1
+            shown = lines[ln - 1].strip()[:120] if 0 <= ln - 1 < len(lines) else frag
+            if shown.startswith(("//", "*", "/*")):
+                continue   # пример в комментарии — не разметка
+            errors.append(f"app.js:{ln}: в HTML-шаблон поле вставлено БЕЗ экранирования: "
+                          f"{frag} — A2 (XSS): оборачивай в esc()/trunc() (атрибуты — attrArg) "
+                          f"| {shown[:80]}")
+    dbl = [ln for ln, t in enumerate(lines, 1) if re.search(r"\besc\(\s*trunc\(", t)]
+    if dbl:
+        errors.append("app.js: двойное экранирование esc(trunc(…) — игрок увидит «&amp;…» "
+                      f"(строки: {dbl[:8]})")
+    print(f"  · A2: HTML-шаблонов {len(_markup_templates(code))}, сырых вставок модельных "
+          f"полей: {n_bad}, двойных экранирований: {len(dbl)}")
+    return errors
+
+
+# A2: полигон — берём НАСТОЯЩИЕ esc/trunc/kv/flagWord из app.js и проверяем, что
+# модельный текст с тегами не умеет «протечь» в разметку. Последняя строка — страховка
+# от «тест ничего не проверяет»: без экранирования в выводе останется сырой `<img`.
+_XSS_SNIPPET = r"""
+const dirty = '<img src=x onerror=alert(1)>"&';
+const cases = [
+  ["trunc", trunc(dirty, 200)],
+  ["trunc-short", trunc(dirty, 8)],
+  ["kv", kv([["Время", dirty], [dirty, 1]])],
+  ["flagWord", flagWord(dirty)],
+  ["flagWord-true", flagWord(true)],
+  ["charRow", charRow(dirty, "текст")],
+];
+let bad = 0;
+for (const [name, html] of cases) {
+  // «протёк» = сырой открывающий тег/атрибут; `&lt;img` и текст onerror= внутри экранированной
+  // строки безвредны — их и обязан давать корректный esc.
+  const leaks = /<(img|script|svg)\b|="[^"]*onerror/i.test(html);
+  const escaped = /&lt;img/.test(html) || name === "flagWord-true";
+  if (leaks || !escaped) { bad++; console.log("LEAK", name, JSON.stringify(html)); }
+}
+if (trunc("абвгдежз ик лм", 6) !== "абвгд…") { bad++; console.log("TRUNC_CHANGED", trunc("абвгдежз ик лм", 6)); }
+console.log(bad ? "BAD=" + bad : "XSS_OK");
+"""
+
+
+def bus_types_check(app_js: str) -> list[str]:
+    """A11 (аудит 41): живой протокол шины не имеет права разъезжаться на две половины.
+
+    `rewind.py` в доке обещал вкладкам событие `rewound` — его не публиковал никто, а
+    фронт не умел читать: вторая вкладка держала удалённый лог до F5. Такое лечится только
+    сверкой двух сторон: каждый `"type": "…"`, который уходит в шину/в SSE, обязан иметь
+    ветку в app.js, и наоборот (иначе мёртвая ветка фронта — это тоже расхождение).
+
+    Чекер читает исходники — поэтому он здесь, а не в тесте (инвариант 19).
+    """
+    errors: list[str] = []
+    server = ""
+    for p in ("backend/bus.py", "backend/rewind.py", "backend/routers/worlds.py",
+              "backend/routers/core.py"):
+        f = ROOT / p
+        if f.exists():
+            server += f.read_text(encoding="utf-8") + "\n"
+    sent = set(re.findall(r'["\']type["\']\s*:\s*["\']([a-z_]+)["\']', server))
+    # известные типы самого transport'а: SSE-служебные и те, что фронт фильтрует общо
+    known_front = set(re.findall(r'data\.type\s*[!=]==?\s*["\']([a-z_]+)["\']', app_js)) \
+        | set(re.findall(r'type\s*===?\s*["\']([a-z_]+)["\']', app_js))
+    # известные формы: transport-служебные (event-stream/SSE-стрим хода) + handshake ленты
+    # `ready` — «догон выдан, дальше живая рассылка»: рисовать нечего, молчаливый игнор
+    # осознан (ветка фронта по нему была бы мёртвым кодом).
+    transport = {"token", "result", "error", "done", "message", "ready"}
+    unknown = sorted(sent - known_front - transport)
+    if unknown:
+        errors.append("app.js не знает типов шины/ленты: " + ", ".join(unknown) +
+                      " — сервер их публикует, вкладка молча игнорирует (A11)")
+    # обратная сторона: ветка фронта по типу, который сервер не шлёт
+    ghost = sorted(t for t in known_front if t not in sent and t not in transport)
+    if ghost:
+        errors.append("app.js ждёт типов, которых сервер не публикует: " + ", ".join(ghost) +
+                      " — мёртвая ветка (протокол рассинхронизирован, A11)")
+    # та же монета: вкладка, которая САМА дёрнула ⏪/💾, обязана поднять «замок» перезагрузки,
+    # иначе её собственный сигнал из шины заставит openWorld() отработать вторично.
+    for fn_name, url in (("openRewindModal", "/rewind"), ("loadSaveSlot", "/load")):
+        try:
+            body = _extract_fn(app_js, fn_name)
+        except RuntimeError:
+            errors.append(f"app.js: нет функции {fn_name}() — путь отката в UI потерян (A11)")
+            continue
+        if url in body and "state.reloading" not in body:
+            errors.append(f"app.js::{fn_name}() дёргает {url} без «замка» state.reloading — "
+                          "свой же сигнал rewound перезагрузит мир дважды (A11)")
+    print(f"  · A11: сервер шлёт типы {sorted(sent)}, фронт разбирает {sorted(known_front)}")
+    return errors
+
+
+def xss_behavior_check(app_js: str) -> list[str]:
+    """A2: поведение экранирующих помощников фронта (реальные функции, прогон на Node)."""
+    node = shutil.which("node") or shutil.which("node.exe")
+    if not node:
+        print("  · A2: node не найден — поведенческий тест экранирования пропущен")
+        return []
+    try:
+        parts = "\n".join(_extract_fn(app_js, fn) for fn in
+                          ("esc", "trunc", "charRow", "flagWord"))
+        m = re.search(r"const kv = [^;]*;", app_js)
+        if not m:
+            return ["app.js: не найден kv — помощник сайдбара потерян"]
+        snippet = parts + "\n" + m.group(0) + "\n" + _XSS_SNIPPET
+    except RuntimeError as e:
+        return [f"app.js: {e}"]
+    with tempfile.NamedTemporaryFile("w", suffix=".cjs", delete=False,
+                                     encoding="utf-8") as fh:
+        fh.write(snippet)
+        tmp = fh.name
+    try:
+        r = subprocess.run([node, tmp], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=60)
+        out = (r.stdout or "") + (r.stderr or "")
+        if "XSS_OK" not in out:
+            return ["app.js: экранирование модельных текстов не пройдено (A2): " + out.strip()[:400]]
+        print("  · A2: trunc/kv/flagWord/charRow экранируют грязный ввод — ок")
+    except Exception as e:
+        return [f"app.js: запуск XSS-полигона не удался: {e}"]
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    return []
+
+
 def mobile_check(css: str, html: str, app_js: str) -> list[str]:
     """E6 (хвосты 38): мобильная адаптивность не должна молча «испариться».
 
@@ -353,6 +542,9 @@ def main() -> int:
 
     errors += dynamic_check(app_js, html, used)
     errors += dataclick_check(app_js)
+    errors += bus_types_check(app_js)
+    errors += xss_check(app_js)
+    errors += xss_behavior_check(app_js)
     errors += mobile_check(css, html, app_js)
     files = {"frontend/app.js": app_js, "frontend/index.html": index_html,
              "frontend/admin.html": admin_html}

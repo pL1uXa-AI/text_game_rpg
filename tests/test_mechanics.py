@@ -11,7 +11,7 @@ from backend import narrator
 from backend.narrator import (
     THEMES, apply_directives, default_setting,
     effective_stats, format_state, normalize_directives, recalc_derived, roll_expr, roll_outcome,
-    split_engine, tick_effects,
+    DICE_COUNT_MAX, DICE_MOD_MAX, DICE_SIDES_MAX, split_engine, tick_effects,
 )
 # D2 (аудит 38): фасад narrator больше не реэкспортирует имя, которое никем не читалось
 # через narrator.X — берём напрямую из модуля-владельца (механика живёт в mechanics).
@@ -75,8 +75,52 @@ def test_roll_mod():
 
 
 def test_roll_garbage_fallback():
+    # A1 (аудит 41): фолбэк бросает НАСТОЯЩИЙ d20 (видно в логе броска), а не «пустоту».
     r = roll_expr("не_куб")
-    assert r["rolls"] == [] and 1 <= r["total"] <= 20
+    assert len(r["rolls"]) == 1 and 1 <= r["total"] <= 20
+    assert 1 <= r["total"] <= 20
+    assert r["expr"] == "d20" and r["note"]
+
+
+# ── A1 (аудит 41): границы кубика ─────────────────────────────────
+
+def test_roll_zero_dice_no_crash_and_is_clamped():
+    """`d0` и `0d6` раньше давали 500-ку / «бросок без броска». Теперь — фолбэк d20."""
+    for bad in ("d0", "0d6", "d1", "0d100+3", "d", "", "  ", "99d"):
+        r = roll_expr(bad)
+        assert len(r["rolls"]) == 1, bad
+        assert 1 <= r["total"] <= 20, bad
+        assert r["expr"] == "d20" and r["note"], bad
+
+
+def test_roll_huge_counts_are_clamped_not_dos():
+    """99999999d20 не должен вешать ход и раздувать событие `dice`."""
+    r = roll_expr("99999999d20")
+    assert len(r["rolls"]) == DICE_COUNT_MAX
+    assert r["expr"].startswith(f"{DICE_COUNT_MAX}d20") and "подрезано" in r["note"]
+    big = roll_expr("1d99999999")
+    assert len(big["rolls"]) == 1 and 1 <= big["total"] <= DICE_SIDES_MAX
+    assert big["expr"] == f"1d{DICE_SIDES_MAX}"
+
+
+def test_roll_trailing_junk_is_not_silently_ignored():
+    """`2d6zz` — не валидный куб: раньше re.match съедал префикс и молча бросал 2d6."""
+    assert roll_expr("2d6zz")["expr"] == "d20"
+    assert roll_expr("7d6")["expr"] == "7d6"
+
+
+def test_roll_bonuses_are_clamped():
+    r = roll_expr("d20+999999999", mod=10**9)
+    assert r["total"] <= 20 + 2 * DICE_MOD_MAX
+    assert roll_expr("d20-5")["total"] >= 1 - 5
+
+
+def test_roll_is_fast_for_absurd_input():
+    """Главная гарантия A1: абсурдное выражение не тормозит ход."""
+    import time
+    t0 = time.perf_counter()
+    roll_expr("99999999d20")
+    assert time.perf_counter() - t0 < 0.5
 
 
 def test_roll_outcome_buckets():

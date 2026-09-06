@@ -232,6 +232,21 @@ class VisionDirective(BaseModel):
     hint: Any = None
 
 
+class WorldEvolveDirective(BaseModel):
+    """`world_evolve`: {what, why} — мастер ЯВНО отходит от канвы (стартового) сюжета.
+
+    Нужно потому, что канва сюжета уходит в промпт КАЖДОГО хода: без записи «мы свернули»
+    мастер либо тащит мёртвую арку, либо молча её бросает и через N ходов противоречит сам
+    себе. Движок тут только хранит правду (закон 2): решение свернуть и свернуть ли — мастера
+    (закон 3). Строка попадает в «Историю поворотов» состояния и помечает канву как
+    «отклонённую от реальности».
+    """
+    model_config = ConfigDict(extra="allow")
+
+    what: Any = None
+    why: Any = None
+
+
 # Паспорт ключей → модели (для dict-формы: валидация = verbatim-копия, т.к. extra=allow
 # и Any-поля не меняют значения; идемпотентно и безопасно).
 DICT_SPECS: dict[str, type[BaseModel]] = {
@@ -263,6 +278,7 @@ DICT_SPECS: dict[str, type[BaseModel]] = {
     "faction_rank": FactionRankDirective,
     "date": CalendarDirective,
     "vision_add": VisionDirective,
+    "world_evolve": WorldEvolveDirective,
     "trigger_vision": VisionDirective,
 }
 

@@ -10,7 +10,9 @@ dословных повторов) и `lexical_dup_share` (доля повто�
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -42,7 +44,10 @@ _agent_counts: dict[str, int] = {}
 
 def record(turn_metrics: dict | None = None, **kw) -> None:
     """Сохранить метрику одного события (хода/LLM-вызова).
-    Принимает dict или kwargs. Обновляет кумулятивные счётчики и кладёт снапшот в очередь."""
+    Принимает dict или kwargs. Обновляет кумулятивные счётчики и кладёт снапшот в очередь.
+
+    D14 (аудит 41): на диск метрика уходит НЕ сразу, а пачкой (см. «Буфер журнала» ниже) —
+    ход игрока больше не платит `open(...,'a')` за каждую метрику."""
     if not turn_metrics:
         turn_metrics = {}
     if kw:
@@ -55,7 +60,7 @@ def record(turn_metrics: dict | None = None, **kw) -> None:
     entry.setdefault("ts", time.time())
     _ensure_totals_baseline()   # база должна быть снята ДО первой собственной записи
     _samples.append(entry)
-    _persist(entry)
+    _queue_persist(entry)
 
     # кумулятивы (безопасно, малые типы)
     ct = entry.get("completion_tokens") or 0
@@ -199,17 +204,173 @@ def _rotate_journal(p: Path) -> None:
         log.warning("metrics: ротация журнала не удалась: %s", e)
 
 
-def _persist(entry: dict) -> None:
-    p = _file_path()
-    if not p:
-        return
+def _append_lines(p: Path, items: list[dict]) -> None:
+    """Один `open(...,'a')` на пачку записей. ФОРМАТ ЖУРНАЛА НЕ МЕНЯЕТСЯ: JSON-строка на метрику.
+
+    Сбой — warning (метрики не должны ронять ни ход, ни фоновый сброс), строки теряются:
+    журнал — диагностика, а не игровая память (см. bus.py: ему точность не нужна тем более)."""
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         _rotate_journal(p)
         with p.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            for entry in items:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
-        log.warning("metrics: не удалось дописать %s: %s", p, e)
+        log.warning("metrics: не удалось дописать %s (%d записей): %s", p, len(items), e)
+
+
+def _persist(entry: dict) -> None:
+    """Записать ОДНУ метрику сразу, минуя буфер (низкоуровневая точка; её же дергает `flush`)."""
+    p = _file_path()
+    if not p:
+        return
+    _append_lines(p, [entry])
+
+
+# ── Буфер журнала (D14, аудит 41) ─────────────────────────────────────────
+# `record()` вызывается СИНХРОННО из async-хода (`routers/core.py`), и раньше каждая
+# метрика значила `mkdir` + `open(...,'a')` + запись в data/metrics.jsonl на горячем пути
+# (плюс проверка ротации). Теперь метрика ложится в память, а на диск уходит ПАЧКА:
+#   * по объёму — накопилось `_FLUSH_BATCH` строк (`record` зовётся раз на ход, значит пачка
+#     это ~20 ходов: раньше каждый из них стоил своего `open()`);
+#   * по возрасту — первая ждущая строка старше `_FLUSH_AGE_S` (проверка на каждой новой
+#     записи, «амортизированно», как `_prune` в ratelimit: отдельного таймера нет);
+#   * при остановке сервера (`app._lifespan`) и при явном `flush()` — синхронно.
+# Цикл событий не блокируется: сброс уходит в поток (`run_in_executor`), а если цикла нет
+# (скрипты, pytest) — пишется сразу синхронно, чтобы «запустил скрипт → журнал на месте».
+# Цена честности: последние ≤ `_FLUSH_BATCH` строк могут отставать от `/api/metrics` (он
+# читает память, она свежее) и от диска, пока процесс жив; поле `journal_pending` в отчёте
+# это видно. `METRICS_PERSIST=false` (conftest) — буфер даже не заводится: ноль I/O в tests.
+_FLUSH_BATCH = 20        # сколько метрик ждём до записи одной пачкой (~20 ходов)
+_FLUSH_AGE_S = 2.0
+_MAX_PENDING = 500          # потолок памяти: переполнился — пишем сразу, копить не даём
+_pending: list[dict] = []
+_pending_lock = threading.Lock()
+_pending_since: float = 0.0        # monotonic-момент, когда буфер стал непустым
+_flush_fut: "Optional[asyncio.Future]" = None
+_flush_loop: Optional[asyncio.AbstractEventLoop] = None   # цикл, которому принадлежит fut
+_flush_writes = 0                  # сколько пачек ушло на диск (наблюдаемость)
+
+
+def _queue_persist(entry: dict) -> None:
+    """Положить метрику в буфер журнала и, при зрелости пачки, заказать сброс."""
+    global _pending_since
+    if _file_path() is None:
+        return                      # персист выключен / нет конфига — буфер не нужен
+    try:
+        loop: "Optional[asyncio.AbstractEventLoop]" = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None                 # вне asyncio (скрипт/тест) — писать сразу, синхронно
+    due = False
+    first = False
+    with _pending_lock:
+        first = not _pending
+        if first:
+            _pending_since = time.monotonic()
+        _pending.append(entry)
+        if (len(_pending) >= _FLUSH_BATCH
+                or len(_pending) > _MAX_PENDING
+                or (time.monotonic() - _pending_since) >= _FLUSH_AGE_S):
+            due = True
+    if due or loop is None:
+        _schedule_flush(loop)
+        return
+    if first:
+        # «разрядка» по возрасту: если новых метрик больше не будет (игрок замолчал),
+        # отложенный вызов сам донесёт пачку до диска — отдельного таймера не заводим.
+        try:
+            loop.call_later(_FLUSH_AGE_S, _schedule_flush, loop)
+        except Exception as e:
+            log.warning("metrics: отложенный сброс не поставлен, пишу синхронно: %s", e)
+            flush()
+
+
+def _schedule_flush(loop: "Optional[asyncio.AbstractEventLoop]" = None) -> None:
+    """Сбросить буфер, не вставая в позу циклу событий.
+
+    Один писатель за раз: если прошлый сброс ещё в работе в ЭТОМ ЖЕ цикле, новые строки
+    догонят его пачку (буфер общий), второго `open()` на тот же файл не заводим. Future из
+    чужого цикла (TestClient приносит новый на каждый тест, и он к этому моменту уже закрыт)
+    не переживёт нас — сброс перепривязывается к живому циклу, иначе буфер завис бы навечно."""
+    global _flush_fut, _flush_loop
+    try:
+        running: "Optional[asyncio.AbstractEventLoop]" = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if loop is None:
+        loop = running
+    if loop is None or loop is not running or loop.is_closed():
+        _flush_fut = _flush_loop = None
+        flush()                     # активного цикла нет (скрипт/тест) — пишем сразу
+        return
+    if _flush_fut is not None and _flush_loop is loop and not _flush_fut.done():
+        return
+    try:
+        fut = loop.run_in_executor(None, flush)
+    except Exception as e:          # нет пула / цикл закрывается — не терять метрики
+        log.warning("metrics: фоновый сброс не запланирован, пишу синхронно: %s", e)
+        _flush_fut = _flush_loop = None
+        flush()
+        return
+    fut.add_done_callback(_on_flush_done)
+    _flush_fut, _flush_loop = fut, loop
+
+
+def _on_flush_done(fut: "asyncio.Future") -> None:
+    """Правило 14: отказ фонового сброса виден в журнале, а не молчит."""
+    global _flush_fut, _flush_loop
+    try:
+        fut.result()
+    except Exception as e:
+        log.warning("metrics: фоновый сброс журнала не удался: %s", e)
+    finally:
+        if _flush_fut is fut:
+            _flush_fut = _flush_loop = None
+
+
+def flush() -> int:
+    """Записать всё, что накоплено в буфере, одной пачкой. Возвращает число строк.
+
+    Синхронная и безопасная из любого места: вызывается при остановке сервера, из тестов
+    и когда активного цикла событий нет."""
+    global _pending_since, _flush_writes
+    with _pending_lock:
+        if not _pending:
+            _pending_since = 0.0
+            return 0
+        items = _pending[:]
+        _pending.clear()
+        _pending_since = 0.0
+    p = _file_path()
+    if not p:
+        return 0                    # персист выключен по дороге: строки просто забыты
+    _append_lines(p, items)
+    _flush_writes += 1
+    return len(items)
+
+
+def pending_count() -> int:
+    """Сколько метрик ещё не дошло до журнала (наблюдаемость буфера)."""
+    with _pending_lock:
+        return len(_pending)
+
+
+def buffer_stats() -> dict:
+    """Снимок буфера для `/api/metrics`: сколько ждёт, сколько пачек ушло, возраст heads."""
+    with _pending_lock:
+        age = round(time.monotonic() - _pending_since, 2) if _pending else 0.0
+        return {"pending": len(_pending), "age_s": age, "flushes": _flush_writes,
+                "batch": _FLUSH_BATCH, "max_age_s": _FLUSH_AGE_S}
+
+
+def reset_buffer() -> None:
+    """Забыть буфер (только для тестов: состояние модуля не должно протекать между тестами)."""
+    global _pending_since, _flush_fut, _flush_loop, _flush_writes
+    with _pending_lock:
+        _pending.clear()
+        _pending_since = 0.0
+    _flush_fut = _flush_loop = None
+    _flush_writes = 0
 
 
 def read_journal(tail: int | None = None) -> list[dict]:
@@ -250,6 +411,8 @@ def as_json(limit: int = 20) -> dict:
 
     In-memory буфер пуст после рестарта — тогда окно достраивается из журнала
     data/metrics.jsonl, чтобы история времени/токенов/качества не терялась."""
+    # Буфер намеренно НЕ сбрасываем: он синхронно писал бы I/O из async-роута, а память
+    # всегда свежее журнала — отчёту недостающие на диске строки не нужны.
     all_samples = list(_samples)
     restored_from_journal = False
     if not all_samples:
@@ -259,6 +422,9 @@ def as_json(limit: int = 20) -> dict:
     snapshot = {
         "samples_total": len(all_samples),
         "restored_from_journal": restored_from_journal,
+        # D14: сколько метрик ещё в буфере и не дописано в data/metrics.jsonl
+        "journal_pending": pending_count(),
+        "journal_buffer": buffer_stats(),
         "windows": {
             "all": _aggregate(all_samples),
             "recent_60": _aggregate(recent),

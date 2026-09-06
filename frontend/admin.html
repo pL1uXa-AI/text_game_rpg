@@ -83,10 +83,12 @@
 
   <div class="admin-panel">
     <h2>🎛 Генерация по умолчанию (для новых миров)</h2>
-    <label>Температура <input type="text" id="a-default-temp" placeholder="0.8"></label>
-    <label>Top-P <input type="text" id="a-default-top-p" placeholder="0.95"></label>
-    <label>Max токенов <input type="text" id="a-max-tokens" placeholder="2000"></label>
-    <label>Размер контекста <input type="text" id="a-context-tokens" placeholder="32768"></label>
+    <!-- A9 (аудит 41): поля числовые и с теми же границами, что клампит сервер
+         (config.NUM_RANGES) — форма не предлагает то, что будет подрезано. -->
+    <label title="0…2">Температура <input type="number" min="0" max="2" step="0.05" id="a-default-temp" placeholder="0.8"></label>
+    <label title="0…1">Top-P <input type="number" min="0" max="1" step="0.05" id="a-default-top-p" placeholder="0.95"></label>
+    <label title="16…32768">Max токенов <input type="number" min="16" max="32768" step="1" id="a-max-tokens" placeholder="2000"></label>
+    <label title="512…262144">Размер контекста <input type="number" min="512" max="262144" step="1" id="a-context-tokens" placeholder="32768"></label>
     <label title="Вес BM25 в гибридном поиске памяти (0 = только косинус Chroma, 1 = только BM25).">
       Вес BM25 в гибридном поиске RAG <input type="number" min="0" max="1" step="0.05" id="a-hybrid-weight" placeholder="0.4">
     </label>
@@ -198,7 +200,7 @@
     <label class="check" title="Дамп собранного промпта хода в лог на DEBUG — видно, что реально ушло в модель">
       <input type="checkbox" id="a-log-prompt-dump"> 🧾 Дампить промпт хода в журнал</label>
     <label>Размер файла журнала до ротации, байт
-      <input type="number" min="65536" max="268435456" step="65536" id="a-log-max-bytes" placeholder="5242880"></label>
+      <input type="number" min="1048576" max="268435456" step="65536" id="a-log-max-bytes" placeholder="5242880"></label>
     <label>Архивных файлов журнала
       <input type="number" min="0" max="30" id="a-log-backup-count" placeholder="3"></label>
     <label title="Повторов ПОСЛЕ первой попытки; 0 = отключить">
@@ -216,8 +218,8 @@
       <input type="checkbox" id="a-bg-yield-turn"> ⏳ Фон уступает ход игрока</label>
     <label class="check" title="Выключи, чтобы рассказчик всегда получал ПОЛНЫЙ промпт: ярусы режут правила о подсистемах, которых в мире пока нет">
       <input type="checkbox" id="a-prompt-tiers"> ✂️ Ярусы системного промпта (экономия контекста)</label>
-    <label title="Каждая точка ~1–5 КБ JSON; 0 = хранить все">
-      Хранить точек перемотки на мир <input type="number" min="0" max="5000" id="a-snapshot-keep" placeholder="120"></label>
+    <label title="Каждая точка ~1–5 КБ JSON; 0 = хранить все; меньше 10 сервер не отдаёт — точки кончатся слишком быстро">
+      Хранить точек перемотки на мир <input type="number" min="0" max="100000" id="a-snapshot-keep" placeholder="120"></label>
   </div>
 
   <div class="admin-panel">
@@ -256,6 +258,7 @@
       <button id="a-save" class="btn primary">💾 Сохранить всё</button>
       <button id="a-reset" class="btn danger">Сбросить всё к .env</button>
     </div>
+    <p class="note" id="a-stale"></p>
     <p class="note">Сохранение применяется сразу (пересчитывается конфиг). Изменения провайдеров затрагивают
       миры без своих пер-мировых настроек.</p>
     <div id="save-state"></div>
@@ -357,6 +360,18 @@ async function load() {
   const eff = d.effective || {};
   const prov = eff.providers || {};
   ALL_ADMIN_KEYS = (d.overridable && d.overridable.length) ? d.overridable : ALL_ADMIN_KEYS;
+  // B5 (аудит 41): «осколки» — строки админки, под которые в конфиге уже нет поля (снятую
+  // ручку RERANK_TOP_N сброс не снимал НИКАК: живое имя её не накрывало). Показываем и
+  // добавляем к сбросу, чтобы кнопка «Сбросить всё к .env» чистила таблицу целиком.
+  STALE_KEYS = (d.stale || []).slice();
+  const staleBox = $("a-stale");
+  if (staleBox) {
+    staleBox.textContent = STALE_KEYS.length
+      ? "⚠ В таблице админки остались ключи, которые конфиг НЕ читает: " + STALE_KEYS.join(", ") +
+        " (настройка снята с поддержки — «сбросить всё к .env» их уберёт)"
+      : "";
+    staleBox.style.display = STALE_KEYS.length ? "" : "none";
+  }
 
   ["main", "embedding", "rerank"].forEach((kind) => {
     const p = prov[kind] || {};
@@ -671,6 +686,7 @@ $("a-save").onclick = save;
 // Теперь список приходит от сервера (d.overridable — он производен от dataclass Config).
 // FALLBACK-список на случай, если сервер не вернул d.overridable. Расходится с реальностью
 // не должен — сверяется тестом test_admin_reset_keys_match_backend.
+let STALE_KEYS = [];   // B5: строки админки без поля в Config (приезжают в d.stale)
 let ALL_ADMIN_KEYS = [
   "MAIN_BASE_URL", "MAIN_API_KEY", "MAIN_MODEL",
   "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
@@ -702,7 +718,7 @@ $("a-reset").onclick = async () => {
   // выключатели и «возврат к .env» на самом деле ВЫКЛЮЧАЛ судью, мастера, боевой ИИ,
   // события и озвучку. Теперь удаляем строки через `reset` (приоритет возвращается .env),
   // а выбранный провайдер оставляем как есть.
-  const payload = { reset: ALL_ADMIN_KEYS.slice() };
+  const payload = { reset: ALL_ADMIN_KEYS.concat(STALE_KEYS) };
   ["main", "embedding", "rerank"].forEach((k) => { payload[`${k}_provider`] = $val(`a-${k}-provider`); });
   try {
     await API("/api/admin/settings", { method: "POST", body: JSON.stringify(payload) });

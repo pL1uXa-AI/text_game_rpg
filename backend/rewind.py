@@ -18,8 +18,11 @@
      возвращается в недавнее окно (обратимость — суть фикса A1);
   5. векторы удалённых обменов/сводок вычищаются из ChromaDB (A4: память не должна помнить
      отменённое; ошибки чистки логируются, а не глотаются);
-  6. мир помечает точку отсчёта, и все открытые вкладки получают событие `rewound` —
-     чтобы UI перерисовал лог, а не дорисовывал к старому.
+  6. мир помечает точку отсчёта и рассылает по шине событие `rewound` (+ метку
+     `meta.rewound` на системной строке отката) — все открытые вкладки перерисовывают лог,
+     а не дорисовывают его к устаревшему. Запасной путь (поллинг без SSE) доносит тот же
+     сигнал через метку события — иначе вкладка без живого соединения показывала бы удалённые
+     ходы до F5 (A11, аудит 41).
 
 Законы архитектуры: перемотка — служебная операция пользователя над собственным
 прохождением (как загрузка сохранения); решений за мастера движок не принимает.
@@ -29,10 +32,18 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from . import chroma_client, db
+from . import bg, bus, chroma_client, db
 from .logsetup import get_logger, turn_context
 
 log = get_logger(__name__)
+
+
+class RewindBusy(RuntimeError):
+    """Мир сейчас недосягаем для отката: идёт ход игрока, ↻ или другой откат (A5).
+
+    Поднимается ДО любой записи в БД — роутер превращает его в честный 409, а мир
+    остаётся ровно таким, каким был (ни событий, ни состояния не тронуто).
+    """
 
 
 def _folded_ranges_covering(world_id: int, from_seq: int) -> list[dict]:
@@ -84,7 +95,24 @@ async def rewind_to(world_id: int, before_seq: int, setting: Optional[dict] = No
     В обоих режимах всё, что было свёрнуто в ставшие недостоверными сводки, разворачивается
     обратно в недавнее окно (обратимость — суть фикса A1), а векторы удалённого вычищаются
     из ChromaDB (A4).
+
+    A5 (аудит 41): весь откат идёт под барьером `bg.rewind_block` — тот же `_regen`, что и у ↻.
+    Без него перемотка «догоняла» идущий ход и фоновые агенты: откат случался раньше, чем ход
+    дописал события/setting, и мир сразу после «перемотки» уезжал в будущее. Теперь такой
+    откат невозможен: занятый мир отдаёт `RewindBusy` (роутер превращает его в 409) БЕЗ
+    единой записи в БД.
     """
+    with bg.rewind_block(world_id) as ok:
+        if not ok:
+            raise RewindBusy(
+                "По этому миру сейчас идёт ход или перегенерация — перемотка/загрузка не "
+                "могла бы честно догнать таймлайн. Дождись ответа и повтори.")
+        return await _rewind_to(world_id, before_seq, setting=setting, mode=mode, note=note)
+
+
+async def _rewind_to(world_id: int, before_seq: int, setting: Optional[dict] = None,
+                     mode: str = "delete", note: str = "⏪ Перемотка") -> dict:
+    """Тело отката — вызывается только из `rewind_to`, под барьером."""
     hide = mode == "hide"
     seq = int(before_seq)
     with turn_context(world_id=world_id, seq=seq, agent="rewind"):
@@ -160,12 +188,25 @@ async def rewind_to(world_id: int, before_seq: int, setting: Optional[dict] = No
         ev = db.add_event(world_id, "system",
                           f"{note}: возврат к ходу {seq} — {verb} событий {removed_n}, "
                           f"сводок {len(removed_summaries)}, возвращено в недавнюю память "
-                          f"{unfolded_n}.")
+                          f"{unfolded_n}.",
+                          # A11 (аудит 41): метка на строке отката — носитель сигнала для
+                          # вкладок БЕЗ живой SSE-ленты (запасной поллинг читает события).
+                          meta={"rewound": {"to_seq": seq, "mode": mode}})
         # 6) память не должна помнить отменённое (A4) — в обоих режимах
         await _purge_vectors(world_id, exchange_seqs,
                              [s["seq"] for s in stale] if hide else removed_summaries)
         log.info("перемотка (world %s, mode=%s): %d событий, %d сводок, развёрнуто %d",
                  world_id, mode, removed_n, len(removed_summaries), unfolded_n)
+        # A11 (аудит 41): обещание из докстринга модуля — в жизни. Раньше `rewound` не
+        # публиковался НИГДЕ, и вторая открытая вкладка после отката в первой держала
+        # удалённый лог (дорисовывая к нему новые ходы) до ручного F5.
+        # Публикуем ПОСЛЕ всех записей в БД: вкладка по этому сигналу перезагружает мир,
+        # и перезагрузка обязана увидеть уже откатанный таймлайн.
+        # `bus.publish` (не publish_threadsafe) — мы и так в цикле событий приложения
+        # (async-роут), а глобальный `_loop` шины может указывать на другой/мёртвый цикл.
+        bus.publish(world_id, {"type": "rewound", "world_id": world_id, "seq": seq,
+                               "mode": mode, "event_id": ev["id"],
+                               "latest_seq": db.latest_seq(world_id)})
         return {"ok": True, "world_id": world_id, "seq": seq, "mode": mode,
                 "removed_events": removed_n, "removed_summaries": len(removed_summaries),
                 "unfolded": unfolded_n, "setting": setting, "event": ev,

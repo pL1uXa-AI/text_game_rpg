@@ -112,8 +112,9 @@ def test_export_import_json_roundtrip(world_with_history):
     assert r2.status_code == 200, r2.text
     new_id = r2.json()["world_id"]
     assert client.get(f"/api/worlds/{new_id}").status_code == 200
-    assert len(client.get(f"/api/worlds/{new_id}/history").json()) == \
-           len(client.get(f"/api/worlds/{wid}/history").json())
+    # A8 (аудит 41): сравниваем события страницы, а не сам dict ответа {events, truncated}
+    assert len(client.get(f"/api/worlds/{new_id}/history").json()["events"]) == \
+           len(client.get(f"/api/worlds/{wid}/history").json()["events"])
 
 
 def test_export_json_download_header(world_with_history):

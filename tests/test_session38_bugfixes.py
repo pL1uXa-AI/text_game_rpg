@@ -875,7 +875,13 @@ def test_prompt_rules_numbering(fake_config):
             plain = sorted(int(x) for x in nums if x[-1].isdigit())
             assert plain == list(range(1, max(plain) + 1)), \
                 f"номера правил с дыркой (canon={bool(canon)}, tools={tools}): {plain}"
-            assert max(plain) == 36, f"хвост правил уехал (canon={bool(canon)}): {max(plain)}"
+            assert max(plain) == narrator_mod.TAIL_RULE_BASE + len(narrator_mod.TAIL_RULES) - 1, \
+                f"хвост правил уехал (canon={bool(canon)}): {max(plain)} != " \
+                f"{narrator_mod.TAIL_RULE_BASE}+{len(narrator_mod.TAIL_RULES)}-1"
+            # Сессия 63: правило хвоста обязано доходить до «живого мира» — иначе мир снова
+            # рельсовый (канва сюжета тащит игрока к написанному финалу).
+            assert "ЖИВОЙ МИР vs КАНВА СЮЖЕТА" in p, \
+                f"правило 37 пропало из промпта (tools={tools})"
             # подстроки правил не должны дублировать заголовки других правил (trim режет
             # строку по номеру — дубль заголовка вернул бы вырезанное правило обратно)
             assert p.count("ФРАКЦИИ → ПУТЬ ИГРОКА") == 1, \

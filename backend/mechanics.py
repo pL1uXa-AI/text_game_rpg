@@ -24,6 +24,7 @@ import re
 from typing import Any, Optional
 
 from .directives import normalize as _normalize_directives
+from .plot_deviation import plot_deviation_add
 
 from .logsetup import get_logger
 
@@ -311,6 +312,25 @@ def recalc_derived(p: dict, difficulty: str = "normal") -> None:
     p["mp"] = min(p.get("mp", p["max_mp"]), p["max_mp"])
 
 
+def _flag_mark(value) -> str:
+    """Человекочитаемая отметка значения флага для системки (D8).
+
+    Значения флагов читает судья и `station:`-крафт, поэтому движок их НЕ меняет —
+    тут только перевод в текст: булево/«true»/«1» → «да», «false»/«0» → «нет»,
+    строка-факт («ключ у мельника») → сама строка (квотится в 60 знаков)."""
+    if isinstance(value, str):
+        s = value.strip()
+        low = s.lower()
+        if low in ("true", "1", "да", "yes", "on"):
+            return "да"
+        if low in ("false", "0", "нет", "no", "off", ""):
+            return "нет"
+        return s[:60]
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "да" if value else "нет"
+    return "да" if value else "нет"
+
+
 def _safe_int(v, default=0):
     """Безопасный int(): кривое от LLM (строка/None/мусор) → default, иначе падение хода."""
     try:
@@ -490,10 +510,17 @@ def _norm_item(item: Any) -> dict:
 
 
 def _give_item(setting: dict, name: str, qty: int, desc: str = "",
-               weight: float | None = None) -> None:
+               weight: float | None = None, value: int | None = None) -> None:
     """Добавить предмет в инвентарь игрока (склеивает по имени).
     weight (кг / условные единицы) — опциональный вес предмета для системы
-    вместимости; если не задан, вес сохраняется как есть (0 = невесомый)."""
+    вместимости; если не задан, вес сохраняется как есть (0 = невесомый).
+    value (цена продажи) — ЕДИНСТВЕННАЯ точка, где предмету проставляется
+    ценность (D9, аудит 41): раньше `add_item` дописывал её отдельным
+    вторичным поиском по инвентарю, а `trade_buy` — третьим; у нового
+    предмета значение появлялось «боковой дверью». Теперь и у нового, и у
+    уже лежащего в рюкзаке предмета значение пишет это же звено, и только
+    когда значение реально передано (None = не трогать прежнее).
+    """
     inv = setting["player"].setdefault("inventory", [])
     found = next((x for x in inv if x.get("name") == name), None)
     if found:
@@ -502,12 +529,16 @@ def _give_item(setting: dict, name: str, qty: int, desc: str = "",
             found["desc"] = desc
         if weight is not None:
             found["weight"] = float(weight)
+        if value is not None:
+            found["value"] = value
     else:
         entry = {"name": name, "qty": qty}
         if desc:
             entry["desc"] = desc
         if weight is not None:
             entry["weight"] = float(weight)
+        if value is not None:
+            entry["value"] = value
         inv.append(entry)
 
 
@@ -1745,14 +1776,25 @@ class ItemHandler(DirectiveHandler):
         msgs: list[str] = []
         p = setting["player"]
         if "add_item" in d:
+            # D9 (аудит 41): сводим к ОДНОМУ сообщению на ход. Модель, которой
+            # игрок сказал «выдай 1000 мечей», нередко шлёт add_item списком из
+            # сотен пунктов (или повторяет один предмет несколько раз), и раньше
+            # каждый пункт рождал свою системку → чат тонул, а карточке предмета
+            # в `origins` доставалась случайная из копий. Предметы склеивает
+            # `_give_item`, здесь склеиваем и показ (по имени, суммируя qty).
+            got: dict[str, int] = {}
             for it in d["add_item"]:
                 ni = _norm_item(it)
-                _give_item(setting, ni["name"], ni["qty"], ni.get("desc", ""), float(ni.get("weight", 0) or 0))
-                if ni.get("value") is not None:
-                    found = next((x for x in setting["player"]["inventory"] if x["name"] == ni["name"]), None)
-                    if found:
-                        found["value"] = ni["value"]
-                msgs.append(f"Получено: {ni['name']} ×{ni['qty']}")
+                _give_item(setting, ni["name"], ni["qty"], ni.get("desc", ""),
+                           float(ni.get("weight", 0) or 0), value=ni.get("value"))
+                got[str(ni["name"])] = got.get(str(ni["name"]), 0) + ni["qty"]
+            if got:
+                names = list(got.items())
+                shown, tail = names[:6], len(names) - 6
+                txt = "; ".join(f"{nm} ×{q}" for nm, q in shown)
+                if tail > 0:
+                    txt += f" … и ещё {tail}"
+                msgs.append(f"🎒 Получено: {txt}")
         if "remove_item" in d:
             for it in d["remove_item"]:
                 ri = _norm_item(it)
@@ -1886,11 +1928,11 @@ class EconomyHandler(DirectiveHandler):
                         stock["qty"] -= qty
                         if stock["qty"] <= 0:
                             sh["items"].remove(stock)
-                        _give_item(setting, item, qty, stock.get("desc", ""), float(stock.get("weight", 0) or 0))
                         # покупка: предмет в руках наследует ценность покупки (для продажи)
-                        _bought = next((x for x in setting["player"]["inventory"] if x.get("name") == item), None)
-                        if _bought is not None and stock.get("value"):
-                            _bought["value"] = _safe_int(stock.get("value"), 0)
+                        # (D9: тем же вызовом, что и выдача — без второго поиска по инвентарю)
+                        _give_item(setting, item, qty, stock.get("desc", ""),
+                                   float(stock.get("weight", 0) or 0),
+                                   value=(_safe_int(stock.get("value"), 0) or None))
                         msgs.append(f"🛒 Куплено: {item} ×{qty} за {total} 🪙.")
         if "trade_sell" in d and isinstance(d["trade_sell"], dict):
             ts = d["trade_sell"]
@@ -2250,7 +2292,7 @@ class QuestHandler(DirectiveHandler):
     `quest {id, timer: {name, turns, desc}}` — заводится таймер в setting.timers со ссылкой
     `quest`, тикает общим механизмом (с32) и при истечении только напоминает (правило 30)."""
     keys = frozenset({"quest", "quest_done", "quest_advance", "quest_choose",
-                      "quest_success", "quest_fail"})
+                      "quest_success", "quest_fail", "quest_remove"})
 
     def apply(self, setting: dict, d: dict) -> list[str]:
         msgs: list[str] = []
@@ -2350,6 +2392,32 @@ class QuestHandler(DirectiveHandler):
                     if setting["quests"][nxt.strip()].get("status") != "active":
                         setting["quests"][nxt.strip()]["status"] = "active"
                         msgs.append(f"📜 Продолжение: {setting['quests'][nxt.strip()].get('title', nxt)}")
+        # Сессия 63 («живой мир»): quest_remove {id | [id, ...]} — СТЕРЕТЬ квест совсем.
+        # Отличие от quest_done/quest_fail принципиальное: «выполнен»/«провален» — это итог,
+        # которого игрок не переживал, а арка канвы сюжета, ставшая невозможной (её участники
+        # мертвы, город уничтожен, фракция распущена), не имеет ни того, ни другого. Без
+        # удаления рассказчик был вынужден «закрывать» несуществуемую арку — и статистика
+        # (progress.quests_done) врала, и в списке висел мёртвый квест. Решение удалять — за
+        # мастером (закон 3); движок лишь исполняет и убирает привязанный дедлайн.
+        if "quest_remove" in d:
+            raw_qr = d["quest_remove"]
+            ids = ([raw_qr] if isinstance(raw_qr, str)
+                   else [x for x in raw_qr if isinstance(x, str)] if isinstance(raw_qr, list)
+                   else [str(raw_qr.get("id"))] if isinstance(raw_qr, dict) else [])
+            for qid in [str(i).strip() for i in ids if str(i).strip()]:
+                quest = setting["quests"].get(qid)
+                if quest is None:
+                    msgs.append(f"📌 Квест «{qid}» не найден.")
+                    continue
+                # ВАЖНО: снять дедлайн ДО удаления квеста — _quest_timer_finish ищет квест
+                # в setting["quests"] и на уже удалённом молча выйдет, оставив сиротский
+                # таймер, который тикал бы в «Таймерах мира» до скончания мира.
+                _quest_timer_finish(setting, qid, msgs)
+                setting["quests"].pop(qid, None)
+                # Формулировка — языком МИРА, а не движка: это строка журнала, которую читает
+                # игрок (закон 2: показать принятое изменение, а не внутреннюю механику).
+                # «Квест удалён/убран из мира» звучало как отчёт админки.
+                msgs.append(f"📕 Квест «{quest.get('title', qid)}» больше не актуален — его больше нет.")
         return msgs
 
 
@@ -2483,7 +2551,7 @@ class NpcHandler(DirectiveHandler):
 
 class LocationHandler(DirectiveHandler):
     """Локации: создание/обновление/портал (move) + граф карты мира."""
-    keys = frozenset({"location_add", "location_update", "move"})
+    keys = frozenset({"location_add", "location_update", "location_remove", "move"})
 
     def apply(self, setting: dict, d: dict) -> list[str]:
         msgs: list[str] = []
@@ -2565,6 +2633,37 @@ class LocationHandler(DirectiveHandler):
                             if b not in cons:
                                 cons.append(b)
                     msgs.append(f"Переход: {setting['locations'][dst].get('name', dst)}")
+        # Сессия 63 («живой мир»): location_remove {id | [id,...]} — мир теряет место.
+        # До этого у движка были remove для фракций/квестов/магазинов/таймеров/предметов,
+        # но НЕ для локаций: город, стёртый с лица земли действием игрока, физически не
+        #куда было убрать — карта навсегда хранила живую точку канвы. Теперь мир может
+        # меняться под игрока и в географии. Запрет removal текущей локации — это ровно
+        # «код проверяет, мастер решает» (закон 3): пусть сперва выведет персонажа.
+        if "location_remove" in d:
+            raw_lr = d["location_remove"]
+            ids = ([raw_lr] if isinstance(raw_lr, str)
+                   else [str(x) for x in raw_lr if isinstance(x, (str, int))] if isinstance(raw_lr, list)
+                   else [str(raw_lr.get("id") or "")] if isinstance(raw_lr, dict) else [])
+            locs = setting.get("locations") or {}
+            cur = setting.get("current_location")
+            for lid in [str(i).strip() for i in ids if str(i or "").strip()]:
+                if lid not in locs:
+                    msgs.append(f"🗺 Локация «{lid}» не найдена (удалять нечего).")
+                    continue
+                if lid == cur:
+                    msgs.append(f"🗺 «{locs[lid].get('name', lid)}» нельзя стереть: игрок СЕЙЧАС здесь — "
+                                "сначала выведи его (move), тогда место уйдёт из мира.")
+                    continue
+                name = locs.pop(lid).get("name", lid)
+                # подчищаем входящие рёбра карты, иначе в connections мёртвый id
+                # остался бы как ссылка в никуда (и на SVG-карте — разорванная линия)
+                for other in locs.values():
+                    cons = other.get("connections")
+                    if isinstance(cons, list) and lid in cons:
+                        other["connections"] = [c for c in cons if c != lid]
+                        if not other["connections"]:
+                            other.pop("connections", None)
+                msgs.append(f"🗺 {name} больше нет — место стёрто с карты мира.")
         return msgs
 
 
@@ -2602,35 +2701,65 @@ class WorldHandler(DirectiveHandler):
     keys = frozenset({"flag", "time", "weather", "game_over"})
 
     def apply(self, setting: dict, d: dict) -> list[str]:
+        # D8 (аудит 41): раньше звено возвращало [] — ход, в котором мастер передвинул
+        # часы или поднял грозу, игрок замечал только по сайдбару. Законы не запрещают
+        # ПОКАЗ (закон 2: «это только чтение/отображение»), поэтому факт среды теперь
+        # системится в чат. Решает по-прежнему мастер (закон 3): движок ничего не
+        # оценивает и не спорит — он только озвучивает записанное.
+        msgs: list[str] = []
         if "flag" in d and isinstance(d["flag"], dict) and str(d["flag"].get("name", "")).strip():
             f = d["flag"]
             key = str(f["name"]).strip()
-            setting["flags"][key] = f.get("value", True)
+            value = f.get("value", True)
+            # «значение не поменялось» — не показываем: флаг-директива нередко повторяется
+            # из хода в ход (модель страхуется), а спам в чате хуже молчания.
+            # Сверяем ЧИТАЕМОЕ значение: True и "true" — один и тот же факт.
+            changed = (key not in setting["flags"]
+                       or _flag_mark(setting["flags"][key]) != _flag_mark(value))
+            setting["flags"][key] = value
             # п.12 (сессия 40): у флага может быть человекочитаемое название — оно идёт в
             # словарь `setting["flag_titles"]` (там же, где и `station:`-флаги), а наружу
             # — обычная системка. Названия НЕ храним в значении флага: значения читают
             # `location_stations` (булева станция), дневник и судья («флаг = факт»).
             title = str(f.get("title") or "").strip()[:120]
-            if title:
-                ft = setting.setdefault("flag_titles", {})
-                if isinstance(ft, dict) and ft.get(key) != title:
-                    ft[key] = title
+            ft = setting.setdefault("flag_titles", {})
+            if title and isinstance(ft, dict):
+                ft[key] = title
+            # `station:` — служебный флаг крафта (станция в месте), а не сюжетный факт:
+            # игрок читает её как «📕 Станции здесь», показывать «флаг station:кузня — да»
+            # = сыпать машинными ключами (тот же дефект, что п.12 чинил в названии флага).
+            if changed and not key.startswith("station:"):
+                shown = title or (ft.get(key) if isinstance(ft, dict) else "") or key
+                msgs.append(f"🚩 {str(shown).strip()[:120]} — {_flag_mark(value)}.")
         if "time" in d or "weather" in d:
             # п.14/п.14b (сессия 40): запоминаем ход, когда среда ДВИГАЛАСЬ в последний раз
             # — отдельно погоду и время суток (вечер/ночь залипают так же верно, как туман).
             # Счётчик нужен не «запретить туман», а показать мастеру в формате состояния,
             # что часы в мире не идут (закон 3: менять или нет — решает рассказчик).
             now = _safe_int(setting.get("_player_turns"), 0)
+            # показываем только РЕАЛЬНУЮ смену: авто-часы (`tick_time`) двигают время в
+            # начале хода и сами пишут «🕐 Часы мира: …»; если мастер в этом же ходе
+            # вернул то же значение — дубля в чате не будет (сличение в lower/strip).
+            prev_time = str(setting.get("time") or "").strip().lower()
+            prev_weather = str(setting.get("weather") or "").strip().lower()
             setting["_env_last_turn"] = now
             if "time" in d:
+                new_time = str(d["time"] or "").strip()
                 setting["_time_last_turn"] = now
                 setting["time"] = str(d["time"])
+                if new_time and new_time.lower() != prev_time:
+                    msgs.append(f"🕐 Время: {new_time}.")
             if "weather" in d:
+                new_weather = str(d["weather"] or "").strip()
                 setting["_weather_last_turn"] = now
                 setting["weather"] = str(d["weather"])
+                if new_weather and new_weather.lower() != prev_weather:
+                    msgs.append(f"🌦 Погода: {new_weather}.")
         if d.get("game_over"):
+            # отдельной системки здесь нет: финал озвучивает фронт («💀 Мир завершён.» по
+            # res.game_over), а смерть от урона — финальный чек apply_directives.
             setting["game_over"] = True
-        return []
+        return msgs
 
 
 class FactionHandler(DirectiveHandler):
@@ -2870,6 +2999,28 @@ class VisionHandler(DirectiveHandler):
         return msgs
 
 
+class PlotDeviationHandler(DirectiveHandler):
+    """`world_evolve {what, why}` — мастер ЯВНО свернул с канвы сюжета (сессия 63).
+
+    Миров из этого НЕ меняются ничего (локации/квесты/NPC правят своими директивами):
+    движок лишь хранит правду о том, что канва больше не закон, чтобы следующий промпт
+    не тащил игрока обратно в написанный сценарий (закон 2). Решает свернуть — мастер.
+    """
+
+    keys = frozenset({"world_evolve"})
+
+    def apply(self, setting: dict, d: dict) -> list[str]:
+        ev = d.get("world_evolve")
+        if isinstance(ev, str) and ev.strip():
+            ev = {"what": ev}
+        if not isinstance(ev, dict):
+            return []
+        msg = plot_deviation_add(setting, str(ev.get("what") or ""),
+                                 str(ev.get("why") or ""),
+                                 turn=setting.get("_player_turns"))
+        return [msg] if msg else []
+
+
 # Цепочка обработчиков: порядок сохраняет прежний порядок сообщений в выводе.
 DIRECTIVE_CHAIN: list[DirectiveHandler] = [
     PlayerHandler(),
@@ -2894,6 +3045,7 @@ DIRECTIVE_CHAIN: list[DirectiveHandler] = [
     CalendarHandler(),
     VisionHandler(),
     LocationHandler(),
+    PlotDeviationHandler(),
     WorldHandler(),
 ]
 

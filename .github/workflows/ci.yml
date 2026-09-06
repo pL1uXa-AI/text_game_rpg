@@ -62,12 +62,29 @@ jobs:
       - name: "Bat checks (D11: структура start_game/setup_*.bat)"
         run: python -X utf8 scripts/check_start_bat.py
 
+      - name: "Typo checks (C10 словарь опечаток + C3 латиница в кириллице)"
+        # Тот же класс, что проверяется тестом test_check_typos_script_runs, но без pytest —
+        # шаг назван в ROADMAP с сессии 38, а в CI его никогда не было (C3, сессия 61).
+        run: |
+          python -X utf8 scripts/check_typos.py
+          python -X utf8 scripts/check_typos.py --probe
+
+      - name: "Docs figures (C1: числа README/AGENT/ROADMAP = реальность)"
+        # --check: расхождение числа тестов/рассказчиков/сюжетов с кодом = красный CI.
+        # Чинится локально одной командой: python -X utf8 scripts/doc_figures.py --sync
+        run: python -X utf8 scripts/doc_figures.py
+
       - name: "Ruff lint (E4/E7/E9/F — баги, не стиль)"
         run: ruff check backend
 
+      # B1 (аудит 41): шаг был СЛОМАН второй раз — `mypy backend` падает на первом же
+      # файле («No parent module -- cannot perform relative import»: в проекте нет
+      # backend/__init__.py, запуск живёт на implicit namespace packages) и НЕ анализирует
+      # остальные файлы. Правильный запуск — `-p backend` (см. mypy.ini, сессия 38, D4).
+      # Из-за continue-on-error деградация была не видна: типизация в CI не проверялась.
       - name: "Mypy (не блокирует: подсветка типов, continue-on-error)"
         continue-on-error: true
-        run: mypy backend || echo "::warning::mypy нашёл замечания (не блокирует)"
+        run: mypy -p backend || echo "::warning::mypy нашёл замечания (не блокирует)"
 
       - name: "Coverage отчёт (информационный)"
         continue-on-error: true

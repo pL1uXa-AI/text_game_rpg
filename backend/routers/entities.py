@@ -4,16 +4,31 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from .. import chroma_client, db, narrator
 from ..logsetup import get_logger
+from ..ratelimit import guard_for
 from ..schemas import EntityIn
 from .core import _world_or_404
 
 log = get_logger(__name__)
 
 router = APIRouter(tags=["Карточки сущностей"])
+
+# A2 (аудит 41): ЕДИНЫЙ список видов. Раньше он был инлайном только в POST, и PATCH
+# принимал ЛЮБОЙ `kind` — карточка с kind=`<img src=x onerror=…>` возвращалась во фронте
+# в data-kind (а оттуда — в URL запроса). Синхронизирован с memory.ENTITY_KINDS.
+ENTITY_KINDS = ("npc", "location", "faction", "quest", "item", "event",
+                "enemy", "shop", "companion", "craft",
+                "race", "class", "profession", "skill", "effect")
+
+
+def _check_kind(world_id: int, kind: str) -> None:
+    """Неизвестный/грязный вид карточки — 400 (а не тихое создание строки с мусором)."""
+    if kind not in ENTITY_KINDS:
+        log.warning("entities (world %s): отклонён неизвестный вид карточки %r", world_id, kind[:60])
+        raise HTTPException(400, f"Неизвестный вид сущности: {kind}")
 
 
 @router.get("/api/worlds/{world_id}/entities")
@@ -36,14 +51,12 @@ async def entity_detail(world_id: int, kind: str, entity_key: str):
 
 
 @router.post("/api/worlds/{world_id}/entities")
-async def entity_create(world_id: int, body: EntityIn):
+async def entity_create(world_id: int, body: EntityIn,
+                        _rl: None = Depends(guard_for("entity_write"))):
     # A4 (аудит 38): карточку нельзя завести для несуществующего мира (осиротевшая строка,
     # см. A8) — проверка мира единая для всех методов этого роутера.
     _world_or_404(world_id)
-    if body.kind not in ("npc", "location", "faction", "quest", "item", "event",
-                          "enemy", "shop", "companion", "craft",
-                          "race", "class", "profession", "skill", "effect"):
-        raise HTTPException(400, f"Неизвестный вид сущности: {body.kind}")
+    _check_kind(world_id, body.kind)
     ent = db.upsert_entity(world_id, body.kind, body.key, name=body.name, summary=body.summary,
                            relationship=body.relationship, bio_add=body.bio_add, meta=body.meta,
                            seq=db.latest_seq(world_id))
@@ -52,8 +65,10 @@ async def entity_create(world_id: int, body: EntityIn):
 
 
 @router.patch("/api/worlds/{world_id}/entities/{kind}/{entity_key}")
-async def entity_patch(world_id: int, kind: str, entity_key: str, body: EntityIn):
+async def entity_patch(world_id: int, kind: str, entity_key: str, body: EntityIn,
+                       _rl: None = Depends(guard_for("entity_write"))):
     _world_or_404(world_id)
+    _check_kind(world_id, kind)   # A2 (аудит 41): PATCH раньше пропускал любой kind
     existing = db.get_entity(world_id, kind, entity_key)
     if not existing:
         raise HTTPException(404, "Карточка не найдена")

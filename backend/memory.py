@@ -37,6 +37,75 @@ log = get_logger(__name__)
 # Chroma (на импорте активного цикла событий ещё нет). Чистятся в lifespan приложения.
 PENDING_VECTOR_KEYS: list[str] = []
 
+# Последний итог сводки сиротских векторов (`sweep_orphan_vectors`) — чтобы `/api/system/status`
+# показывал счётчик без полного обхода коллекции на каждый опрос вкладки.
+LAST_VECTOR_SWEEP: dict = {}
+
+# Сколько id уходит в один запрос Chroma на удаление (pagina: сотни тысяч осиротевших
+# векторов не должны превращаться в один мегабайтный POST).
+VECTOR_DELETE_CHUNK = 500
+
+
+async def sweep_orphan_vectors(delete: bool = True) -> dict:
+    """Найти (и по умолчанию удалить) векторы миров, которых больше нет в SQLite.
+
+    Обратная сверка «вектор ↔ живой мир», которой в проекте не было НИГДЕ (аудит 41,
+    [A1 §5]): удаление мира начинается с чистки Chroma и при её отказе даёт 503 (с36), а
+    `prune_orphan_rows` чистит сирот в SQLite — но векторы миров, стёртых прямым SQL или
+    уехавших на бэкап, оставались навсегда: RAG по такой памяти может достать сюжет
+    удалённого мира, а счётчик «чанков» врёт игроку.
+
+    Идемпотентно и по тому же образцу, что `db.prune_orphan_rows` (правило 7: само-исцеление
+    допустимо): на чистых данных ничего не делает, только пишет `scanned`.
+
+    Трогает ВЕКТОРЫ целиком, состояние миров в SQLite не меняет (законы 2/3: это обслуживание
+    памяти, а не решение за мастера). Вектор, чей `world_id` не опознаётся, НЕ удаляется.
+    """
+    out: dict = {"scanned": 0, "orphan_worlds": 0, "orphan_vectors": 0, "deleted": 0,
+                 "dry_run": not delete, "collections": []}
+    if not await chroma_client.ping():
+        # Chroma лежит — это не ошибка сводки: чистка догонит при следующем старте.
+        out["skipped"] = "chroma_unavailable"
+        log.warning("чистка сиротских векторов пропущена: ChromaDB не отвечает")
+        return out
+    live = db.world_ids()
+    orphans: set[int] = set()
+    for name in chroma_client.collection_names_all():
+        try:
+            by_world = await chroma_client.get_ids_by_world(name)
+        except Exception as e:
+            # молчать нельзя (правило 14), но и ронять старт из-за одной коллекции глупо
+            log.warning("чистка сиротских векторов: обход коллекции %s не удался: %s", name, e)
+            out["error"] = f"{name}: {e}"
+            continue
+        out["collections"].append(name)
+        for wid, ids in sorted(by_world.items()):
+            out["scanned"] += len(ids)
+            if wid in live:
+                continue
+            orphans.add(wid)
+            out["orphan_vectors"] += len(ids)
+            if not delete:
+                continue
+            ok = 0
+            for i in range(0, len(ids), VECTOR_DELETE_CHUNK):
+                chunk = ids[i:i + VECTOR_DELETE_CHUNK]
+                try:
+                    await chroma_client.delete_by_ids(chunk)
+                    ok += len(chunk)
+                except Exception as e:
+                    log.warning("чистка сиротских векторов (мир %s уже удалён, %s id): %s",
+                                wid, len(chunk), e)
+            out["deleted"] += ok
+    out["orphan_worlds"] = len(orphans)
+    if out["orphan_worlds"]:
+        log.info("чистка сиротских векторов: %s векторов от %s удалённых миров%s",
+                 out["orphan_vectors"], out["orphan_worlds"],
+                 " (только подсчёт)" if not delete else f": убрано {out['deleted']}")
+    LAST_VECTOR_SWEEP.clear()
+    LAST_VECTOR_SWEEP.update(out)
+    return out
+
 
 # ══════════════════════════════════════════════════════════════
 # Векторная память: RAG-поиск + индексация
@@ -257,7 +326,7 @@ _MACHINE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_.\-]*$")
 
 def looks_machine_name(s: object) -> bool:
     """Похоже ли имя на внутренний id (`trail_to_outpost`, `orin_shop`), а не на
-    название из мира. Критерий conservativный: только латиница/цифры/`_-.` без пробелов
+    название из мира. Критерий консервативный: только латиница/цифры/`_-.` без пробелов
     — русские названия, «V-28» и «d20» под него НЕ попадают (они и есть человекочитаемые)."""
     t = str(s or "").strip()
     return bool(t) and bool(_MACHINE_KEY_RE.match(t))
@@ -653,7 +722,7 @@ def ensure_knowledge_cards(world_id: int, setting: dict, seq: int = 0,
                                              meta={"kind": ef.get("kind", "особый"), "turns": ef.get("turns", -1),
                                                    "damage": ef.get("damage", 0), "heal": ef.get("heal", 0),
                                                    "stacks": ef.get("stacks", 1), "mods": ef.get("mods") or {}}))
-        # предметы инвентаря — тоже в карточки знаний (условие получения из «Получено: …»)
+        # предметы инвентаря — тоже в карточки знаний (условие получения из «🎒 Получено: …»)
         for item in (p.get("inventory") or []):
             iname = str(item.get("name") or "").strip()[:120]
             if not iname:

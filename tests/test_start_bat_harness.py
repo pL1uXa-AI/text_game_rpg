@@ -125,6 +125,7 @@ def run_bat(sandbox: dict, *, llama: str = "200", chroma: str = "200",
         "GAME_NO_BROWSER": "1",
     })
     env.pop("GAME_BIND", None)
+    env.pop("GAME_BIND_CONFIRM", None)   # B2: иначе унаследованный из shells флаг «разрешить»
     env.pop("PY", None)
     env.update(extra_env or {})
     p = subprocess.run(["cmd", "/c", "start_game.bat"], cwd=str(sandbox["root"]), env=env,
@@ -198,10 +199,26 @@ def test_bat_reports_missing_interpreter(sandbox):
 
 
 def test_bat_honors_game_bind_env(sandbox):
-    """GAME_BIND — осознанный лаз (правило 5): по умолчанию loopback, явно — любой адрес."""
+    """GAME_BIND — осознанный лаз (правило 5): по умолчанию loopback, явно (с подтверждением) — любой адрес."""
     for bind in ("0.0.0.0", "10.0.0.5"):
-        r = run_bat(sandbox, extra_env={"GAME_BIND": bind})
+        r = run_bat(sandbox, extra_env={"GAME_BIND": bind, "GAME_BIND_CONFIRM": "1"})
         assert r.uvicorn and f"--host {bind}" in r.uvicorn[0], f"GAME_BIND={bind} проигнорирован"
+
+
+def test_bat_refuses_public_bind_without_confirm(sandbox):
+    """B2 (аудит 41): чужой адрес без GAME_BIND_CONFIRM — сервер НЕ поднимается.
+
+    Раньше launcher сам приглашал «запусти с GAME_BIND=0.0.0.0», выдавая игру без
+    авторизации (и админку с записью ключей) всей локальной сети."""
+    r = run_bat(sandbox, extra_env={"GAME_BIND": "0.0.0.0"})
+    assert not r.uvicorn, "без подтверждения bat всё равно вывел сервер наружу"
+    assert r.proc.returncode == 1
+    out = (r.proc.stdout + r.proc.stderr)
+    assert "GAME_BIND_CONFIRM" in out, f"нет внятного объяснения отказа: {out[-300:]}"
+    # localhost-варианты подтверждения НЕ требуют
+    for bind in ("127.0.0.1", "localhost"):
+        r = run_bat(sandbox, extra_env={"GAME_BIND": bind})
+        assert r.uvicorn, f"{bind} — ложный отказ (игрок не должен подтверждать своё же ПК)"
 
 
 def test_bat_does_not_launch_second_server(sandbox):

@@ -109,7 +109,7 @@ def test_rewind_via_api_delete(api_client):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["removed_events"] > 0
-    seqs = [e["seq"] for e in client.get(f"/api/worlds/{wid}/history?limit=0").json()]
+    seqs = [e["seq"] for e in client.get(f"/api/worlds/{wid}/history?limit=0").json()["events"]]
     assert max(seqs) <= target, f"после перемотки не должно быть ходов после {target}, есть {max(seqs)}"
 
 

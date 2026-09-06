@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from typing import Any, Optional
 
 from . import db
@@ -99,6 +98,20 @@ def notable_diff(prev: dict, now: dict, action: str = "", sys_msgs: Optional[lis
         elif q.get("progress") and q.get("progress") != old.get("progress"):
             out.append({"cat": CAT_QUEST, "title": f"{title}: {str(q['progress'])[:90]}",
                         "text": "Шаг пройден."})
+    # Сессия 63 («живой мир»): квест МОГ ИСЧЕЗНУТЬ (quest_remove — арка стала невозможной).
+    # Дневник знал только о появлении, поэтому стёртая директивой арка исчезала из журнала
+    # без следа: игроку выглядело так, будто задания никогда не было. Исчезновение — тоже
+    # реальное принятое изменение мира, его показывать можно и нужно (в отличие от
+    # мета-записей рассказчика про канву).
+    for qid in pq:
+        if qid in nq:
+            continue
+        old = _as_dict(pq[qid])
+        if str(old.get("status") or "active") != "active":
+            continue          # выполнен/провален — об этом уже сказано выше
+        t = str(old.get("title") or qid)[:80]
+        out.append({"cat": CAT_QUEST, "title": f"Больше не актуально: {t}",
+                    "text": "Обстоятельства изменились — это дело больше не стоит."})
 
     # ── персонажи: первая встреча и смерть ──
     pn, nn = _as_dict(prev.get("npc")), _as_dict(now.get("npc"))
@@ -193,6 +206,12 @@ def notable_diff(prev: dict, now: dict, action: str = "", sys_msgs: Optional[lis
     if cur_now and cur_now != str(prev.get("current_location") or "") and _as_dict(nl.get(cur_now)):
         nm = str(_as_dict(nl[cur_now]).get("name") or cur_now)[:60]
         out.append({"cat": CAT_PLACE, "title": f"Ты добрался: {nm}", "text": ""})
+    # Сессия 63: место могло СТЕРЕТЬСЯ (location_remove — разрушено/затоплено/закрыто).
+    for lid in pl:
+        if lid in nl:
+            continue
+        nm = str(_as_dict(pl[lid]).get("name") or lid)[:60]
+        out.append({"cat": CAT_PLACE, "title": f"Больше нет: {nm}", "text": "", "subject": nm})
 
     # ── мир: смерть/финал, сезон, доска, таймер ──
     if now.get("game_over") and not prev.get("game_over"):
@@ -254,34 +273,33 @@ def add_player_note(world_id: int, note: str) -> Optional[dict]:
 
 
 def entries(world_id: int, limit: int = 100, cat: str = "") -> list[dict]:
-    """Записи дневника хронологически: [{seq, cat, icon, title, text}]."""
-    rows = db.list_entities(world_id, kind=KIND)
-    out: list[dict] = []
-    for r in rows:
-        try:
-            meta = json.loads(r.get("meta") or "{}")
-        except Exception:
-            meta = {}
-        c = str(meta.get("cat") or CAT_WORLD)
-        if cat and c != cat:
-            continue
-        out.append({"seq": int(meta.get("seq") or r.get("seq") or 0), "cat": c,
-                    "icon": str(meta.get("icon") or _ICON.get(c, "•")),
-                    "title": r.get("name") or "", "text": r.get("summary") or "",
-                    "subject": str(meta.get("subject") or ""),
-                    "key": r.get("entity_key")})
+    """Записи дневника хронологически: [{seq, cat, icon, title, text}].
+
+    A7 (аудит 41): потолок `limit` и фильтр `cat` уходят в SQL (`db.list_cards`), а не
+    срезаются в Python после выборки ВСЕХ карточек мира. Поэтому `meta` целиком больше не
+    читается (иконку даёт `_ICON` по категории) и из выдачи убрано поле `subject`: его не
+    показывает ни фронт, ни `render()` — а ради него пришлось бы тащить весь JSON.
+    Записи отсортированы хронологически (SQL режет последние `limit`).
+    """
+    n = max(1, int(limit)) if limit else 0
+    rows = db.list_cards(world_id, KIND, limit=n, cat=cat)
+    out = [{"seq": int(r["seq"] or 0), "cat": str(r["cat"] or CAT_WORLD),
+            "icon": _ICON.get(str(r["cat"] or CAT_WORLD), "•"),
+            "title": r["name"] or "", "text": r["summary"] or "",
+            "key": r["entity_key"]} for r in rows]
     out.sort(key=lambda x: (x["seq"], x["cat"]))
-    return out[-max(1, int(limit)):] if limit else out
+    return out
 
 
 def entry_categories(world_id: int) -> list[dict]:
-    """Категории дневника с числом записей (для фильтров во вкладке)."""
-    counts: dict[str, int] = {}
-    for it in entries(world_id, limit=0):
-        c = str(it.get("cat") or CAT_WORLD)
-        counts[c] = counts.get(c, 0) + 1
+    """Категории дневника с числом записей (для фильтров во вкладке).
+
+    Счёт ведёт SQLite (`GROUP BY json_extract(meta,'$.cat')`) — раньше для этого
+    перебирались все карточки мира с разбором JSON в Python.
+    """
+    counts = db.count_cards_by_cat(world_id, KIND)
     return [{"cat": c, "icon": _ICON.get(c, "•"), "count": n}
-            for c, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+            for c, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
 
 
 def render(world_id: int, limit: int = 40) -> str:

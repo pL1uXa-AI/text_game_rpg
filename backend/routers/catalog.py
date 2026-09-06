@@ -62,6 +62,12 @@ async def narrators():
     # (INSERT OR IGNORE по name — идемпотентно, существующие записи не трогаются).
     if narrator.ensure_narrators_fresh():
         db.seed_narrators(narrator.NARRATOR_PRESETS)
+    # A13 (аудит 41): сид переехал из импорта app.py в старт приложения (lifespan, фоном),
+    # поэтому список может быть пустым в самый первый миг после запуска (или на совсем
+    # свежей базе, где стартовый проход ещё не дошёл) — здесь доводим до истины дёшево:
+    # один INSERT OR IGNORE только когда таблицы реально пустые.
+    if not db.list_narrators() and narrator.NARRATOR_PRESETS:
+        db.seed_narrators(narrator.NARRATOR_PRESETS)
     return db.list_narrators()
 
 

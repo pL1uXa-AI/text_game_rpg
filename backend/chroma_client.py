@@ -14,6 +14,7 @@ delete_by_* применяется к ОБЕИМ коллекциям (base и l
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Optional
 
 import httpx
@@ -197,6 +198,52 @@ async def delete_by_where(where: dict) -> None:
         except Exception as e:
             log_once(log, f"chroma-delw-{name}", 30, "ChromaDB: delete where из %s не удалось: %s",
                      name, e)
+
+
+async def get_ids_by_world(name: str, page: int = 1000, max_pages: int = 2000) -> dict[int, list[str]]:
+    """Пройти ВСЮ коллекцию постранично и собрать id векторов, сгруппированные по `world_id`.
+
+    Нужен обратной сверке «вектор ↔ живой мир» (`memory.sweep_orphan_vectors`, аудит 41,
+    [A1 §5]): `/get` без фильтра возвращает метаданные пачками, а `query` по определению не
+    может перечислить коллекцию (он отдаёт только `n_results` ближайших).
+
+    Ключ берётся из `metadata.world_id`; если его нет или он не читается — из префикса id
+    (`<kind>_<world_id>_…`, см. `memory.index_*`: `ex_19_5`, `ent_21_npc_herbalist`,
+    `sum_4_2`, `lore_7_3_0`). Векторы, чей владелец не опознаётся НИКАК, в ответе не
+    участвуют: sweep их НЕ трогает (лучше осиротевший вектор, чем удалённый живой).
+    """
+    cid = await ensure_collection(name)
+    out: dict[int, list[str]] = {}
+    offset = 0
+    for _ in range(max_pages):
+        data = await _raw("POST", _collection_url(cid, "/get"),
+                          {"limit": page, "offset": offset, "include": ["metadatas"]}) or {}
+        ids = data.get("ids") or []
+        if not ids:
+            break
+        metas = data.get("metadatas") or []
+        for i, vid in enumerate(ids):
+            wid = _world_id_of(vid, metas[i] if i < len(metas) else None)
+            if wid is not None:
+                out.setdefault(wid, []).append(vid)
+        offset += len(ids)
+        if len(ids) < page:
+            break
+    return out
+
+
+_PREFIX_RE = re.compile(r"^[a-z]+_(\d+)_", re.I)
+
+
+def _world_id_of(vec_id: str, meta: dict | None) -> Optional[int]:
+    """Владелец вектора: metadata `world_id` (источник истины при записи), иначе префикс id."""
+    if isinstance(meta, dict):
+        try:
+            return int(meta["world_id"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    m = _PREFIX_RE.match(vec_id or "")
+    return int(m.group(1)) if m else None
 
 
 async def query(query_embedding: list[float], n_results: int = 10, where: dict | None = None) -> list[dict]:

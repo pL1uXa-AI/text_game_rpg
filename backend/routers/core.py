@@ -301,8 +301,11 @@ def _fresh_setting_or_none(world_id: int) -> dict | None:
 CHAT_LOG_ROLES: tuple[str, ...] = ("player", "narrator", "system", "dice", "divine")
 
 
-async def _context_guard(world_id: int, providers: dict, gen_settings: dict) -> dict:
+async def _context_guard(world_id: int | None, providers: dict, gen_settings: dict) -> dict:
     """Авто-детект реального окна модели и защита от обрезов (сессия 33).
+
+    `world_id` — `None` при СОЗДАНИИ мира (D1, аудит 41: раньше сюда писали 0, и в логе
+    жил несуществующий «world 0», под который потом легко было найти «его» записи).
 
     Стандарт `CONTEXT_TOKENS=32768` рассчитан на облачные модели; локальная llama.cpp
     ходит с n_ctx 8192. Если мир заявляет больше, чем модель потянет, промпт обрезается
@@ -315,13 +318,15 @@ async def _context_guard(world_id: int, providers: dict, gen_settings: dict) -> 
     Возвращает (возможно обновлённый) dict gen_settings. Никогда не бросает —
     недоступный /models не должен валить создание мира или сохранение настроек."""
     g = dict(gen_settings or {})
+    # D1: «мира ещё нет» пишется в логе словом, а не нулём — выдуманный id не ищется.
+    who = f"world {world_id}" if world_id is not None else "новый мир"
     if not get_config().detect_model_context:
         return g
     try:
         prov = providers.get("main") or {}
         info = await llm.probe_context(prov)
     except Exception as e:
-        log.warning("context_guard (world %s): probe не удался — %s", world_id, e)
+        log.warning("context_guard (%s): probe не удался — %s", who, e)
         return g
     if not info:
         g.pop("context_limit", None)
@@ -335,8 +340,8 @@ async def _context_guard(world_id: int, providers: dict, gen_settings: dict) -> 
     safe = int(limit * 0.95)
     if declared > safe:
         g["context_tokens"] = max(512, safe)
-        log.warning("context_guard (world %s): контекст снижен %s → %s (лимит модели %s, %s)",
-                    world_id, declared, g["context_tokens"], limit, info["source"])
+        log.warning("context_guard (%s): контекст снижен %s → %s (лимит модели %s, %s)",
+                    who, declared, g["context_tokens"], limit, info["source"])
     return g
 
 
@@ -432,15 +437,24 @@ def _rag_note(world: dict, rag_chunks: list[str]) -> str | None:
 
 
 def _recent_block(world: dict | None, world_id: int,
-                  prompt_tokens: int | None = None) -> list[dict]:
+                  prompt_tokens: int | None = None,
+                  exclude_ids: set[int] | None = None) -> list[dict]:
     """Последние несвёрнутые события в пределах токен-бюджета (per-world контекст).
 
     B5: ограниченный запрос к SQLite вместо «весь лог мира в Python».
     A2: бюджет считается с ИЗМЕРЕННЫМ размером системного промпта этого мира.
-    """
+
+    A3 (аудит 41): `exclude_ids` — события ТЕКУЩЕГО хода, которые уже не должны попадать
+    в `[НЕДАВНЯЯ ИСТОРИЯ]`. Действие игрока отдельным блоком кладёт в промпт
+    `[ДЕЙСТВИЕ ИГРОКА]`, а к моменту сборки recent оно УЖЕ лежит в БД — без фильтра модель
+    читала одно и то же дважды (дубль съедал бюджет recent и провоцировал копирование
+    собственной формулировки). При ↻ отсекаются и события заменяемого хода (старый ответ
+    модель не должна перечитывать как «уже случившийся»)."""
     budget = narrator.world_recent_budget(world, prompt_tokens=prompt_tokens) if world \
         else get_config().recent_token_budget
     evs = db.get_unfolded_events(world_id, limit=max(40, int(budget / 40)))
+    if exclude_ids:
+        evs = [e for e in evs if e.get("id") not in exclude_ids]
     out: list[dict] = []
     used = 0
     for e in reversed(evs):
@@ -452,8 +466,18 @@ def _recent_block(world: dict | None, world_id: int,
     return list(reversed(out))
 
 
+# Пер-мирные границы gen_settings живут в config.GEN_LIMIT_KEYS / clamp_gen_settings (A9):
+# один реестр на глобальные (.env/админка) и per-world значения. Читает их narrator
+# (`world_gen_settings`) и этот модуль, поэтому мир с «max_tokens: 0» из старого сохранения
+# или из импортированного дампа больше не роняет каждый ход.
+
+
 def _gen_params(world: dict) -> dict:
-    g = json.loads(world.get("gen_settings") or "{}")
+    """Параметры хода из настроек мира — ПОСЛЕ клампа (A9, аудит 41).
+
+    `narrator.world_gen_settings` уже отдаёт подрезанный dict (он же читается при сборке
+    промпта и бюджетов), поэтому здесь остаётся только долить глобальные дефолты."""
+    g = narrator.world_gen_settings(world)
     cfg = get_config()
     return {"temperature": g.get("temperature", cfg.default_temp),
             "top_p": g.get("top_p", cfg.default_top_p),
@@ -724,18 +748,27 @@ async def _process_action(world_id: int, text: str, stream_emit=None, regenerate
     Сессия 36, п.3A: на время перегенерации мир ставится в барьер `bg.regen_block` —
     фоновые агенты старого хода (их директивы уже могли лечь в setting) не пишут в мир,
     пока состояние откатано к снапшоту и пересчитывается заново. Иначе ↻ теряло/двоило
-    их механику."""
+    их механику.
+
+    A5 (аудит 41): тот же барьер держит и ⏪ перемотка с загрузкой сохранения, а ход обязан
+    уступить, если мир уже занят (`bg.turn_block`) — иначе он дописал бы события/setting
+    поверх только что откатанного состояния («перемотал — и мир снова уехал в будущее»)."""
     if regenerate:
         with bg.regen_block(world_id) as acquired:
             # мир уже под перегенерацией (задвоенный клик/ретрай) — не лезем вторым проходом
             if not acquired:
                 raise HTTPException(409, "Перегенерация этого хода уже выполняется. Подожди.")
-            with bg.player_turn():
+            # барьер `_regen` занят НАМИ, поэтому отказывать можем только параллельному ходу
+            with bg.turn_block(world_id, allow_regen=True), bg.player_turn():
                 return await _process_action_inner(world_id, text, stream_emit=stream_emit,
                                                    regenerate=regenerate)
-    with bg.player_turn():
-        return await _process_action_inner(world_id, text, stream_emit=stream_emit,
-                                           regenerate=regenerate)
+    with bg.turn_block(world_id) as free:
+        if not free:
+            raise HTTPException(409, "По этому миру уже идёт ход, ↻ или перемотка. "
+                                     "Дождись ответа и повтори.")
+        with bg.player_turn():
+            return await _process_action_inner(world_id, text, stream_emit=stream_emit,
+                                               regenerate=regenerate)
 
 
 async def _process_action_inner(world_id: int, text: str, stream_emit=None,
@@ -811,16 +844,24 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
     if tick_msgs:
         action_ctx = "[Начало хода]\n" + "\n".join(tick_msgs) + "\n\n" + text
     player_ev = None
+    # A3 (аудит 41): id событий, которые НЕ должны попадать в `[НЕДАВНЯЯ ИСТОРИЯ]`, потому
+    # что они уже поданы модели отдельно (действие — в `[ДЕЙСТВИЕ ИГРОКА]`, старый ответ при
+    # ↻ всё равно будет удалён и записан заново).
+    prompt_skip_ids: set[int] = set()
     if regenerate:
         # ищем последнее действие игрока — под него индексируем новую версию ответа в памяти
         prev_player = db.get_latest_by_role(world_id, "player")
         idx_seq = prev_player["seq"] if prev_player else db.latest_seq(world_id)
+        if prev_player:
+            prompt_skip_ids.add(prev_player["id"])
         # заменяем события прошлого хода — по реестру, а при его отсутствии (после рестарта
         # сервера) по БД: тот же ход обязан быть заменён, а не задвоен (сессия 36, п.3B)
         replaced_ids = _turn_registry(world_id, idx_seq)
+        prompt_skip_ids.update(replaced_ids)
     else:
         player_ev = db.add_event(world_id, "player", text.replace("<<ENGINE>>", ""))
         idx_seq = player_ev["seq"]
+        prompt_skip_ids.add(player_ev["id"])
         replaced_ids = []
         # счётчик действий игрока — для динамических событий мира (раз в N ходов)
         setting["_player_turns"] = setting.get("_player_turns", 0) + 1
@@ -842,7 +883,8 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
     # но не блокирует игру), и каждая ошибка остаётся в логе (правило 14).
     rag_scores: list[dict] = []
     prompt_tokens_prev = int(setting.get("_ctx_prompt_tokens") or 0) or None
-    recent = _recent_block(world, world_id, prompt_tokens=prompt_tokens_prev)
+    recent = _recent_block(world, world_id, prompt_tokens=prompt_tokens_prev,
+                           exclude_ids=prompt_skip_ids)
     summaries = _summaries(world_id)
     entity_cards = narrator.select_relevant_entities(world_id, setting, text)
     mem_res, lore_res = await asyncio.gather(
@@ -988,11 +1030,19 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
             label = str(r.get("label", "проверка"))[:120]
             res = narrator.roll_expr(expr, mod)
             total = res["total"]
-            outcome = narrator.roll_outcome(total, dc, expr)
+            # D7 (аудит 41): исход считаем по фактическому броску (res["rolls"]) и по тому
+            # кубу, который реально бросили (res["expr"] после клампов), — а не по исходной
+            # строке модели и не по итогу: nat-1 в total не различим, а `1d20`/`D20+3`
+            # не проходили прежнюю проверку startswith("d20").
+            outcome = narrator.roll_outcome(total, dc, res.get("expr") or expr, res.get("rolls"))
             emoji = {"критический успех": "🎉", "успех": "✅", "провал": "❌", "критический провал": "💥"}.get(outcome, "")
+            # A1 (аудит 41): показываем ТОТ куб, что реально бросили (после клампов), и
+            # предупреждаем, если запрос модели пришлось подрезать.
+            shown = res.get("expr") or expr
+            note = f"\n⚠ {res['note']}" if res.get("note") else ""
             dice_ev = db.add_event(world_id, "dice",
-                                   f"🎲 Проверка «{label}»\nКуб: {expr}" + (f" +{mod}" if mod else "")
-                                   + f" → {' '.join(map(str, res['rolls']))} = {total}\nСложность: {dc}\n"
+                                   f"🎲 Проверка «{label}»\nКуб: {shown}" + (f" +{res.get('mod', mod)}" if res.get("mod", mod) else "")
+                                   + f" → {' '.join(map(str, res['rolls'])) or '—'} = {total}\nСложность: {dc}{note}\n"
                                    + f"Итог: {emoji} {outcome}",
                                    meta={"turn": idx_seq})
             dice_events.append(dice_ev)
@@ -1020,7 +1070,17 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
         cleaned = _dedupe_repeats(final_text)
         if cleaned != final_text:
             final_text = cleaned
-        if not _looks_finished(final_text) and not final_text.strip().endswith((".", "!", "?", "…")):
+        # D5 (аудит 41): раньше здесь стояло ВТОРОЕ условие — «текст не кончается точкой,
+        # восклицательным, вопросительным или многоточием». Оно ИЗБЫТОЧНО: `_looks_finished`
+        # возвращает True для любого текста, чей последний символ входит в _FINISH_CHARS,
+        # а эти четыре знака — её строгое подмножество. Значит «не закончен» уже означает
+        # «не кончается одним из них», и `and …` никогда не меняло результат (а на ответах,
+        # закрытых кавычкой, ещё и СПОРИЛО с первой эвристикой). Проверяем одним условием
+        # ровно то, для чего оно и нужно: ответ оборван на полуслове, финального знака нет.
+        # Поведение прежнее полностью — включая поблажки `_looks_finished` (пустой текст и
+        # короче 20 знаков). Снятие оставляет ОДНЮ точку правки: порог обрыва живёт в
+        # _FINISH_CHARS, а не в двух алфавитах, которые при правке разъехались бы молча.
+        if not _looks_finished(final_text):
             final_text = await _finish_cut_reply(world, setting, persona, providers,
                                                  final_text.strip(), text, sys_msgs)
     if not final_text.strip():
@@ -1214,6 +1274,8 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
         # были, а статистики по частоте обрезов — нет.
         fr = str(llm_finish.get("finish_reason") or "")
         cut_by_limit = fr == "length"
+        # D5 (аудит 41): то же условие, что решает выше, дописывать ли оборванный ответ
+        # (`_looks_finished`) — раньше оно было переписано здесь вторым экземпляром.
         cut_mid = (not cut_by_limit) and bool(final_text.strip()) \
             and not _looks_finished(final_text)
         metrics.record(
@@ -1276,7 +1338,13 @@ async def _maybe_logic_judge(world_id: int, setting: dict, action: str, reply: s
     согласованность биографии персонажа с его ролью (раса/класс/профессия/навыки).
     - Противоречие фактам → системное сообщение-«искажение реальности» (сюжетный поворот);
     - Несогласованность роли/биографии → применяет корректировку (движок директив) + системное сообщение.
-    Не блокирует ответ игроку, не запускается повторно для мира и не чаще интервала ходов."""
+    Не блокирует ответ игроку, не запускается повторно для мира и не чаще интервала ходов.
+
+    A4 (аудит 41): `setting` — снимок хода (`agents_setting`, deepcopy на момент подачи задачи),
+    а мир за время `sleep(1.5)` + ожидания bg-очереди успевает измениться (или агент ждёт
+    минуты), поэтому судья сверяет ход с ПЕРЕЧИТАННЫМ из БД состоянием `s`, а не со снимком:
+    иначе — ложные «искажения реальности» и `corrections` против фактов прошлого хода.
+    """
     if world_id in _judge_busy:
         return
     _judge_busy.add(world_id)
@@ -1297,7 +1365,7 @@ async def _maybe_logic_judge(world_id: int, setting: dict, action: str, reply: s
         turns = s.get("_player_turns", 0) or 0
         if turns - last < interval:
             return
-        res = await narrator.logic_judge(world_id, setting, action, reply,
+        res = await narrator.logic_judge(world_id, s, action, reply,
                                          lang=world.get("language", "ru"),
                                          provider=providers["main"])
         if not res:

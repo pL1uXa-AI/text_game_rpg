@@ -63,8 +63,29 @@ if %errorlevel% neq 0 (
 
 REM 3. Сервер игры
 REM ВАЖНО: слушаем ТОЛЬКО 127.0.0.1. В .env лежат живые API-ключи, у игры нет авторизации —
-REM доступ с 0.0.0.0 отдаёт админку (/admin) и весь API всей локальной сети.
+REM доступ с чужого адреса отдаёт админку (/admin) и весь API всей локальной сети.
 if "%GAME_BIND%"=="" set GAME_BIND=127.0.0.1
+
+REM B2 (аудит 41): этот launcher больше НЕ приглашает игрока «открыть наружу». Любой
+REM адрес, кроме localhost, теперь требует явного подтверждения GAME_BIND_CONFIRM=1:
+REM /api/admin/settings переписывает провайдеров и MAIN_BASE_URL (перехват промптов и
+REM ключей), а авторизации в игре нет. Подсказка «как это сделать» из вывода убрана —
+REM кто действительно хочет доступ с телефона, тот прочитает комментарий здесь.
+REM (При выходе наружу админка всё равно остаётся только с 127.0.0.1 — см. ADMIN_ALLOW_LAN,
+REM а лимиты запросов для чужих адресов урезаны в 4 раза — backend/ratelimit.py.)
+if "%GAME_BIND%"=="127.0.0.1" goto bind_ok
+if "%GAME_BIND%"=="localhost" goto bind_ok
+if "%GAME_BIND%"=="::1" goto bind_ok
+if "%GAME_BIND_CONFIRM%"=="1" goto bind_warn
+echo [ERROR] GAME_BIND=%GAME_BIND% — игра без авторизации ушла бы всей сетью наружу.
+echo         Нужен доступ с другого устройства — запусти с GAME_BIND_CONFIRM=1,
+echo         помня: в .env лежат живые API-ключи.
+pause
+exit /b 1
+:bind_warn
+echo [WARN]  GAME_BIND=%GAME_BIND% — сервер доступен НЕ только на этом ПК.
+echo         Админка /api/admin/settings при этом остаётся закрытой на localhost.
+:bind_ok
 
 REM D13 (аудит 38): вместо жёсткого абсолютного пути к python.exe — интерпретатор берётся
 REM из GAME_PYTHON (можно задать в .env-стиле/окружении), иначе из PATH. Раньше на любой
@@ -79,8 +100,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 echo [START] Text Game RPG: http://127.0.0.1:8002
-echo [INFO]  bind=%GAME_BIND% (чтобы открыть наружу — запусти вручную с GAME_BIND=0.0.0.0,
-echo         помня: авторизации в игре нет, в .env живые ключи)
+echo [INFO]  bind=%GAME_BIND%  ^(правило 5 в AGENT.md: наружу — только осознанно^)
 "%GAME_PYTHON%" -X utf8 -m uvicorn backend.app:app --host %GAME_BIND% --port 8002
 if %errorlevel% neq 0 (
     echo.

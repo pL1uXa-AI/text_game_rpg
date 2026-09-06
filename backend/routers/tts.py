@@ -7,11 +7,12 @@ import base64
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
 from .. import bg, db, narrator, tts
 from ..config import get_config
+from ..ratelimit import guard_for
 from ..schemas import TtsDownloadIn, TtsSettingsIn, TtsTestIn
 
 router = APIRouter(tags=["Озвучка (TTS)"])
@@ -61,7 +62,7 @@ async def world_tts_settings_set(world_id: int, body: TtsSettingsIn):
 
 
 @router.post("/api/tts/test")
-async def tts_test(body: TtsTestIn):
+async def tts_test(body: TtsTestIn, _rl: None = Depends(guard_for("tts_test"))):
     """Мгновенный синтез тестовой фразы: возвращает аудио base64 (для кнопки «Проверить голос»)."""
     cfg = get_config()
     provider = (body.provider or "").strip() or cfg.tts_provider or "none"
@@ -79,7 +80,7 @@ async def tts_test(body: TtsTestIn):
 
 
 @router.post("/api/tts/download")
-async def tts_download(body: TtsDownloadIn):
+async def tts_download(body: TtsDownloadIn, _rl: None = Depends(guard_for("tts_download"))):
     """Скачивание голосовых моделей: piper (голос) / kokoro (модель целиком)."""
     if body.provider == "piper":
         voice = body.voice or tts.DEFAULT_VOICES["piper"]
@@ -125,7 +126,8 @@ async def event_tts_status(world_id: int, event_id: int):
 
 
 @router.post("/api/worlds/{world_id}/events/{event_id}/tts/retry")
-async def event_tts_retry(world_id: int, event_id: int):
+async def event_tts_retry(world_id: int, event_id: int,
+                          _rl: None = Depends(guard_for("tts_retry"))):
     """Перезапускает фоновый синтез для события (ошибка/вручную)."""
     ev = db.get_event(event_id)
     if not ev or ev.get("world_id") != world_id:

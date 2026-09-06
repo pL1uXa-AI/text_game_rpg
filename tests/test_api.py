@@ -12,6 +12,15 @@ import json
 
 from backend import narrator as narrator_mod
 
+
+def hist(client, wid: int, **params) -> list[dict]:
+    """События GET /history (A8, аудит 41): ответ — страница `{events, truncated}`.
+    Тестам почти всегда нужен именно список, а форму ответа проверяет
+    tests/test_session48_history_page.py."""
+    body = client.get(f"/api/worlds/{wid}/history", params=params).json()
+    return body["events"] if isinstance(body, dict) else body
+
+
 # Тема по умолчанию — первый сюжет из plots/ (system). Раньше был хардкод THEME_ID;
 # встроенных тем больше нет — они живут файлами в plots/system и plots/user.
 THEME_ID = narrator_mod.THEMES[0]["id"]
@@ -184,6 +193,35 @@ def test_action_slash_roll(api_client):
     assert "🎲" in r.json()["reply"]
 
 
+def test_action_slash_roll_junk_never_500(api_client):
+    """A1 (аудит 41): `/roll d0` ронял ход на 500, `0d6` «бросал» ноль кубиков."""
+    client, holder = api_client
+    wid = client.post("/api/worlds", json={"theme_id": THEME_ID, "name": "C2"}).json()["world_id"]
+    for cmd in ("/roll d0", "/roll 0d6", "/roll d", "/roll 99999999d20", "/roll 1d99999999", "/roll абракадабра"):
+        r = client.post(f"/api/worlds/{wid}/action", json={"text": cmd})
+        assert r.status_code == 200, f"{cmd} → {r.status_code}"
+        reply = r.json()["reply"]
+        assert "🎲" in reply or "Формат" in reply, cmd
+        assert len(reply) < 4000, f"{cmd}: ответ раздут ({len(reply)} симв.)"
+        assert "= 0" not in reply, f"{cmd}: «бросок без броска» → {reply}"
+    # событие броска тоже обязано быть коротким и честным
+    evs = client.get(f"/api/worlds/{wid}/events").json()["events"]
+    dice = [e for e in evs if e["role"] == "dice"]
+    assert dice and max(len(e["content"]) for e in dice) < 4000
+
+    # тот же мусор от МОДЕЛИ (директива roll:) не должен ронять ход и терять системки
+    before = client.get(f"/api/worlds/{wid}").json()["setting"]["player"]["gold"]
+    holder["reply"] = ('Ты пробуешь замок.\n<<ENGINE>>{"roll": {"expr": "d0", "mod": 2, "dc": 12, '
+                       '"label": "взлом"}, "player": {"gold": 7}}')
+    r = client.post(f"/api/worlds/{wid}/action", json={"text": "взломать замок"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"]["player"]["gold"] == before + 7, "из-за кривого куба потерялись остальные директивы"
+    evs = client.get(f"/api/worlds/{wid}/events").json()["events"]
+    d = [e for e in evs if e["role"] == "dice"][-1]
+    assert "d20" in d["content"] and len(d["content"]) < 2000, d["content"]
+
+
 def test_action_slash_info_commands(api_client):
     client, _ = api_client
     wid = client.post("/api/worlds", json={"theme_id": THEME_ID, "name": "C1"}).json()["world_id"]
@@ -234,7 +272,7 @@ def test_regenerate_replaces_events(api_client):
     r2 = client.post(f"/api/worlds/{wid}/action", json={"text": "второй шаг"})
     assert r2.status_code == 200
     hist = client.get(f"/api/worlds/{wid}/history").json()
-    narr_before = [e for e in hist if e["role"] == "narrator"]
+    narr_before = [e for e in hist["events"] if e["role"] == "narrator"]
     # регенерируем второй (последний) ход
     holder["reply"] = "Второй ответ — перегенерирован."
     rr = client.post(f"/api/worlds/{wid}/action", json={"text": "второй шаг", "regenerate": True})
@@ -242,7 +280,7 @@ def test_regenerate_replaces_events(api_client):
     body = rr.json()
     assert "replaced_events" in body and len(body["replaced_events"]) >= 1
     hist2 = client.get(f"/api/worlds/{wid}/history").json()
-    narr_after = [e for e in hist2 if e["role"] == "narrator"]
+    narr_after = [e for e in hist2["events"] if e["role"] == "narrator"]
     assert len(narr_after) == len(narr_before), \
         f"перегенерация должна заменять (не добавлять): {len(narr_before)} → {len(narr_after)}"
 
@@ -335,7 +373,7 @@ def test_gen_settings_update(api_client):
 def test_feedback_clamped(api_client):
     client, _ = api_client
     wid = client.post("/api/worlds", json={"theme_id": THEME_ID, "name": "K"}).json()["world_id"]
-    ev = client.get(f"/api/worlds/{wid}/history").json()[-1]
+    ev = hist(client, wid)[-1]
     r = client.post(f"/api/worlds/{wid}/events/{ev['id']}/feedback", json={"value": 99})
     assert r.status_code == 200
 
@@ -358,15 +396,15 @@ def test_history_pagination(api_client):
     # несколько ходов, чтобы набрать события
     for i in range(5):
         client.post(f"/api/worlds/{wid}/action", json={"text": f"действие {i}"})
-    full = client.get(f"/api/worlds/{wid}/history").json()
+    full = hist(client, wid)
     assert len(full) > 3
     # страница до некой точки — строго раньше этого seq
-    page = client.get(f"/api/worlds/{wid}/history", params={"before": full[3]["seq"], "limit": 2}).json()
+    page = hist(client, wid, before=full[3]["seq"], limit=2)
     assert page, "нашлись более ранние события"
     assert all(e["seq"] < full[3]["seq"] for e in page), "все события страницы строго раньше before"
     assert len(page) <= 2, "limit соблюдён"
-    # без before — вся история (обратная совместимость)
-    assert len(client.get(f"/api/worlds/{wid}/history").json()) == len(full)
+    # без before — та же страница целиком (по умолчанию влезает: потолок см. сессию 48)
+    assert len(hist(client, wid)) == len(full)
 
 
 def test_export_history(api_client):
