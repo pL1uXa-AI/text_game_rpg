@@ -35,9 +35,11 @@ scripts\setup_env.bat
 **свой** изолированный venv ChromaDB в `data/chroma-venv`. Дальше — только `start_game.bat`.
 
 Окружение разработки (уже настроено):
-1. **llama.cpp сервер** на `127.0.0.1:8080` (OpenAI-совместимый `/v1`) — модель `Ternary-Bonsai-8B-TQ2_0`.
-2. **Python** `D:\Development\Development_Tools\Runtimes\Python\3.12.10\python.exe` (3.12.10, см. requirements.txt).
-3. **Своя ChromaDB игры** в `data/chroma-venv`, поднята на `127.0.0.1:8001`.
+1. **llama.cpp сервер** на `127.0.0.1:8080` (совместимый `/v1`) — любая загруженная модель
+   (какая именно — видно в `/props` сервера; игру интересует только окно контекста,
+   оно детектится само, `DETECT_MODEL_CONTEXT`).
+2. **Python** 3.12+ (см. `requirements.txt`; на новой машине ставится `scripts\setup_env.bat`).
+3. **Своя ChromaDB игры** в `data/chroma-venv`, поднимается на `127.0.0.1:8001`.
 
 ### Запуск
 ```bat
@@ -320,7 +322,7 @@ text_game/
 - `EMBEDDING_PROVIDER` (`routerai`|`openai_compat`|`local`|`none`): `EMBEDDING_BASE_URL/API_KEY/MODEL` (`qwen/qwen3-embedding-8b`, 4096-dim) — RouterAI. **`local`** — оффлайн FastEmbed: `LOCAL_EMBEDDING_MODEL` (по умолч. `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim), кэш `LOCAL_EMBEDDING_CACHE` (`data/fastembed`); не требует ключа/интернета. Chroma-коллекция при `local` — `text_game_memory_local` (разная размерность — разные коллекции).
 - `HYBRID_WEIGHT_BM25` (дефолт 0.4) — вес BM25 в гибридном поиске памяти RAG (0 = только косинус Chroma, 1 = только BM25); правится в админке (🎛 Генерация → «Вес BM25 в гибридном поиске RAG»).
 - `RERANK_PROVIDER` (`routerai`|`openai_compat`|`none`) + `RERANK_ENABLED` (глобальный выключатель): `RERANK_MODEL=voyageai/rerank-2.5`; `RERANK_BASE_URL` — базовый `/api/v1` (клиент сам добавляет `/rerank`).
-- `CHROMA_HOST/PORT/COLLECTION` — **своя** ChromaDB: `127.0.0.1:8001`, коллекция `text_game_memory` (не конфликтует с py_docs:8000).
+- `CHROMA_HOST/PORT/COLLECTION` — **своя** ChromaDB: `127.0.0.1:8001`, коллекция `text_game_memory` (порт выбран так, чтобы не пересекаться с другими ChromaDB на машине).
 - `DEFAULT_TEMP / DEFAULT_TOP_P / MAX_TOKENS / CONTEXT_TOKENS` — генерация по умолчанию; стандарт `MAX_TOKENS=2000` (макс. длина ответа), `CONTEXT_TOKENS=32768` (32k) — стартовый размер контекста новых миров (память ≈ контекст − оверхед − ответ; под облачные модели). Регулируется per-world ползунками «Max токенов»/«Размер контекста» в настройках; ползунок и сохранение допускают до 262144 (256k) для моделей с широким окном (128k/256k), не превышай фактическое n_ctx своей модели (локальная llama.cpp = 8192 — для неё уменьшай контекст).
   - ⚠️ `MAX_TOKENS` относится **только к обычным ходам** (ответы рассказчика на твои действия). Длина **вступительной сцены** задаётся отдельным жёстким лимитом в коде (`generate_opening`, `OPENING_MAX_TOKENS = 2400`) и настройками мира не управляется — меняется только в `backend/character_generator.py::generate_opening`. Вступление никогда не показывается оборванным: незаконченный текст (нет конца фразы или ответ упёрся в лимит) перегенерируется, а при неудаче берётся последнее полное предложение либо завязка сюжета.
 - `RECENT_TOKEN_BUDGET / SUMMARY_TOKEN_BUDGET / RAG_MEMORY_K / RAG_MEMORY_MAX / RAG_CANDIDATES` — параметры гибридной памяти (RECENT_TOKEN_BUDGET — запасной бюджет, когда у мира не задан контекст). **RAG-факты и лор растут с размером контекста мира** (база при 32k → пропорционально больше при 128k/256k, потолки RAG_MEMORY_MAX/LORE_RAG_K_MAX/LORE_TOKEN_BUDGET_MAX): с окном 256k рассказчик вспоминает до 24 фактов памяти и 12 лор-чанков, а не фиксированные 4+3. Правится в Админке (🧠 Память) и per-world ползунками в Настройках мира (0 = авто).

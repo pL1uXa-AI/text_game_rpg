@@ -128,14 +128,26 @@ def test_check_available_matches_probe():
 # ── HTTP-контур: статус-эндпоинт использует тот же критерий ──────────────
 
 def test_status_reports_401_as_up(api_client, monkeypatch):
-    """Раньше: голый GET без ключа + `== 200` → `llm.up: false` при живой модели."""
+    """Раньше: голый GET без ключа + `== 200` → `llm.up: false` при живой модели.
+
+    Ключ обязан УХОДИТЬ в probe статуса: без настройки в CI провайдер — llamacpp с
+    пустым ключом (заголовка нет по праву), поэтому сценарий «ключ есть» задаём явно.
+    """
     client, _ = api_client
     c = _Client(status_code=401)
     monkeypatch.setattr(llm_mod, "_get_client", lambda: c)
+    from backend.config import get_config
+
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "main_provider", "openai_compat")
+    monkeypatch.setattr(cfg, "main_api_key", "sk-TESTKEY")
     body = client.get("/api/system/status").json()
     assert body["llm"]["up"] is True
     assert body["llm"]["needs_key"] is True
-    assert c.headers.get("Authorization"), "статус обязан спрашивать модель с ключом"
+    assert c.headers.get("Authorization") == "Bearer sk-TESTKEY", \
+        "статус обязан спрашивать модель с ключом"
+    # ключ не утёк в ответ статуса (правило 3)
+    assert "sk-TESTKEY" not in body["llm"]["detail"]
 
 
 def test_status_reports_refused_as_down(api_client, monkeypatch):
