@@ -38,7 +38,7 @@
 
 | Область | Статус |
 |---------|--------|
-| **Git-репозиторий** `github.com/pL1uXa-AI/text_game_rpg` (приватный): `.gitignore` (секреты/`data/`/логи/папка идей), `.gitattributes` (LF + CRLF для .bat), `.env.example`, `requirements.txt` + `requirements-optional.txt`, `scripts/setup_env.bat` — окружение с нуля | ✅ сессия 33 |
+| **Git-репозиторий** `github.com/pL1uXa-AI/text_game_rpg` (**публичный** — проверено аудитом 42, `api.github.com` отдаёт `private=false`): `.gitignore` (секреты/`data/`/логи/папка идей), `.gitattributes` (LF + CRLF для .bat), `.env.example`, `LICENSE` (MIT), `requirements.txt` + `requirements-optional.txt`, `scripts/setup_env.bat` — окружение с нуля | ✅ сессия 33 |
 | **Безопасность**: сервер слушает **только 127.0.0.1** (был `--host 0.0.0.0` при живых ключах и отсутствии авторизации); `.env.*` (включая `.env.bak` с ключами) исключены из git; ключи не уходят ни в `/api/*`, ни в JSON-дамп | ✅ сессия 33 |
 | **Переносимость мира**: `GET /api/worlds/{id}/export/json` (состояние + все события + карточки + лор + слоты + граф) и `POST /api/worlds/import/json` (создаёт НОВЫЙ мир, память перестраивается фоново); кнопки «🗄 Полный дамп» / «📥 Импорт из дампа» в UI; авто-бэкап `data/game.db` при старте (`data/backups/`, SQLite Backup API, ротация `BACKUP_KEEP`) | ✅ сессия 33 |
 | **Метрики переживают перезапуск**: `data/metrics.jsonl` + `restored_from_journal` в `/api/metrics` (раньше буфер был чисто in-memory и обнулялся рестартом) | ✅ сессия 33 |

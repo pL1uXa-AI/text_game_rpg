@@ -139,7 +139,7 @@ llama.cpp или облако) генерирует ответ, мир живё�
     при незакрытом соединении/цикле (залоченный `game.db` на Windows), отказ rate-limit виден в
     журнале с ключом. Исключение — легальные фолбэки (RAG при выключенных эмбеддингах — ожидаемое
     поведение, а не ошибка; сама недоступность RAG логируется).
-15. **Git и секреты (сессия 33)**: репозиторий `github.com/pL1uXa-AI/text_game_rpg` — **приватный**. В git НЕ попадают: `.env` и любые `.env.*` (живые ключи), вся папка `data/` (game.db, chroma, chroma-venv, tts, fastembed, backups, metrics.jsonl, logs/), логи, `nul`, кэши, `__pycache__`. В репозитории — код, документация, `plots/` и `.env.example` (шаблон без ключей). Перед каждым пушем проверять: `git diff --cached | grep -ciE "sk-[A-Za-z0-9]{12,}"` → **0**. JSON-дамп мира (`/export/json`) обязан быть без ключей (тест `test_world_dump_strips_api_keys`). Мусор рабочей копии (`.env.bak*`, `nul`, `server*.log`) не обещается навечно убранным: такие файлы могут появляться локально снова, и это не ошибка доков — `nul` плодит любое `>nul`/`> nul` в `.bat` (`start_game.bat`, `scripts/setup_env.bat`), а `server*.log` — ручной перезапуск сервера с перенаправлением вывода. **Рабочее дерево — не объект проверок**: тест `test_b1_trash_files_stay_out_of_git` сверяет **индекс git**, а не файлы на диске, и никогда не утверждает, что рабочее дерево чисто; за правдой о дереве следят `tests/test_session57_worktree_trash.py` (канон мусора покрыт `.gitignore`). **Удалять такие файлы — только по явному разрешению владельца**: это его рабочие файлы и его логи, а `nul` на Windows снимается лишь `del \\?\D:\...\nul` — обычный `rm`/`del` его не видит.
+15. **Git и секреты (сессия 33; статус репозитория уточнён в аудите 42)**: репозиторий `github.com/pL1uXa-AI/text_game_rpg` — **публичный** (`api.github.com` отдаёт `private=false`; прежняя формулировка «приватный» была ложной и убаюкивала — в публичном репозитории утечка ключа стоит дороже). В git НЕ попадают: `.env` и любые `.env.*` (живые ключи), вся папка `data/` (game.db, chroma, chroma-venv, tts, fastembed, backups, metrics.jsonl, logs/), логи, `nul`, кэши, `__pycache__`. В репозитории — код, документация, `plots/` и `.env.example` (шаблон без ключей). Перед каждым пушем проверять: `git diff --cached | grep -ciE "sk-[A-Za-z0-9]{12,}"` → **0**. JSON-дамп мира (`/export/json`) обязан быть без ключей (тест `test_world_dump_strips_api_keys`). Мусор рабочей копии (`.env.bak*`, `nul`, `server*.log`) не обещается навечно убранным: такие файлы могут появляться локально снова, и это не ошибка доков — `nul` плодит любое `>nul`/`> nul` в `.bat` (`start_game.bat`, `scripts/setup_env.bat`), а `server*.log` — ручной перезапуск сервера с перенаправлением вывода. **Рабочее дерево — не объект проверок**: тест `test_b1_trash_files_stay_out_of_git` сверяет **индекс git**, а не файлы на диске, и никогда не утверждает, что рабочее дерево чисто; за правдой о дереве следят `tests/test_session57_worktree_trash.py` (канон мусора покрыт `.gitignore`). **Удалять такие файлы — только по явному разрешению владельца**: это его рабочие файлы и его логи, а `nul` на Windows снимается лишь `del \\?\D:\...\nul` — обычный `rm`/`del` его не видит.
 ---
 
 ## 🔄 РИТУАЛ ЗАКРЫТИЯ СЕССИИ (обязателен после КАЖДОЙ сессии, в этом порядке)
@@ -555,6 +555,8 @@ text_game/
 ├── start_game.bat        # единый запуск; интерпретатор из GAME_PYTHON/PY; скобки в if-блоках ^(...)
 ├── AGENT.md              # ЭТОТ ФАЙЛ (действующие правила) · AGENT_ARCHIVE.md (хронология, эссе)
 ├── README.md (пользовательский) · ROADMAP.md (идеи и статусы) · PLOTS.md (схема файлов сюжетов)
+├── LICENSE               # MIT
+├── docs/images/showcase.png # 📷 снимок интерфейса для README (пересобрать: scripts/screenshot.mjs)
 ├── backend/
 │   ├── app.py            # FastAPI: тонкая сборка (роутеры + static + lifespan) + self_heal()
 │   ├── config.py         # .env → Config; PROVIDER_OPTIONS; est_tokens; NUM_RANGES/NUM_ZERO_KEYS;
@@ -606,6 +608,7 @@ text_game/
 ├── scripts/              # start_chroma.bat · setup_env.bat · setup_tts.bat · check_plot.py ·
 │                         #   check_frontend.py (+ xss_probe.js) · check_start_bat.py · check_typos.py ·
 │                         #   doc_figures.py (реестр повторяющихся чисел доков) · test_directives.py ·
+│                         #   screenshot.mjs (📷 снимок интерфейса в docs/images/showcase.png) ·
 │                         #   smoke_tts.py · smoke_session36.py
 ├── plots/                # system/*.js · user/*.js · narrators/*.js   # чистый JSON с расширением .js
 ├── pytest.ini · ruff.toml · mypy.ini · requirements*.txt · .github/workflows/ci.yml
@@ -808,7 +811,7 @@ ls data/backups/                                  # стартовый сним�
 `mypy -p backend` + скан секретов.
 
 ### Git (репозиторий подключён)
-`origin = https://github.com/pL1uXa-AI/text_game_rpg` (**приватный**). В репозиторий попадает ТОЛЬКО
+`origin = https://github.com/pL1uXa-AI/text_game_rpg` (**публичный** — см. правило 15). В репозиторий попадает ТОЛЬКО
 код, документация, `plots/` (сюжеты/рассказчики) и `.env.example`; никогда не коммитятся `.env*`,
 вся папка `data/`, логи, `nul`, кэши (полный перечень — правило 15). Перед каждым пушем:
 ```bash
