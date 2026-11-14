@@ -1633,7 +1633,16 @@ async def _maybe_autonomous_master(world_id: int, setting: dict, action: str, re
         active = sum(1 for q in quests.values() if isinstance(q, dict) and q.get("status") in ("active", None))
         reason = narrator.master_stuck_reason(actions, active, turns)
         if not reason:
-            return
+            # «Живой мир» (жалоба: «чтобы всё появлялось и росло дальше без моего скрипта»):
+            # игрок не застрял — и это хорошо. Но тогда мастер молчал бы вечно, и мир ждал
+            # бы ходов игрока, как декорация. Раз в WORLD_GROWTH_INTERVAL ходов — ОДНО
+            # небольшое событие жизни: новое лицо, открылась лавка, ярмарка, слух. Без
+            # угрозы и без «намёка на подвиг», чтобы спокойная игра не стала гонкой.
+            if not cfg.world_growth_enabled:
+                return
+            if turns - last < max(1, cfg.world_growth_interval):
+                return
+            reason = "growth"
         providers = _world_providers(world)
         # компактный контекст — последний обмен + состояние (не раздуваем токены)
         recent_text = (("Действие игрока: " + (action or "")[:300])

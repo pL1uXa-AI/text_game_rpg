@@ -22,13 +22,24 @@ log = get_logger(__name__)
 _LATIN = re.compile(r"[A-Za-z]")
 _CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 
-# Порог: доля одного алфавита среди всех букв. Порог щедрый к «остаткам», но не к смешению:
-# модель любит начинать по-русски и скатываться в английский посреди сцены (0.2–0.4
-# кириллицы в живом прогоне). 0.85 отсекает такие ответы, оставляя законные латинские
-# вставки — имена, названия, термины — которые в русском тексте редки.
+# Порог: доля одного алфавита среди всех букв. Обычный русский текст с парой латинских
+# вставок проходит; но доля — грубая мера: три-четыре английских слова посреди русского
+# абзаца дают всего 0.82 кириллицы и «проскакивают», хотя игрок видит в тексте чужой язык.
 _DOMINANT = 0.85
-# Минимум букв, чтобы судить о языке (короткие реплики/цифры не считаем).
 _MIN_LETTERS = 40
+
+# Второй, более точный критерий: иноземная ФРАЗА внутри текста. Имена, названия моделей и
+# термины — это одно-два слова; три и более латинских слова подряд — уже предложение не
+# на языке мира. Ловит именно то, что жаловал игрок: «Руки знают жест: мять the hook
+# straight, flick the wrist, let the sinker drop».
+_LATIN_PHRASE = re.compile(r"[A-Za-z][A-Za-z'’-]*(?:[ \t]+[A-Za-z][A-Za-z'’-]*){2,}")
+_CYR_PHRASE = re.compile(r"[А-Яа-яЁё][А-Яа-яЁё'’-]*(?:[ \t]+[А-Яа-яЁё][А-Яа-яЁё'’-]*){3,}")
+
+
+def _has_foreign_phrase(text: str, lang: str) -> bool:
+    """Есть ли внутри текста фраза (≥3 слов подряд) на чужом алфавите."""
+    foreign = _CYR_PHRASE if lang == "en" else _LATIN_PHRASE
+    return bool(foreign.search(text or ""))
 
 
 def wrong_language(text: str, lang: str = "ru") -> bool:
@@ -39,6 +50,8 @@ def wrong_language(text: str, lang: str = "ru") -> bool:
     """
     if lang not in ("ru", "en") or not text:
         return False
+    if _has_foreign_phrase(text, lang):
+        return True
     latin = len(_LATIN.findall(text))
     cyr = len(_CYRILLIC.findall(text))
     total = latin + cyr
@@ -58,13 +71,16 @@ async def retell_in_language(world: dict, text: str, lang: str, provider: dict |
     from . import llm
 
     if lang == "ru":
-        sys_msg = ("Ты — редактор. Перепиши текст рассказчика на РУССКОМ языке полностью, "
-                   "сохранив в точности все события, факты, реплики, детали и порядок "
+        sys_msg = ("Ты — редактор-переводчик. Перепиши текст рассказчика ПОЛНОСТЬЮ на РУССКОМ "
+                   "языке. ВАЖНО: в тексте встречаются отдельные английские слова и целые "
+                   "английские фразы — их тоже переведи на русский (кроме имён собственных и "
+                   "названий). Сохрани в точности все события, факты, реплики, детали и порядок "
                    "сцен. Ничего не добавляй и не убирай. Верни только переписанный текст.")
     else:
-        sys_msg = ("You are an editor. Rewrite the narrator's text in ENGLISH, preserving exactly "
-                   "every event, fact, line of dialogue, detail and scene order. Add or remove "
-                   "nothing. Return only the rewritten text.")
+        sys_msg = ("You are an editor-translator. Rewrite the narrator's text entirely in ENGLISH. "
+                   "IMPORTANT: foreign words and whole foreign phrases inside it must be translated "
+                   "too (proper names may stay). Preserve exactly every event, fact, line of dialogue, "
+                   "detail and scene order. Add or remove nothing. Return only the rewritten text.")
     try:
         out = await llm.complete(
             [{"role": "system", "content": sys_msg},

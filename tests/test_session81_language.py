@@ -30,6 +30,31 @@ def test_english_slip_is_detected():
     assert lang_mod.wrong_language(ENGLISH_SLIP, "ru")
 
 
+def test_mixed_phrase_inside_russian_is_caught():
+    """Реальный случай с Qwen3: русский абзац, а внутри — английская фраза.
+
+    Такая вставка даёт 0.82 кириллицы и по «доле букв» проскакивала (порог 0.85), хотя
+    игрок в тексте видит чужой язык. Поэтому есть второй критерий — фраза из ≥3 латинских
+    слов подряд.
+    """
+    mixed = ("Каменный Мост держит реку без единой опоры. Он закидывает линию, и руки "
+             "знают жест: мять the hook straight, flick the wrist, let the sinker drop.")
+    assert lang_mod.wrong_language(mixed, "ru")
+
+
+def test_latin_nouns_in_russian_are_fine():
+    """Имена собственные и отдельные термины латиницей — не смешение языков."""
+    t = "Марта Смазчица и Тиль Аркан говорили о Школе Камня, а сержант Дозора Верн молчал."
+    assert not lang_mod.wrong_language(t, "ru")
+
+
+def test_long_russian_text_passes():
+    t = ("Каменный Мост держит реку без единой опоры. Он закидывает линию и ждёт поклёвки, "
+         "слушая, как вода шлёпает о камень. Марта Смазчица вела учёт на причале, а утро "
+         "шло своим чередом, не торопясь и не требуя ничего.")
+    assert not lang_mod.wrong_language(t, "ru")
+
+
 def test_short_text_not_judged():
     """Короткая реплика/цифры — не повод для перегенерации."""
     assert not lang_mod.wrong_language("ОК", "ru")

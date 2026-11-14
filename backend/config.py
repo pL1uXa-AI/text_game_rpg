@@ -435,6 +435,11 @@ class Config:
     # по правилу фоновых задач — не блокирует ответ игроку, глобально выключается этим флагом.
     autonomous_master_enabled: bool = True
     autonomous_master_interval: int = 6   # не чаще раза в N ходов игрока (экономия токенов)
+    # «Живой мир»: тот же фоновый мастер, но не для тупика, а чтобы мир рос сам — новое лицо,
+    # открылась лавка, ярмарка, слух. Пока игрок не застрял, это ЕДИНСТВЕННЫЙ повод мастера
+    # говорить. 0 ходов = выключено (тогда мир статичен: он ждёт игрока, как декорация).
+    world_growth_enabled: bool = True
+    world_growth_interval: int = 8
 
     # ── Боевой ИИ врагов (сессия 26) ──
     # Фоновый тактический агент: пока в бою есть живые враги, решает их ход — преследование/охрана,
@@ -694,6 +699,8 @@ class Config:
             auto_time_every=it(4, "AUTO_TIME_EVERY"),
             autonomous_master_enabled=get("AUTONOMOUS_MASTER_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             autonomous_master_interval=it(6, "AUTONOMOUS_MASTER_INTERVAL"),
+            world_growth_enabled=get("WORLD_GROWTH_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
+            world_growth_interval=it(8, "WORLD_GROWTH_INTERVAL"),
             enemy_ai_enabled=get("ENEMY_AI_ENABLED", default="true").lower() in ("1", "true", "yes", "on"),
             enemy_ai_interval=it(2, "ENEMY_AI_INTERVAL"),
             backup_db_on_start=get("BACKUP_DB_ON_START", default="true").lower() in ("1", "true", "yes", "on"),
