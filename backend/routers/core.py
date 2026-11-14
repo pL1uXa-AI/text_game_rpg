@@ -13,7 +13,7 @@ import time
 
 from fastapi import HTTPException
 
-from .. import bg, db, graph, journal, llm, metrics, narrator, tts
+from .. import bg, db, graph, intent as intent_mod, journal, language as language_mod, llm, metrics, narrator, tts
 from ..config import est_tokens, get_config, KEY_MASK
 from ..schemas import ProviderIn
 
@@ -839,10 +839,21 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
     tool_calls_out: list[dict] = []
 
     text = text.strip()
+    # Игрок заявляет НАМЕРЕНИЕ, а не результат: «я нахожу мешок», «я убил орка» — это
+    # попытка, исход решает рассказчик (правило 4а). Переписываем свершившиеся глаголы в
+    # «пытаюсь + инфинитив», сохраняя смысл целиком, и оставляем исходную формулировку
+    # рядом — модель видит и буквальную просьбу, и намерение. В историю/память (событие
+    # игрока) пишется ИСХОДНЫЙ текст: это его слова, а не редакторская правка.
+    intent = intent_mod.normalize_intent(text)
+    if intent["changed"]:
+        log.debug("намерение (world %s): %r -> %r", world_id, text, intent["text"])
     # если в начале хода сработали эффекты — рассказчик должен знать об этом
     action_ctx = text
+    if intent["changed"]:
+        action_ctx = (f"{intent['text']}\n"
+                      f"(дословно игрок написал: «{intent['original']}»)")
     if tick_msgs:
-        action_ctx = "[Начало хода]\n" + "\n".join(tick_msgs) + "\n\n" + text
+        action_ctx = "[Начало хода]\n" + "\n".join(tick_msgs) + "\n\n" + action_ctx
     player_ev = None
     # A3 (аудит 41): id событий, которые НЕ должны попадать в `[НЕДАВНЯЯ ИСТОРИЯ]`, потому
     # что они уже поданы модели отдельно (действие — в `[ДЕЙСТВИЕ ИГРОКА]`, старый ответ при
@@ -1083,6 +1094,16 @@ async def _process_action_inner(world_id: int, text: str, stream_emit=None,
         if not _looks_finished(final_text):
             final_text = await _finish_cut_reply(world, setting, persona, providers,
                                                  final_text.strip(), text, sys_msgs)
+        # Язык ответа — свойство мира, а не стиль: локальные модели на длинном промпте
+        # иногда сползают в английский посреди сцены. Это видно игроку сразу и ломает
+        # погружение, поэтому один раз просим переписать ответ на языке мира.
+        if language_mod.wrong_language(final_text, world.get("language", "ru")):
+            regenerated = await language_mod.retell_in_language(
+                world, final_text, world.get("language", "ru"), providers["main"])
+            if regenerated:
+                log.info("ответ перегенерирован на языке мира (world %s: %s)",
+                         world_id, world.get("language", "ru"))
+                final_text = regenerated
     if not final_text.strip():
         # модель отправила ТОЛЬКО механику (tool_call / <<ENGINE>>) без прозы —
         # не пишем бессмысленное «Механика применена», а сгенерируем связный текст.

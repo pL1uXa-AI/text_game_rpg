@@ -421,7 +421,7 @@ POST /api/worlds/{id}/action[/stream]
 (риск задвоенного урона); ключуются НОМЕРАМИ правил — инвариант 10.
 
 ### Рассказчики (`narrators`, сменные персоны)
-- Таблица `narrators(id, name UNIQUE, desc, prompt, is_preset, created_at, updated_at)`; 8 предустановленных сеются идемпотентно (`db.seed_narrators` — из стартового прохода
+- Таблица `narrators(id, name UNIQUE, desc, prompt, is_preset, created_at, updated_at)`; 9 предустановленных сеются идемпотентно (`db.seed_narrators` — из стартового прохода
   `app.self_heal()`, а НЕ на импорте app.py; файлы `plots/narrators/*.js`). `GET /api/narrators`
   досеивает пустую таблицу сам (дешёвый `INSERT OR IGNORE`), чтобы каталог не пустовал в первые
   миллисекунды после запуска.
@@ -755,7 +755,7 @@ python -X utf8 -m uvicorn backend.app:app --host 127.0.0.1 --port 8002
 # 3. pytest-набор (изолирован: temp БД, TTS/события/облако выкл., rate-limit выкл.,
 #    бэкап БД и журнал метрик на диск выкл. — боевые data/game.db и data/ не трогает)
 python -X utf8 -m pytest
-#    1065 тестов: схемы директив, механика, API, граф, админка, интеграция (10 ходов → память),
+#    1097 тестов: схемы директив, механика, API, граф, админка, интеграция (10 ходов → память),
 #    слой памяти (BM25/гибрид/пороги/коллекции по размерности/retrieve_memory/сводки/чанкинг лора/
 #    подготовка текста TTS/кэш-хеши/norm_rate), дамп/импорт/бэкап, перемотка, rate-limit/трассинг/LRU,
 #    динамическая память, дедуп/обрыв, авто-детект n_ctx, экранирование и XSS фронта, батники,
@@ -779,7 +779,7 @@ python -X utf8 scripts/check_start_bat.py
 #     статусы квестов/связей, рассинхрон лора. Опечатки/латинские склейки по всему проекту:
 python -X utf8 scripts/check_plot.py plots/system/*.js plots/user/*.js
 python -X utf8 scripts/check_typos.py
-#     рассказчики: python -X utf8 -c "import sys; sys.path.insert(0,'.'); from backend.narrators_loader import NARRATOR_PRESETS; print(len(NARRATOR_PRESETS))"  # 8 из plots/narrators/*.js
+#     рассказчики: python -X utf8 -c "import sys; sys.path.insert(0,'.'); from backend.narrators_loader import NARRATOR_PRESETS; print(len(NARRATOR_PRESETS))"  # 9 из plots/narrators/*.js
 
 # 4c. Правдивость ЧИСЕЛ в README/AGENT/ROADMAP: число pytest-тестов, рассказчиков, сюжетов, жанровых
 #     подсказок и пути/операции OpenAPI сверяются с реальностью (код/диск/pytest/`app.openapi()`) и
@@ -797,7 +797,7 @@ python -X utf8 scripts/smoke_session36.py
 # 5. Smoke-тесты живого сервера
 curl -s http://127.0.0.1:8002/api/system/status   # LLM+Chroma up, провайдеры с маской, блок tts, llm.needs_key
 curl -s http://127.0.0.1:8002/api/themes | python -X utf8 -c "import json,sys; print(len(json.load(sys.stdin)))"   # число сюжетов в plots/
-curl -s http://127.0.0.1:8002/api/narrators       # 8 предустановленных
+curl -s http://127.0.0.1:8002/api/narrators       # 9 предустановленных
 curl -s http://127.0.0.1:8002/api/providers       # опции main/embedding/rerank
 # озвучка: python -X utf8 scripts/smoke_tts.py (статус → настройки мира → синтез → фон события → audio)
 # дамп/импорт мира (переносимость, без LLM): export/json → grep -c api_key dump.json (обязано быть 0)
@@ -1032,7 +1032,7 @@ git status --short | grep -E "^A.*\.env($|\b)"        # пусто (.env не в
     векторов без читаемого `world_id` делает сводку слепой.
 
 ### Контроль качества
-- `python -X utf8 -m pytest` → **1065 тестов**, 0 падений (замер — `--collect-only`; слово и число
+- `python -X utf8 -m pytest` → **1097 тестов**, 0 падений (замер — `--collect-only`; слово и число
   правит реестр `doc_figures`, а не глаза). Прирост числа по сессиям и ПОИМЁННЫЙ состав набора — в
   `AGENT_ARCHIVE.md`, раздел «🧪 Тестовый набор: состав и история прироста». Здесь держим только
   правило: добавил тест/файл/эндпоинт → `doc_figures.py --sync`.

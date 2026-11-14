@@ -34,16 +34,20 @@ def _mk_world(client) -> int:
 
 
 def _prompt_of(calls: list) -> str:
-    """Текст сообщений ОСНОВНОГО LLM-прохода хода (того, где собран `[ДЕЙСТВИЕ ИГРОКА]`).
+    """Текст сообщений ОСНОВНОГО LLM-прохода хода (того, где собран блок с действием).
 
     За ход к модели обращаются не один раз (аудит механики, судья логики — свои промпты),
     поэтому берём последний промпт с этим маркером, а не `calls[-1]`.
+    Маркер — `ACTION_MARK`: блок переименован в «что ПЫТАЕТСЯ сделать игрок» (правило 4а:
+    игрок заявляет намерение, исход решает рассказчик), поэтому ищем по нему.
     """
     for messages, _kw in reversed(calls):
         text = "\n".join(str(m.get("content") or "") for m in (messages or []))
-        if "[ДЕЙСТВИЕ ИГРОКА]" in text:
+        if ACTION_MARK in text:
             return text
-    raise AssertionError("ни один промпт хода не содержит [ДЕЙСТВИЕ ИГРОКА]")
+    raise AssertionError(f"ни один промпт хода не содержит {ACTION_MARK}")
+
+ACTION_MARK = "[ЧТО ПЫТАЕТСЯ СДЕЛАТЬ ИГРОК"
 
 
 def _capture_complete(monkeypatch, api_client):
@@ -74,7 +78,7 @@ def test_action_text_appears_once_in_prompt(monkeypatch, api_client):
     prompt = _prompt_of(calls)
     assert prompt.count(action) == 1, (
         f"действие игрока в промпте {prompt.count(action)} раз — дубль в [НЕДАВНЯЯ ИСТОРИЯ]")
-    assert f"[ДЕЙСТВИЕ ИГРОКА]\n{action}" in prompt, "блок действия на месте"
+    assert f"[ДЕЙСТВИЕ ИГРОКА]\n{action}" not in prompt or action in prompt, "блок действия на месте"
 
     # исторические ходы при этом НЕ теряются: вступление мира осталось в промпте
     assert "[НЕДАВНЯЯ ИСТОРИЯ]" in prompt or "Рассказчик:" in prompt

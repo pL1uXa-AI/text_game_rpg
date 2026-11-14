@@ -359,6 +359,10 @@ class Config:
     default_temp: float = 0.8
     default_top_p: float = 0.95
     max_tokens: int = 2000
+    # Уровень «размышлений» reasoning-моделей (xhigh/medium/low/high). Пусто = не передавать
+    # (для API, которые такого поля не знают: OpenAI, RouterAI). Qwen3 через llama.cpp по
+    # умолчанию сидит на xhigh — это десятки секунд на любой ответ; medium в разы быстрее.
+    reasoning_effort: str = ""
     context_tokens: int = 32768  # стандарт 32k: размер контекста нового мира (память считается от него)
 
     # Память
@@ -658,6 +662,7 @@ class Config:
             default_temp=flt(0.8, "DEFAULT_TEMP"),
             default_top_p=flt(0.95, "DEFAULT_TOP_P"),
             max_tokens=it(2000, "MAX_TOKENS"),
+            reasoning_effort=get("REASONING_EFFORT", default="").strip().lower(),
             context_tokens=it(32768, "CONTEXT_TOKENS"),
             recent_token_budget=it(2600, "RECENT_TOKEN_BUDGET"),
             summary_token_budget=it(700, "SUMMARY_TOKEN_BUDGET"),

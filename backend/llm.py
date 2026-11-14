@@ -241,7 +241,7 @@ def probe_context_cached(provider: dict) -> Optional[dict]:
 
 def _payload(messages: list[dict], temperature: float, max_tokens: int, top_p: float,
              stream: bool, provider: dict, tools: list | None = None,
-             tool_choice: str | None = None) -> dict:
+             tool_choice: str | None = None, effort: str | None = None) -> dict:
     payload: dict = {
         "messages": messages,
         "temperature": temperature,
@@ -256,6 +256,21 @@ def _payload(messages: list[dict], temperature: float, max_tokens: int, top_p: f
         payload["max_tokens"] = int(max_tokens)
     if provider.get("model"):
         payload["model"] = provider["model"]
+    # Уровень «размышлений» (reasoning effort) для моделей, которые его понимают
+    # (Qwen3 через llama.cpp: xhigh / medium / low). По умолчанию шаблон Qwen3 стоит на
+    # xhigh, и даже «Say OK» занимало 36 секунд — на среднем уровне ответ в разы быстрее
+    # при том же качестве. Поле шлём ТОЛЬКО если провайдер его поддерживает: чужие API
+    # (RouterAI, OpenAI) на незнакомый ключ отвечают 400 — поэтому по умолчанию выключено.
+    # `effort` переопределяет уровень для ОДНОГО вызова: служебным задачам (перевод,
+    # переписывание, короткие уточнения) размышления не нужны, а у «рассуждающей» модели
+    # они съедают весь ответ — она уходит думать и возвращает пустую строку.
+    eff = get_config().reasoning_effort if effort is None else effort
+    if eff and eff != "off" and provider.get("reasoning_effort", True):
+        payload["reasoning_effort"] = eff
+    elif effort == "off" and provider.get("reasoning_effort", True):
+        # Прямое отключение «мыслей» — Qwen3/llama.cpp понимают enable_thinking;
+        # что не понимает API, тот проигнорирует лишнее поле.
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     if tools:
         payload["tools"] = tools
         if tool_choice:
@@ -277,7 +292,7 @@ async def complete(messages: list[dict], temperature: float = 0.8, max_tokens: i
                    top_p: float = 0.95, provider: dict | None = None,
                    tools: list | None = None, tool_choice: str | None = None,
                    tool_calls_out: list[dict] | None = None,
-                   finish_out: dict | None = None) -> str:
+                   finish_out: dict | None = None, effort: str | None = None) -> str:
     """Один тарелочный проход к модели.
 
     `finish_out` (если передан dict) дополняется служебными сведениями ответа:
@@ -288,7 +303,8 @@ async def complete(messages: list[dict], temperature: float = 0.8, max_tokens: i
     prov = provider or _provider()
     url = f"{prov['base_url']}/chat/completions"
     headers = {"Authorization": f"Bearer {prov['api_key']}"} if prov.get("api_key") else {}
-    payload = _payload(messages, temperature, max_tokens, top_p, False, prov, tools=tools, tool_choice=tool_choice)
+    payload = _payload(messages, temperature, max_tokens, top_p, False, prov,
+                       tools=tools, tool_choice=tool_choice, effort=effort)
 
     async def _attempt():
         resp = await _get_client().post(url, json=payload, headers=headers)
