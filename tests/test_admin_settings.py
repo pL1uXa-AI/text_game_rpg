@@ -92,7 +92,9 @@ def test_config_repeated_loads_no_recursion(api_client):
     for _ in range(5):
         invalidate_config()
         cfg = get_config()
-        assert cfg.max_tokens > 0
+        # max_tokens == 0 — законный режим «без лимита», поэтому проверяем не «> 0»,
+        # а саму границу: значение либо не задано (0), либо в допустимом диапазоне.
+        assert cfg.max_tokens == 0 or cfg.max_tokens >= 16
 
 
 def test_api_roundtrip_persists(api_client):

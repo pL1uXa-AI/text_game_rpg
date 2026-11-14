@@ -11,6 +11,10 @@ set "ROOT=%~dp0.."
 cd /d "%ROOT%"
 
 set "CHROMA_EXE=%ROOT%\data\chroma-venv\Scripts\chroma.exe"
+REM chroma.exe из venv (chromadb 0.6.3) на этой машине стартует и МГНОВЕННО выходит с кодом 1 без
+REM единой строки в stdout/stderr/логе. Тот же сервер, запущенный как -m chromadb.cli.cli,
+REM поднимается нормально. Поэтому запускаем через python venv, а .exe — только фолбэк.
+set "CHROMA_PY=%ROOT%\data\chroma-venv\Scripts\python.exe"
 set "CHROMA_DATA=%ROOT%\data\chroma"
 set "CHROMA_HOST=127.0.0.1"
 set "CHROMA_PORT=8001"
@@ -22,12 +26,18 @@ set "CHROMA_LOG=%ROOT%\data\logs\chroma.log"
 set ANONYMIZED_TELEMETRY=FALSE
 set CHROMA_TELEMETRY_ENDPOINT=
 
-if not exist "%CHROMA_EXE%" (
-    echo [ERROR] chroma.exe not found: "%CHROMA_EXE%"
-    echo         Run scripts\setup_env.bat - it creates data\chroma-venv and installs chromadb
-    pause
-    exit /b 1
-)
+if exist "%CHROMA_PY%" goto have_py
+if exist "%CHROMA_EXE%" goto have_exe
+echo [ERROR] Neither python.exe nor chroma.exe in data\chroma-venv.
+echo         Run scripts\setup_env.bat - it creates data\chroma-venv and installs chromadb
+pause
+exit /b 1
+:have_py
+set "CHROMA_CMD="%CHROMA_PY%" -X utf8 -m chromadb.cli.cli"
+goto have_cmd
+:have_exe
+set "CHROMA_CMD="%CHROMA_EXE%""
+:have_cmd
 
 if not exist "%ROOT%\data\logs" mkdir "%ROOT%\data\logs"
 if not exist "%CHROMA_DATA%" mkdir "%CHROMA_DATA%"
@@ -51,7 +61,9 @@ exit /b 0
 echo [START] Game ChromaDB on %CHROMA_HOST%:%CHROMA_PORT%...
 echo         Data: %CHROMA_DATA%
 echo         Log:  %CHROMA_LOG%
-start "ChromaDB-Game" /MIN "%CHROMA_EXE%" run --path "%CHROMA_DATA%" --host %CHROMA_HOST% --port %CHROMA_PORT% --log-path "%CHROMA_LOG%"
+REM Лог uvicorn пишет в stdout — перенаправляем в файл, иначе при падении нет ни следа.
+REM (прежний --log-path писал не всегда, и «мёртвая» Chroma не оставляла chroma.log вовсе)
+start "ChromaDB-Game" /MIN %CHROMA_CMD% run --path "%CHROMA_DATA%" --host %CHROMA_HOST% --port %CHROMA_PORT% --log-path "%CHROMA_LOG%" >> "%CHROMA_LOG%" 2>&1
 
 set count=0
 :wait_loop

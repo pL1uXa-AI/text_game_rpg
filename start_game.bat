@@ -1,6 +1,7 @@
 @echo off
 REM Text Game RPG — запуск сервера игры.
-REM Требования: 1) llama.cpp на 8080 (уже запущен)  2) своя ChromaDB на 8001 (поднимется сама).
+REM Требования: 1) провайдер модели из MAIN_BASE_URL в .env (локальная модель или облако)
+REM             2) своя ChromaDB на 8001 (поднимется сама).
 REM Консоль НЕ закрывается при ошибке: показываем сообщение и ждём Enter.
 
 setlocal
@@ -20,23 +21,51 @@ if %errorlevel% equ 0 (
     exit /b 0
 )
 
-REM 1. Проверка llama.cpp
-REM Сервер модели может быть запущен с --api-key: тогда /v1/models без ключа отвечает 401,
-REM и «не нулевой errorlevel от curl» означал бы «llama.cpp мёртв» — игра отказывалась
-REM стартовать при живом сервере (сессия 36, п.14). Поэтому проверяем сам ФАКТ ответа:
-REM любой код меньше 500 (включая 401/404) = сервис отвечает, он живой.
-set "LLAMA_CODE=000"
-for /f "usebackq delims=" %%c in (`curl -s -o nul --max-time 5 -w "%%{http_code}" http://127.0.0.1:8080/v1/models`) do set "LLAMA_CODE=%%c"
-if "%LLAMA_CODE:~0,1%"=="5" goto llama_dead
-if "%LLAMA_CODE%"=="000" goto llama_dead
-echo [OK] llama.cpp отвечает на 127.0.0.1:8080 (HTTP %LLAMA_CODE%)
-goto llama_ok
-:llama_dead
-echo [WARN] llama.cpp не отвечает на 127.0.0.1:8080 — игра без рассказа не поедет!
-echo        Запусти сервер модели и повтори запуск.
+REM 1. Проверка ПРОВАЙДЕРА МОДЕЛИ — того, что реально настроен в .env (MAIN_BASE_URL).
+REM Было: жёстко http://127.0.0.1:8080/v1/models, т.е. лаунчер с марша бросал запуск у игрока
+REM с облачным провайдером (routerai.ru и т.п.): «llama.cpp не отвечает» — хотя llama.cpp ему
+REM не нужен вовсе. Теперь адрес берётся из того же .env, что читает backend/config.py, и
+REM проверяется тем же критерием, что llm.probe(): любой код < 500 (401/403/404 тоже) = живой.
+REM Таймаут больше 8-секундного в probe(): облачный шлюз под нагрузкой медленнее локалки.
+REM GAME_PROBE_URL=<url> — явный override (осознанно, как GAME_BIND); GAME_SKIP_LLM_CHECK=1 —
+REM пропустить проверку (критерий GAME_* из харнесса test_start_bat_harness.py).
+REM
+REM ⚠ Про стиль: здесь НЕТ блоков `if ( ... )` вокруг set+echo. cmd раскрывает %VAR% во всём
+REM блоке при разборе, до выполнения, поэтому `set "X=..."` и `echo %X%` в одном блоке печатают
+REM СТАРОЕ (пустое) значение — ровно так адрес из .env терялся, и проверка молча уходила на
+REM http://127.0.0.1:8080/v1. Ветки — только через goto, переменные — вне скобок.
+set "PROVIDER_BASE="
+if not exist ".env" goto provider_default
+for /f "usebackq tokens=1,* delims==" %%a in (`findstr /b /c:"MAIN_BASE_URL=" .env`) do set "PROVIDER_BASE=%%b"
+set "PROVIDER_BASE=%PROVIDER_BASE:"=%"
+set "PROVIDER_BASE=%PROVIDER_BASE: =%"
+:provider_default
+if "%PROVIDER_BASE%"=="" set "PROVIDER_BASE=http://127.0.0.1:8080/v1"
+if not "%GAME_PROBE_URL%"=="" goto probe_override
+set "PROBE_URL=%PROVIDER_BASE%/models"
+goto provider_probe
+:probe_override
+echo [INFO]  GAME_PROBE_URL задан — проверяю %GAME_PROBE_URL%
+set "PROBE_URL=%GAME_PROBE_URL%"
+:provider_probe
+if "%GAME_SKIP_LLM_CHECK%"=="1" goto llm_skip
+set "LLM_CODE=000"
+for /f "usebackq delims=" %%c in (`curl -s -o nul --max-time 15 -w "%%{http_code}" "%PROBE_URL%"`) do set "LLM_CODE=%%c"
+if "%LLM_CODE%"=="000" goto llm_dead
+if "%LLM_CODE:~0,1%"=="5" goto llm_dead
+echo [OK] провайдер модели отвечает: %PROBE_URL% (HTTP %LLM_CODE%)
+goto llm_ok
+:llm_skip
+echo [INFO]  проверка провайдера пропущена: GAME_SKIP_LLM_CHECK=1
+goto llm_ok
+:llm_dead
+echo [WARN] провайдер модели НЕ отвечает: %PROBE_URL% (код %LLM_CODE%)
+echo        Проверь MAIN_BASE_URL/MAIN_API_KEY в .env; если модель держится локально —
+echo        запусти её (например, llama.cpp на 127.0.0.1:8080) и повтори запуск.
+echo        Игра без рассказа не поедет. (Осознанно пропустить: set GAME_SKIP_LLM_CHECK=1)
 pause
 exit /b 1
-:llama_ok
+:llm_ok
 
 REM 2. Проверка своей ChromaDB (порт 8001)
 REM D14 (аудит 38): /api/v1/heartbeat + errorlevel curl → та же схема, что у llama.cpp в

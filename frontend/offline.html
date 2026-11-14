@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Text Game RPG — нужен запуск игры</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #14141b; color: #e6e6ef;
+    font: 16px/1.6 "Segoe UI", system-ui, -apple-system, sans-serif; padding: 24px;
+  }
+  .card {
+    max-width: 680px; width: 100%; background: #1d1d27; border: 1px solid #2e2e3d;
+    border-radius: 14px; padding: 28px 30px; box-shadow: 0 12px 40px rgba(0,0,0,.45);
+  }
+  h1 { margin: 0 0 6px; font-size: 24px; }
+  .sub { margin: 0 0 20px; color: #9a9aae; font-size: 14px; }
+  ol { margin: 0 0 18px; padding-left: 22px; }
+  li { margin: 8px 0; }
+  code, .cmd {
+    font-family: "Cascadia Mono", Consolas, monospace; font-size: 13.5px;
+    background: #101017; border: 1px solid #33334a; border-radius: 7px;
+  }
+  code { padding: 1px 6px; }
+  .cmd { display: block; padding: 10px 12px; margin: 6px 0; color: #9be7a0; overflow-x: auto; white-space: pre; }
+  .note {
+    margin-top: 18px; padding: 12px 14px; border-radius: 9px;
+    background: #1a2029; border: 1px solid #2b3a4d; color: #a8bacf; font-size: 14px;
+  }
+  .why { margin-top: 18px; font-size: 13.5px; color: #8d8da3; }
+  a { color: #7fb0ff; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>⚔️ Text Game RPG</h1>
+  <p class="sub">Файл открыт напрямую из папки — без запуска игры.</p>
+
+  <p>Эта страница — только экран-подсказка. Сама игра — это <b>сервер</b> на Python: он ведёт мир,
+     ходит в LLM, хранит базу в SQLite и отдаёт <code>/api/*</code>. Вкладка, открытая по
+     <code>file://</code>, до этих endpoint'ов дотянуться не может, поэтому игру нужно запустить
+     локально одним двойным щелчком:</p>
+
+  <ol>
+    <li>Закройте эту вкладку.</li>
+    <li>Запустите файл <b>start_game.bat</b> в корне проекта<br>
+        <span class="cmd">D:\...\text_game\start_game.bat</span>
+        <span style="color:#8d8da3">(двойной щелчок; движок llama.cpp на 8080 должен быть уже запущен)</span></li>
+    <li>Откроется браузер на <a href="http://127.0.0.1:8002">http://127.0.0.1:8002</a> — это и есть игра.</li>
+  </ol>
+
+  <div class="note">
+    «Локальный сервер» здесь — не то, что нужно ставить отдельно: это и есть игра.
+    Порт <code>8002</code> слушает только этот компьютер (<code>127.0.0.1</code>), наружу ничего не уходит.
+  </div>
+
+  <p class="why">Если нужен ярлык — создайте его на <code>start_game.bat</code>; при открытии страницы
+     ещё раз покажется эта подсказка, т.к. <code>index.html</code> стучится на тот же адрес
+     <code>http://127.0.0.1:8002</code> и, не найдя его, предлагает запуск.</p>
+</div>
+</body>
+</html>

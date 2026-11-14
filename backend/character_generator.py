@@ -179,11 +179,17 @@ async def generate_character(theme: dict, setting: dict, hook: str = "",
         },
     }}]
     max_attempts = 3
+    # Лимит ответа берём с потолка: инструмент со всеми обязательными полями (identity,
+    # skills, inventory) у «размышляющей» модели — это 1500–3000 токенов. При жёстком
+    # max_tokens сервер обрезал вызов на полуслове (finish_reason=length) → «Unterminated
+    # string» → персонаж не создавался, а мир собирался по 3–4 минуты. 0 (MAX_TOKENS=0) =
+    # без лимита: поле не отправляется, ограничивает только контекст сервера.
+    char_max_tokens = int(get_config().max_tokens or 0)
     for attempt in range(max_attempts):
         try:
             tool_calls_out: list[dict] = []
             await llm.complete(messages, temperature=max(0.4, get_config().default_temp),
-                               max_tokens=2400, provider=provider,
+                               max_tokens=char_max_tokens, provider=provider,
                                tools=char_tool, tool_choice="required",
                                tool_calls_out=tool_calls_out)
         except Exception as e:

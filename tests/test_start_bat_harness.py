@@ -47,15 +47,22 @@ pytestmark = pytest.mark.skipif(os.name != "nt",
                                        "scripts/check_start_bat.py (шаг CI)")
 
 _CURL = """@echo off
-REM Заглушка curl: какой код вернуть, решает тест (FAKE_LLAMA / FAKE_CHROMA).
-REM Порт ищем во ВСЕЙ командной строке: последний аргумент bat-вызова — -w "%{http_code}",
-REM а не URL. NONE = сервис молчит: ничего не печатаем, уходим с ненулевым кодом.
+REM Заглушка curl: какой код вернуть, решает тест (FAKE_PROVIDER / FAKE_CHROMA).
+REM NONE = сервис молчит: ничего не печатаем.
+REM
+REM Адрес провайдера модели лаунчер берёт из .env (MAIN_BASE_URL): у игрока он бывает
+REM и не 127.0.0.1, и не 8080 (llama.cpp в локалке, облачный шлюз). Поэтому «это проверка
+REM модели» определяем по хвосту /models, а не по конкретному порту.
+REM
+REM ⚠ Без `exit /b`: .cmd вызывается из `for /f \\`...\\`` БЕЗ `call`, и return в нём
+REM завершает всю команду (проверено: for получал текст «echo 200» вместо кода).
 set "ALL=%*"
 set "CODE=000"
-if "%ALL:8080=%" NEQ "%ALL%" set "CODE=%FAKE_LLAMA%"
-if "%ALL:8001=%" NEQ "%ALL%" set "CODE=%FAKE_CHROMA%"
-if "%CODE%"=="NONE" exit /b 7
+if not "%ALL:/models=%"=="%ALL%" set "CODE=%FAKE_PROVIDER%"
+if "%CODE%"=="000" if not "%ALL:8001=%"=="%ALL%" set "CODE=%FAKE_CHROMA%"
+if "%CODE%"=="NONE" goto silent
 echo %CODE%
+:silent
 """
 
 _NETSTAT = """@echo off
@@ -109,6 +116,7 @@ def sandbox(tmp_path: Path) -> dict:
 
 def run_bat(sandbox: dict, *, llama: str = "200", chroma: str = "200",
             listening: str = "0", stub_rc: str = "0",
+            main_base_url: str = "http://127.0.0.1:8080/v1",
             extra_env: dict | None = None):
     """Исполняет bat через cmd и возвращает (proc, записанные аргументы uvicorn, флаг вызова Chroma)."""
     marker = sandbox["marker"]
@@ -116,17 +124,22 @@ def run_bat(sandbox: dict, *, llama: str = "200", chroma: str = "200",
         marker.unlink()
     env = dict(os.environ)
     env["PATH"] = str(sandbox["root"] / "bin") + os.pathsep + env.get("PATH", "")
+    # Песочнице нужен .env с адресом провайдера: пишем КАЖДЫЙ прогон из main_base_url,
+    # иначе .env первого вызова «застрял» бы на весь тест.
+    (sandbox["root"] / ".env").write_text(f"MAIN_BASE_URL={main_base_url}\n", encoding="utf-8")
     env.update({
-        "FAKE_LLAMA": llama, "FAKE_CHROMA": chroma, "FAKE_LISTEN": listening,
+        "FAKE_PROVIDER": llama, "FAKE_CHROMA": chroma, "FAKE_LISTEN": listening,
         "CHROMA_STUB_RC": stub_rc, "RUNMARK": str(marker),
         "GAME_PYTHON": sys.executable,
-        # ветка «игра уже запущена» зовёт `start "" http://127.0.0.1:8002` — без этого
+        # Ветка «игра уже запущена» зовёт `start "" http://127.0.0.1:8002` — без этого
         # флага каждый прогон теста открывал бы реальный браузер на рабочем столе
         "GAME_NO_BROWSER": "1",
     })
     env.pop("GAME_BIND", None)
     env.pop("GAME_BIND_CONFIRM", None)   # B2: иначе унаследованный из shells флаг «разрешить»
     env.pop("PY", None)
+    env.pop("GAME_PROBE_URL", None)
+    env.pop("GAME_SKIP_LLM_CHECK", None)
     env.update(extra_env or {})
     p = subprocess.run(["cmd", "/c", "start_game.bat"], cwd=str(sandbox["root"]), env=env,
                        capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -160,21 +173,44 @@ def test_bat_launches_server_on_loopback(sandbox):
     assert not r.chroma_stub_called, "Chroma живая — поднимать её не требовалось"
 
 
-def test_bat_starts_when_llama_answers_401(sandbox):
-    """РЕАЛЬНОЕ поведение (п.14, сессия 36): 401/404 от llama.cpp с --api-key ≠ «сервер мёртв»."""
+def test_bat_probes_the_provider_from_env_not_a_hardcoded_llama(sandbox):
+    """Жалоба «запускаю — и ошибка»: лаунчер проверял ЛИТЕРАЛЬНО 127.0.0.1:8080.
+
+    У игрока модель может жить где угодно — llama.cpp в локальной сети (192.168.1.102)
+    или облачный шлюз. Раньше такой запуск падал с «llama.cpp не отвечает», хотя
+    llama.cpp ему и не нужен. Теперь адрес берётся из MAIN_BASE_URL (.env игрока).
+    """
+    for url in ("http://192.168.1.102:8080/v1", "https://routerai.ru/api/v1", "http://127.0.0.1:8099/v1"):
+        r = run_bat(sandbox, llama="200", main_base_url=url)
+        assert r.uvicorn, (f"провайдер {url} жив, а bat отказался стартовать: "
+                           f"{r.proc.stdout[-500:]}")
+        assert url.split("://", 1)[1] in r.proc.stdout, \
+            f"в сообщении о проверке нет адреса из .env ({url}): {r.proc.stdout[-500:]}"
+
+
+def test_bat_starts_when_provider_answers_401(sandbox):
+    """РЕАЛЬНОЕ поведение (п.14, сессия 36): 401/404 от сервера модели ≠ «сервер мёртв»."""
     for code in ("401", "404", "400", "200"):
         r = run_bat(sandbox, llama=code)
-        assert r.uvicorn, f"llama отвечает {code} — bat отказался стартовать (ложная смерть)"
+        assert r.uvicorn, f"провайдер отвечает {code} — bat отказался стартовать (ложная смерть)"
 
 
-def test_bat_refuses_when_llama_really_dead(sandbox):
+def test_bat_refuses_when_provider_really_dead(sandbox):
     """Нет ответа и 5xx — старт запрещён, bat объясняет причину и не поднимает процесс."""
     r = run_bat(sandbox, llama="NONE")
-    assert not r.uvicorn, "llama.cpp мертва — игра всё равно попыталась стартовать"
+    assert not r.uvicorn, "провайдер мёртв — игра всё равно попыталась стартовать"
     assert r.proc.returncode == 1
-    assert "llama" in (r.proc.stdout + r.proc.stderr).lower()
+    out = (r.proc.stdout + r.proc.stderr).lower()
+    # сообщение обязано указывать, ЧТО именно не ответило, и где это менять
+    assert "провайдер" in out or "main_base_url" in out, f"причина не названа: {out[-400:]}"
     r = run_bat(sandbox, llama="503")
-    assert not r.uvicorn, "5xx от llama.cpp должен считаться смертью"
+    assert not r.uvicorn, "5xx от сервера модели должен считаться смертью"
+
+
+def test_bat_can_skip_provider_check(sandbox):
+    """GAME_SKIP_LLM_CHECK=1 — осознанный обход проверки (сервер поднимается позже модели)."""
+    r = run_bat(sandbox, llama="NONE", extra_env={"GAME_SKIP_LLM_CHECK": "1"})
+    assert r.uvicorn, "проверка пропущена явно, а bat всё равно отказался стартовать"
 
 
 def test_bat_starts_own_chroma_when_down(sandbox):

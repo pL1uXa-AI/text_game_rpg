@@ -343,6 +343,9 @@ def genre_hint_text(genre: str) -> str:
 
 # ── Размер контекста мира (per-world): чем больше — тем точнее память ──
 CONTEXT_OVERHEAD = 2600   # ЗАПАС, если реальный размер системного промпта ещё не измерен
+# Сколько окна оставить под ОТВЕТ, когда лимит ответа выключен (MAX_TOKENS=0). Ноль тут
+# означал бы «промпту можно занять всё окно» — и модели не осталось бы места ответить.
+MIN_RESPONSE_RESERVE = 2000
 MIN_RECENT_BUDGET = 400
 # База шкалы масштабирования памяти/лора: СТАНДАРТ 32k (как в .env CONTEXT_TOKENS=32768).
 # Не используем get_config().context_tokens, потому что админка может поставить глобальный
@@ -391,6 +394,21 @@ def memory_extra_budget(world: dict) -> int:
     return max(512, min(MAX_MEMORY_EXTRA_BUDGET, int(ctx * MEMORY_EXTRA_RATIO)))
 
 
+def response_token_budget(world: dict | None = None) -> int:
+    """Действующий лимит ответа в токенах для мира (0 = без лимита, см. NUM_ZERO_KEYS).
+
+    Не «где-то 0, где-то дефолт»: MAX_TOKENS=0 — законный режим «без лимита», и все места,
+    которым лимит нужен как ЧИСЛО (сколько окна занять, какой объём просить у модели),
+    берут его отсюда. Возвращает 0, если лимита нет.
+    """
+    reg = int(get_config().max_tokens or 0)
+    try:
+        per_world = int(world_gen_settings(world).get("max_tokens") or 0) if world else 0
+    except Exception:
+        per_world = 0
+    return per_world or reg
+
+
 def world_prompt_overhead(world: dict, setting: dict | None = None,
                           prompt_tokens: int | None = None) -> int:
     """Сколько окно съедают системный промпт + max_tokens ответа.
@@ -401,9 +419,10 @@ def world_prompt_overhead(world: dict, setting: dict | None = None,
       2) setting["_ctx_prompt_tokens"] — измерение с последнего хода этого мира;
       3) CONTEXT_OVERHEAD — запас для нового мира/старых сохранений (после первого хода
          само-корректируется).
+    Лимит ответа 0 («без лимита») считаем как 2000 — иначе «резерв под ответ» схлопнулся бы
+    в ноль и память мира заполняла бы окно под завязку.
     """
-    g = world_gen_settings(world)
-    mtok = int(g.get("max_tokens") or get_config().max_tokens)
+    mtok = response_token_budget(world) or 2000
     pt = prompt_tokens
     if not pt:
         try:
@@ -1234,11 +1253,16 @@ def build_system_prompt(world: dict, setting: dict, persona: str | None = None,
     }.get(persp, "")
 
     # Динамический лимит объёма ответа: от максимального числа токенов мира (меняется настройками мир/глобально)
-    g = world_gen_settings(world)
-    max_tok = int(g.get("max_tokens") or get_config().max_tokens)
-    max_chars = int(round(max_tok * 3.2))
-    char_note = (f" Не превышай объём ответа: максимум примерно {max_chars} символов (~{max_tok} токенов). "
-                 "Оборачивай мысль законченной фразой в рамках лимита, не обрывай на полуслове; если лимит тесен — пиши компактнее, но сохраняя живость.")
+    # MAX_TOKENS=0 — лимита нет: тогда и про «максимум символов» модели говорить нечего,
+    # иначе промпт жёстко отрезал бы полноценный ответ предложением «~0 токенов».
+    max_tok = response_token_budget(world)
+    if max_tok > 0:
+        max_chars = int(round(max_tok * 3.2))
+        char_note = (f" Не превышай объём ответа: максимум примерно {max_chars} символов (~{max_tok} токенов). "
+                     "Оборачивай мысль законченной фразой в рамках лимита, не обрывай на полуслове; если лимит тесен — пиши компактнее, но сохраняя живость.")
+    else:
+        char_note = (" Объём ответа не ограничен жёстким лимитом: доводи каждую мысль и сцену до "
+                     "законченной фразы, не обрывай текст на полуслове.")
 
     # B3: персона — до сборки промпта (см. `clip_persona` выше).
     persona_line = clip_persona(persona, world) or \
@@ -1558,7 +1582,9 @@ def build_messages(world: dict, setting: dict, action: str,
         return "\n\n".join(parts)
 
     ctx = world_context_tokens(world)
-    mtok = int(world_gen_settings(world).get("max_tokens") or get_config().max_tokens)
+    # MAX_TOKENS=0 («без лимита») не должен оставлять под ответ ноль окна: сам ответ
+    # всё равно живёт внутри ctx, поэтому резервируем осмысленный MIN_RESPONSE_RESERVE.
+    mtok = response_token_budget(world) or MIN_RESPONSE_RESERVE
     hard = max(1500, ctx - mtok)          # что реально можно отправить модели
     meta: dict = {"trimmed": [], "overflow_tokens": 0}
     content = assemble()

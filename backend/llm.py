@@ -245,10 +245,15 @@ def _payload(messages: list[dict], temperature: float, max_tokens: int, top_p: f
     payload: dict = {
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens,
         "top_p": top_p,
         "stream": stream,
     }
+    # max_tokens=0 (MAX_TOKENS=0) = «без лимита»: поле НЕ отправляем. Иначе сервер обрежет
+    # ответ (включая аргументы tool_call) на N токенах, и у reasoning-моделей весь лимит
+    # уходит в «размышления» — аргументы приходят обрывком JSON. Отрицательное число —
+    # тоже «без лимита» (в llama.cpp -1 означает n_predict=-1), поэтому не отправляем и его.
+    if max_tokens and int(max_tokens) > 0:
+        payload["max_tokens"] = int(max_tokens)
     if provider.get("model"):
         payload["model"] = provider["model"]
     if tools:

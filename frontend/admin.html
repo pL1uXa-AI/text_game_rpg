@@ -267,6 +267,10 @@
 
 <script>
 "use strict";
+// Открыто файлом (file://), а не сервером игры? Админка без /api бесполезна — вместо пустого
+// экрана с ошибками в консоли уводим на подсказку «запустите start_game.bat» (offline.html).
+// Та же проверка, что в index.html; стоит до первого обращения к API.
+if (location.protocol === "file:") { location.replace("offline.html"); }
 const $ = (id) => document.getElementById(id);
 // Null-безопасные чтения: если элемент отсутствует — пустая строка / false, без падения
 const $val = (id) => { const el = $(id); return (el && el.value != null) ? el.value : ""; };

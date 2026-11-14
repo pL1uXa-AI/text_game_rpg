@@ -69,7 +69,7 @@ NUM_RANGES: dict[str, tuple[float, float]] = {
     # генерация (те же границы у per-world значений — см. GEN_LIMIT_KEYS)
     "DEFAULT_TEMP": (0.0, 2.0),
     "DEFAULT_TOP_P": (0.0, 1.0),
-    "MAX_TOKENS": (16.0, 32768.0),
+    "MAX_TOKENS": (16.0, 32768.0),   # 0 = без лимита (см. NUM_ZERO_KEYS)
     "CONTEXT_TOKENS": (512.0, 262144.0),
     "MAX_ACTION_CHARS": (16.0, 100000.0),
     # память/RAG
@@ -119,13 +119,19 @@ NUM_RANGES: dict[str, tuple[float, float]] = {
 #   AUTO_TIME_EVERY=0    — авто-часы выключены (сессия 40, п.14b);
 #   EVENT_EVERY_TURNS=0  — «никогда» (`narrator.event_chance`); 0 у порогов RAG = «авто»;
 #   METRICS_MAX_BYTES=0  — ротация журнала метрик выключена (решение сессии 36);
-#   TTS_CACHE_TTL_DAYS=0 — кэш озвучки живёт вечно.
+#   TTS_CACHE_TTL_DAYS=0 — кэш озвучки живёт вечно;
+#   MAX_TOKENS=0         — «без лимита»: ответ ограничен только контекстом модели.
+#     Зачем: сервер llama.cpp ОБРЕЗАЕТ вызов инструмента на max_tokens (finish_reason=length),
+#     и модель, у которой есть «размышления», первой тратит лимит на них — аргументы приходят
+#     обрывком («Unterminated string»). Отсюда у локальных reasoning-моделей (Qwen3 и т.п.) мир
+#     создавался по 3-4 минуты и без персонажа. С 0 лимита не остаётся вовсе (max_tokens
+#     не отправляется, см. llm._payload), а длину ответа держит контекст и промпт рассказчика.
 NUM_ZERO_KEYS: frozenset[str] = frozenset({
     "TURN_SNAPSHOT_KEEP", "AUTO_TIME_EVERY", "EVENT_EVERY_TURNS", "RAG_MEMORY_K",
     "RAG_MEMORY_MAX", "LORE_RAG_K", "LORE_RAG_K_MAX", "LORE_TOKEN_BUDGET",
     "LORE_TOKEN_BUDGET_MAX", "METRICS_MAX_BYTES", "TTS_CACHE_TTL_DAYS",
     "RERANK_THRESHOLD", "HYBRID_WEIGHT_BM25", "COSINE_THRESHOLD",
-    "COSINE_THRESHOLD_LOCAL", "LLM_RETRY_BACKOFF",
+    "COSINE_THRESHOLD_LOCAL", "LLM_RETRY_BACKOFF", "MAX_TOKENS",
 })
 
 _CLAMP_LOG = logging.getLogger("textgame.config")

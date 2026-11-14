@@ -945,8 +945,10 @@ def test_start_bat_tolerates_401():
     решено оставить проверку текста, но назвать её как есть (см. инвариант 19 в AGENT.md:
     новые проверки так писать нельзя — только поведение; структурные — в scripts/check_*)."""
     bat = io.open(ROOT / "start_game.bat", encoding="utf-8").read()
-    assert "http_code" in bat, "curl-проверка llama.cpp по-прежнему считает 401 смертью"
-    seg = bat[bat.index("REM 1. Проверка llama.cpp"):bat.index("REM 2.")]
+    assert "http_code" in bat, "curl-проверка провайдера по-прежнему считает 4xx смертью"
+    # Секция проверки модели: от заголовка до проверки Chroma. Адрес теперь берётся из
+    # .env (MAIN_BASE_URL), поэтому переменные называются LLM_CODE/llm_dead, а не LLAMA_*.
+    seg = bat[bat.index("REM 1. Проверка"):bat.index("REM 2.")]
     # только ИСПОЛНЯЕМЫЕ строки секции (в REM-комментарии слово errorlevel законно —
     # там оно объясняет, от чего мы ушли)
     code = [ln.strip() for ln in seg.splitlines()
@@ -954,8 +956,10 @@ def test_start_bat_tolerates_401():
             and not ln.strip().startswith(":")]
     assert not any("errorlevel" in ln.lower() for ln in code), \
         "проверка снова на errorlevel curl (любая 4xx = «мёртв» — ложный отказ в запуске)"
-    assert any("LLAMA_CODE" in ln for ln in code), "пропадала проверка HTTP-кода ответа"
-    assert "llama_dead" in seg and "000" in seg
+    assert any("LLM_CODE" in ln for ln in code), "пропадала проверка HTTP-кода ответа"
+    assert "llm_dead" in seg and "000" in seg
+    # адрес берётся из настроек игрока, а не зашит на 127.0.0.1:8080
+    assert "MAIN_BASE_URL" in seg, "проверяется литеральный llama.cpp вместо настроенного провайдера"
 
 
 def test_start_bat_has_no_cjk():

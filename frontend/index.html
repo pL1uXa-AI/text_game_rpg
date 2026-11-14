@@ -5,6 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Text Game RPG — ИИ-рассказчик</title>
 <link rel="stylesheet" href="/static/style.css">
+<script>
+/* Открыт файл напрямую из папки (file://)? Приложение — это сервер на 127.0.0.1:8002,
+   без него ни относительный /api, ни style.css, ни app.js не загрузятся: игрок увидел бы
+   пустой экран и ошибки в консоли. Подсказываем, как запустить игру, и не грузим SPA. */
+(function () {
+  if (location.protocol !== "file:") return;
+  location.replace("offline.html");
+})();
+</script>
 </head>
 <body>
 <div id="app">

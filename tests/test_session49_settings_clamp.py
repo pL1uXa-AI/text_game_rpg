@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Сессия 49 — A9 (аудит 41): «кривое» число в настройках ломало ВСЕ будущие ходы.
 
 Что было: валидация сводилась к «`int()`/`float()` упадёт → дефолт» (`config.it/flt`),
@@ -95,6 +95,8 @@ def test_config_load_clamps_env_values(tmp_path, monkeypatch):
     monkeypatch.setenv("LOG_MAX_BYTES", "1")
     monkeypatch.setenv("TURN_SNAPSHOT_KEEP", "3")
     monkeypatch.setenv("DEFAULT_TEMP", "1e9")
+    # MAX_TOKENS=0 — теперь ЗАКОННЫЙ режим «без лимита» (см. NUM_ZERO_KEYS), а не мусор.
+    # Ниже проверено, что настоящее «слишком мало» по-прежнему подрезается до 16.
     monkeypatch.setenv("MAX_TOKENS", "0")
     monkeypatch.setenv("LLM_BG_CONCURRENCY", "99")
     cfg = Config.load(env_file=tmp_path / "absent.env")
@@ -102,8 +104,32 @@ def test_config_load_clamps_env_values(tmp_path, monkeypatch):
     assert cfg.log_max_bytes == 1_048_576
     assert cfg.turn_snapshot_keep == 10
     assert cfg.default_temp == 2.0
-    assert cfg.max_tokens == 16
+    assert cfg.max_tokens == 0, "0 = без лимита: подрезка до 16 вернула бы обрезку ответов"
     assert cfg.llm_bg_concurrency == 4
+
+
+def test_max_tokens_zero_is_unlimited_but_tiny_is_still_clamped(tmp_path, monkeypatch):
+    """MAX_TOKENS: 0 = «без лимита», 8 = слишком мало (16), мусор = дефолт."""
+    assert clamp_num("MAX_TOKENS", 0) == 0
+    assert clamp_num("MAX_TOKENS", 8) == 16
+    assert clamp_num("MAX_TOKENS", 999999) == 32768
+    monkeypatch.setenv("MAX_TOKENS", "8")
+    cfg = Config.load(env_file=tmp_path / "absent.env")
+    assert cfg.max_tokens == 16
+
+
+def test_unlimited_max_tokens_sends_no_limit_to_model():
+    """«Без лимита» — это ОТСУТСТВИЕ поля max_tokens в запросе, а не 0/«null».
+
+    У qwen/llama.cpp сервер обрезает на max_tokens и аргументы tool_call: модель с
+    «размышлениями» тратила весь лимит на reasoning, а JSON персонажа приходил
+    обрывком (finish_reason=length, «Unterminated string»).
+    """
+    from backend import llm as llm_mod
+    prov = {"base_url": "http://x/v1", "model": "m"}
+    assert "max_tokens" not in llm_mod._payload([], 0.8, 0, 0.95, False, prov)
+    assert "max_tokens" not in llm_mod._payload([], 0.8, -1, 0.95, False, prov)
+    assert llm_mod._payload([], 0.8, 1500, 0.95, False, prov)["max_tokens"] == 1500
 
 
 def test_config_load_keeps_junk_at_default_but_bounds_it(tmp_path, monkeypatch):
@@ -130,11 +156,15 @@ def test_log_rotator_bounds_apply_before_config(tmp_path, monkeypatch):
 # ══════════════════ настройки мира ══════════════════
 
 def test_world_settings_junk_is_clamped_on_save(api_client):
-    """POST /settings: «temperature: 1e9», «max_tokens: 0» не уезжают в БД как есть."""
+    """POST /settings: «temperature: 1e9» и микроскопический лимит не уезжают в БД как есть.
+
+    `max_tokens: 8` (меньше физического минимума 16) — подрезка; `0` теперь ЗАКОННЫЙ режим
+    «без лимита» и не подрезается (см. test_max_tokens_zero_is_unlimited_but_tiny_is_still_clamped).
+    """
     client, _ = api_client
     wid = client.post("/api/worlds", json=_world_payload()).json()["world_id"]
     r = client.post(f"/api/worlds/{wid}/settings",
-                    json={"temperature": 1e9, "top_p": 5, "max_tokens": 0,
+                    json={"temperature": 1e9, "top_p": 5, "max_tokens": 8,
                           "context_tokens": 7})
     assert r.status_code == 200
     g = r.json()["gen_settings"]
@@ -145,9 +175,19 @@ def test_world_settings_junk_is_clamped_on_save(api_client):
     # и честно сказано, что именно подрезали (UI/пользователь видит причину)
     limits = r.json()["gen_limits"]
     assert {"temperature", "max_tokens", "context_tokens"} <= set(limits)
-    assert limits["max_tokens"] == {"sent": 0, "used": 16, "range": [16.0, 32768.0]}
+    assert limits["max_tokens"] == {"sent": 8, "used": 16, "range": [16.0, 32768.0]}
     # в БД легло уже подрезанное значение
     assert json.loads(db_mod.get_world(wid)["gen_settings"])["temperature"] == 2.0
+
+
+def test_world_settings_accept_unlimited(api_client):
+    """`max_tokens: 0` в настройках мира = «без лимита»: сохраняется как 0, без подрезки."""
+    client, _ = api_client
+    wid = client.post("/api/worlds", json=_world_payload("A9-unlim")).json()["world_id"]
+    r = client.post(f"/api/worlds/{wid}/settings", json={"max_tokens": 0})
+    assert r.status_code == 200
+    assert r.json()["gen_settings"]["max_tokens"] == 0
+    assert "max_tokens" not in r.json()["gen_limits"]
 
 
 def test_world_settings_sane_values_untouched(api_client):
@@ -169,21 +209,23 @@ def test_junk_gen_settings_never_reach_the_model(fake_config, monkeypatch):
     import backend.config as config_mod
     cfg = Config()
     monkeypatch.setattr(config_mod, "_cache", {"cfg": cfg})
+    # 0 у max_tokens — «без лимита», остальное — мусор; бюджеты окна обязаны остаться
+    # осмысленными (раньше 0 как размер ответа делал «резерв под ответ» нулевым).
     world = {"id": 42, "gen_settings": json.dumps(
         {"temperature": 1e9, "top_p": -3, "max_tokens": 0, "context_tokens": 5})}
     params = core_mod._gen_params(world)
     assert 0.0 <= params["temperature"] <= 2.0
     assert 0.0 <= params["top_p"] <= 1.0
-    assert params["max_tokens"] >= 16
-    # бюджеты окна остаются положительными (без клампа max_tokens=0/ctx=5 их уводило в мусор)
+    assert params["max_tokens"] == 0, "0 = без лимита, а не «мусор → 16»"
+    # бюджеты окна остаются положительными (0 у лимита не съедает окно целиком)
     assert narrator_mod.world_recent_budget(world) > 0
     assert narrator_mod.world_context_tokens(world) >= 512
-    assert narrator_mod.world_prompt_overhead(world) > 0
+    assert narrator_mod.world_prompt_overhead(world) >= narrator_mod.MIN_RESPONSE_RESERVE
 
 
 def test_world_gen_settings_accept_dict_and_junk_types():
     """Форма gen_settings разная (dict из дампа, JSON-строка, битая строка) — не падаем."""
-    assert narrator_mod.world_gen_settings({"gen_settings": {"max_tokens": 0}})["max_tokens"] == 16
+    assert narrator_mod.world_gen_settings({"gen_settings": {"max_tokens": 0}})["max_tokens"] == 0
     assert narrator_mod.world_gen_settings({"gen_settings": '{битый json'}) == {}
     # числовая строка нормализуется (её всё равно отправляли в модель числом),
     # а не-число остаётся как есть — изобретать значение за игроку не будем
@@ -199,7 +241,7 @@ def test_world_detail_returns_effective_settings(api_client):
     wid = client.post("/api/worlds", json=_world_payload("A9-d")).json()["world_id"]
     db_mod.update_world(wid, gen_settings={"max_tokens": 0, "temperature": 1e9})
     g = client.get(f"/api/worlds/{wid}").json()["gen_settings"]
-    assert g["max_tokens"] == 16 and g["temperature"] == 2.0
+    assert g["max_tokens"] == 0 and g["temperature"] == 2.0
 
 
 # ══════════════════ админка ══════════════════
@@ -282,7 +324,7 @@ def test_clamping_is_logged_not_silent(api_client, monkeypatch):
     logsetup.reset_once()
     try:
         clamp_num("LOG_MAX_BYTES", 1)
-        clamp_gen_settings({"max_tokens": 0}, where="мир 7")
+        clamp_gen_settings({"max_tokens": 8}, where="мир 7")
     finally:
         root.removeHandler(h)
         logsetup.reset_once()
@@ -308,7 +350,7 @@ def test_repeated_clamp_does_not_storm_the_log():
     logsetup.reset_once()
     try:
         for _ in range(5):
-            clamp_gen_settings({"max_tokens": 0}, where="мир 9")
+            clamp_gen_settings({"max_tokens": 8}, where="мир 9")
     finally:
         root.removeHandler(h)
         logsetup.reset_once()
