@@ -2,8 +2,10 @@
 """Роутер страниц и статуса: / (SPA), /admin, /api/system/status."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import APIRouter, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 from .. import chroma_client, db, llm, metrics, tts
 from ..config import get_config
@@ -28,13 +30,19 @@ _PAGE_HEADERS = {"Cache-Control": "no-store"}
 @router.get("/", include_in_schema=False)
 async def index():
     # no-store: см. _PAGE_HEADERS (D15) — без него браузер кеширует оболочку SPA
-    return FileResponse(f"{FRONTEND_DIR}/index.html", headers=_PAGE_HEADERS)
+    # Версии статики (сессия 85): ссылки на CSS/JS получают ?v=<mtime>, иначе телефон
+    # держал старый style.css и «адаптация не поменялась».
+    from ..static_version import version_static
+    html = Path(f"{FRONTEND_DIR}/index.html").read_text(encoding="utf-8")
+    return HTMLResponse(version_static(html, FRONTEND_DIR), headers=_PAGE_HEADERS)
 
 
 @router.get("/admin", include_in_schema=False)
 async def admin_page():
     # no-store: иначе браузер кеширует старую админку и ломается (null в скрипте)
-    return FileResponse(f"{FRONTEND_DIR}/admin.html", headers=_PAGE_HEADERS)
+    from ..static_version import version_static
+    html = Path(f"{FRONTEND_DIR}/admin.html").read_text(encoding="utf-8")
+    return HTMLResponse(version_static(html, FRONTEND_DIR), headers=_PAGE_HEADERS)
 
 
 @router.get("/api/metrics")

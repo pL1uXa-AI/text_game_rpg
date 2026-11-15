@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.testclient import TestClient
 
 from backend.routers import system as sys_mod
+from backend.static_version import version_static
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -61,11 +62,20 @@ def test_both_pages_identical_header():
 
 
 def test_pages_still_real_html():
-    """no-store не сломал выдачу: это по-прежнему те самые файлы."""
+    """no-store не сломал выдачу: это по-прежнему те самые файлы.
+
+    Сессия 85: страницы отдаются через HTMLResponse с `?v=<mtime>` у ссылок на статику
+    (иначе телефон держал старый CSS). Поэтому сравниваем по СМЫСЛУ: ключевые элементы
+    разметки на месте, и отличаются только версии статики.
+    """
     c = _client()
-    assert "Text Game" in c.get("/").text
+    index_html = c.get("/").text
+    assert "Text Game" in index_html
     assert "Админка" in c.get("/admin").text
-    assert (ROOT / "frontend" / "index.html").read_text(encoding="utf-8") == c.get("/").text
+    assert 'id="app"' in index_html, "разметка главной страницы пропала"
+    # исходник и отданный HTML совпадают, если убрать параметры версии
+    src = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
+    assert index_html == version_static(src, ROOT / "frontend")
 
 
 def test_single_header_constant_used():
@@ -85,7 +95,7 @@ def test_missing_file_is_not_silently_ok(tmp_path, monkeypatch):
     monkeypatch.setattr(sys_mod, "FRONTEND_DIR", str(tmp_path))
     app = FastAPI()
     app.include_router(sys_mod.router)
-    with pytest.raises(RuntimeError):
+    with pytest.raises((RuntimeError, FileNotFoundError)):
         TestClient(app, raise_server_exceptions=True).get("/")
 
 
