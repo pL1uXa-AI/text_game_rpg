@@ -211,6 +211,9 @@ function renderWorlds() {
   shown.forEach((w) => {
     const card = document.createElement("div");
     card.className = "world-card";
+    // data-world — чтобы кнопка «Играть» этой карточки могла показать «Загрузка…»
+    // на время запроса мира (телефон по Wi-Fi ждёт заметно дольше, чем ПК).
+    card.dataset.world = String(w.id);
     const tname = (state.themes.find((t) => t.id === w.theme) || {}).name || (w.theme === "custom" ? "Свой сюжет" : `Сюжет «${w.theme}» (удалён/правлен)`);
     card.innerHTML = `
       <div>
@@ -300,11 +303,26 @@ async function createWorld() {
 /* ─────────────── Игровой экран ─────────────── */
 async function openWorld(id) {
   state.currentWorld = id;
+  // Сессия 84: экран игры показываем ТОЛЬКО после загрузки данных мира. Раньше порядок был
+  // «показать пустой экран → await API(...)»: на телефоне по Wi-Fi запрос идёт заметно
+  // дольше, и игрок видел пустое полотно с одной кнопкой «Провидение» — без чата, панели
+  // и заголовка (жалоба «пустой экран»). Теперь сначала данные, потом переключение.
+  // Пока грузим — честная надпись вместо мёртвого экрана (и кнопка не «висит»).
+  const openedBtn = document.querySelector(`.world-card[data-world="${id}"] .btn`);
+  const btnLabel = openedBtn ? openedBtn.textContent : "";
+  if (openedBtn) { openedBtn.disabled = true; openedBtn.textContent = "Загрузка…"; }
+  let d;
+  try {
+    d = await API(`/api/worlds/${id}`);
+  } catch (e) {
+    if (openedBtn) { openedBtn.disabled = false; openedBtn.textContent = btnLabel || "Играть"; }
+    throw e;
+  }
+  if (openedBtn) { openedBtn.disabled = false; openedBtn.textContent = btnLabel || "Играть"; }
   $("screen-start").style.display = "none";
   $("screen-game").style.display = "flex";
   // Кнопка админки — только в меню, в игре не нужна
   const tb = document.querySelector(".topbar"); if (tb) tb.style.display = "none";
-  const d = await API(`/api/worlds/${id}`);
   state.setting = d.setting || null;
   state.gen = d.gen_settings || {};
   state.providersEffective = d.providers_effective || null;
@@ -3121,6 +3139,10 @@ document.addEventListener("DOMContentLoaded", () => {
     if (sideToggle) sideToggle.setAttribute("aria-expanded", open ? "true" : "false");
   };
   if (sideToggle) sideToggle.onclick = () => setSidebar(!sg.classList.contains("side-open"));
+  // Сессия 84: кнопка открытия панели в чате (телефон). Раньше ☰ лежала ВНУТРИ панели,
+  // и на узком экране добраться до карточек/персонажа было нечем — панель скрыта за краем.
+  const sideOpen = $("btn-sidebar-open");
+  if (sideOpen) sideOpen.onclick = () => setSidebar(true);
   const scrim = $("sidebar-scrim");
   if (scrim) scrim.onclick = () => setSidebar(false);
   // клик по карточке состояния (открытая модалка/панель) на узком экране закрывает панель
@@ -3128,7 +3150,8 @@ document.addEventListener("DOMContentLoaded", () => {
     if (window.innerWidth > 900) return;
     if (!sg.classList.contains("side-open")) return;
     const t = e.target;
-    if (t && t.closest && (t.closest(".sidebar") || t.closest("#btn-sidebar"))) return;
+    if (t && t.closest && (t.closest(".sidebar") || t.closest("#btn-sidebar")
+                           || t.closest("#btn-sidebar-open"))) return;
     setSidebar(false);
   }, true);
   //Esc всегда убирает панель — на телефоне это единственный способ вернуться в чат,

@@ -277,7 +277,7 @@ text_game/
 │   ├── admin_settings.py    # чтение таблицы админки отдельным соединением (без рекурсии config→db)
 │   └── config.py            # чтение .env + реестр провайдеров + оверрайды админки
 ├── frontend/                # SPA (vanilla JS, SSE): index.html, admin.html, app.js, style.css
-├── tests/                   # pytest (1106 тестов): директивы, механика, API, граф, память/TTS, интеграция
+├── tests/                   # pytest (1118 тестов): директивы, механика, API, граф, память/TTS, интеграция
 ├── data/                    # ЛОКАЛЬНЫЕ данные (вся папка в .gitignore): game.db, chroma/, chroma-venv/,
 │                            #   tts/, fastembed/, backups/ (снимки game.db), metrics.jsonl
 └── scripts/                 # setup_env.bat (окружение с нуля), setup_tts.bat, start_chroma.bat,

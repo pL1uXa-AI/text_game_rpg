@@ -485,6 +485,10 @@ class Config:
     llm_retries: int = 2              # повторов ПОСЛЕ первой попытки (итого до 3 запросов)
     llm_retry_backoff: float = 0.8    # базовая задержка, удваивается (0.8с → 1.6с)
     llm_timeout: float = 300.0        # общий таймаут запроса к модели (connect — жёстче)
+    # Сколько ждать «Быстрые действия» (POST /suggest). Раньше был жёсткий 12 с в коде:
+    # у локальной 27B-модели ответ идёт 80–140 с, и подсказки возвращались ПУСТЫМИ всегда.
+    # 90 с покрывает и облако, и локальную модель; сверх этого кнопки просто остаются прежними.
+    suggest_timeout: float = 90.0
     chroma_retries: int = 1           # ChromaDB — локальный сервис: один быстрый повтор
     embedding_retries: int = 1        # облачные эмбеддинги/реранкер
 
@@ -718,6 +722,7 @@ class Config:
             llm_retries=it(2, "LLM_RETRIES"),
             llm_retry_backoff=flt(0.8, "LLM_RETRY_BACKOFF"),
             llm_timeout=flt(300.0, "LLM_TIMEOUT"),
+            suggest_timeout=flt(90.0, "SUGGEST_TIMEOUT"),
             chroma_retries=it(1, "CHROMA_RETRIES"),
             embedding_retries=it(1, "EMBEDDING_RETRIES"),
             llm_bg_concurrency=it(2, "LLM_BG_CONCURRENCY"),

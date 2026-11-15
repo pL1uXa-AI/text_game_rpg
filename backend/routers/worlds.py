@@ -257,10 +257,13 @@ async def create_world(body: WorldCreate, _rl: None = Depends(guard_for("create_
     # Быстрые действия ИИ сразу на первом шаге (по вступительной сцене), а не только после хода.
     suggestions: list[str] = []
     try:
+        # Сессия 84: тот же жёсткий 12 с, что и в /suggest, — на медленной модели
+        # подсказки на старте приходили пустыми всегда. Лимит настраиваемый.
         suggestions = await asyncio.wait_for(
             narrator.generate_suggestions(setting, "Начало истории", opening, provider=providers["main"]),
-            timeout=12)
-    except Exception:
+            timeout=max(5, get_config().suggest_timeout))
+    except Exception as e:
+        log.info("подсказки на старте не сгенерированы (world %s): %s", world_id, str(e)[:120])
         suggestions = []
 
     return {"world_id": world_id, "world": _safe_world_row(db.get_world(world_id)),
@@ -444,6 +447,24 @@ async def world_providers(world_id: int, body: ProvidersIn,
             warns.append("Основная модель «" + (main.get("name") or main.get("id") or "?") +
                          "» сейчас не отвечает (" + (main.get("base_url") or "адрес не задан") +
                          "). Ходы будут падать, пока сервер модели не поднимется.")
+        elif main.get("enabled"):
+            # Сессия 84: `check_available` спрашивает только `/models` и считает любой
+            # ответ <500 живым. Ключ с правом ТОЛЬКО на список моделей проходит эту
+            # проверку (200), а на каждом `/chat/completions` отдаёт 401 — так в мире
+            # оказался недействительный ключ RouterAI: «Быстрые действия» молча
+            # возвращались пустыми, а прямой ход падал. Проверяем НАСТОЯЩУЮ генерацию.
+            try:
+                await llm.complete([{"role": "user", "content": "ok"}], max_tokens=1,
+                                   temperature=0.0, provider=main)
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                if "401" in msg or "403" in msg or "Unauthorized" in msg:
+                    warns.append("Ключ модели отклонён сервером (401/403): проверь API-ключ "
+                                 "для «" + (main.get("name") or main.get("id") or "?") +
+                                 "». Доступ к списку моделей может быть, а к генерации — нет.")
+                elif "404" in msg or "not found" in msg.lower():
+                    warns.append("Модель «" + str(main.get("model") or "?") + "» не найдена "
+                                 "на сервере (404) — проверь название модели.")
     except Exception as e:
         log.warning("проверка доступности модели (world %s): %s", world_id, e)
     db.update_world(world_id, provider_settings=current)
@@ -540,11 +561,18 @@ async def suggest_actions(world_id: int, _rl: None = Depends(guard_for("suggest"
     suggestions: list[str] = []
     if last_reply.strip():
         try:
+            # Сессия 84: было жёстко `timeout=12`. На локальной 27B-модели один ответ идёт
+            # 80–140 с, поэтому запрос ВСЕГДА упирался в 12 с, возвращал [] — и «Быстрые
+            # действия» переставали обновляться («раньше работало»). Берём настраиваемый
+            # лимит (SUGGEST_TIMEOUT в .env) с дефолтом, рассчитанным и на локальные модели.
             suggestions = await asyncio.wait_for(
                 narrator.generate_suggestions(setting, "Осмотреться в текущей ситуации", last_reply,
                                               provider=providers["main"]),
-                timeout=12)
-        except Exception:
+                timeout=max(5, get_config().suggest_timeout))
+        except Exception as e:
+            # Раньше это был голый `pass` в `except Exception: suggestions = []`, и игрок
+            # видел просто «залипшие» кнопки без единой строчки в журнале (правило 14).
+            log.info("подсказки не сгенерированы (world %s): %s", world_id, str(e)[:120])
             suggestions = []
     return {"suggestions": suggestions}
 

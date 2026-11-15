@@ -507,6 +507,7 @@ input[type="range"]::-moz-range-track { height: 6px; border-radius: 999px; backg
    масштабируются «подгонкой всего» (fitAll) — отдельной правки не потребовали.
    Десктоп (>900px) не меняется вообще: кнопка-переключатель скрыта, позиционирование прежнее. */
 .sidebar-toggle { display: none; }
+.sidebar-open { display: none; }   /* десктоп: панель и так видна, кнопка не нужна */
 .sidebar-scrim { display: none; }
 
 @media (max-width: 900px) {
@@ -555,6 +556,178 @@ input[type="range"]::-moz-range-track { height: 6px; border-radius: 999px; backg
 /* уважаем системный отказ от анимаций (у выдвижной панели тогда не «плывёт» transform) */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001s !important; transition-duration: .001s !important; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   МОБИЛЬНЫЙ СЛОЙ (сессия 84) — телефон/планшет в локальной сети.
+
+   Что было не так при игре с телефона:
+   1) `height: 100vh` и `max-height: 100vh` у #screen-game/.chat/.sidebar. В мобильных
+      браузерах 100vh = высота БЕЗ учёта адресной строки и панелей, поэтому низ экрана
+      (в первую очередь поле ввода) уезжал под интерфейс браузера, а при прокрутке
+      страница «прыгала». Используем 100dvh с фолбэком на 100vh для старых движков.
+   2) `.topbar` (fixed, справа сверху) на узком экране налезал на ПЕРЕКРЫВАЮЩИЕСЯ
+      элементы: карту, кнопку Провидения и заголовок мира. На телефоне он больше не
+      висит над контентом.
+   3) `body { background-attachment: fixed }` — на iOS тяжёлый фиксированный фон
+      вызывает дёргание при скролле; на мобильных отдаём обычный фон.
+   4) Поле ввода и кнопка отправки были меньше комфортного тапа (44×44). Подняли.
+   5) Клавиатура: .chat прибит к верху экрана, и при открытой клавиатуре низ уезжает.
+      Ставим `100dvh` и `min-height: 0`, чтобы flex-поток сжимался, а .log прокручивался.
+   6) Горизонтальная прокрутка от длинных строк (названия предметов, URL) — вкл.
+      `overflow-x: hidden` у контейнеров и `overflow-wrap: anywhere`.
+
+   Десктоп (>900px) не меняется: все правила внутри медиазапросов.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+/* Фолбэк и «динамическая» высота: браузер возьмёт второе объявление, если умеет dvh. */
+@supports (height: 100dvh) {
+  #screen-game, .chat, .sidebar { height: 100dvh; max-height: 100dvh; }
+}
+
+@media (max-width: 900px) {
+  /* 0) Стартовый экран («Мои миры» + «Новый мир»): на телефоне — ОДНА колонка.
+        Было жёстко `grid-template-columns: 320px 1fr`, и на 390px обе панели
+        втискивались рядом: списки миров и сюжетов сжимались до нечитаемого,
+        карточки шли в два столбика по 180px. Теперь секции друг под другом. */
+  .start-layout {
+    display: flex; flex-direction: column;
+    grid-template-columns: none;
+    gap: 14px; padding: 12px 12px 24px; max-width: 100%;
+  }
+  .start-layout > * { min-width: 0; }
+  .hero h1 { font-size: 24px; }
+  .panel { padding: 13px; border-radius: 12px; }
+  .panel h2 { font-size: 16px; }
+  .theme-grid { grid-template-columns: 1fr; }
+  .world-card { flex-wrap: wrap; }
+  .world-card .w-btns { margin-left: auto; }
+  .world-card .btn { min-height: 40px; }
+  /* статус сервисов и админка не должны свисать в угол поверх заголовка */
+  #app > .topbar { justify-content: flex-end; }
+
+  /* 1) Высота под реальную видимую область, без «прыжков» от адресной строки */
+  html, body { height: auto; min-height: 100%; overscroll-behavior-y: none; }
+  body { background-attachment: scroll; }
+  #screen-game {
+    height: 100dvh; max-height: 100dvh;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    overflow: hidden;
+  }
+
+  /* 2) Topbar не висит над содержимым: на телефоне он внутри потока.
+        Он лежит в #app (не в #screen-game), поэтому правила — по #app > .topbar. */
+  #app > .topbar {
+    position: static; display: flex; justify-content: flex-end;
+    padding: 8px 12px 4px; z-index: auto;
+  }
+  #app > .topbar .btn.small { min-height: 40px; }
+  /* высота #screen-game считается за вычетом строки топбара */
+  #app { display: flex; flex-direction: column; min-height: 100dvh; }
+  #screen-game { flex: 1 1 auto; height: auto; max-height: none; min-height: 0; }
+
+  /* 3) Чат и панель — на всю высоту, панель в оверлее (уже было) */
+  .chat { height: 100dvh; max-height: 100dvh; min-height: 0; }
+  .sidebar { height: 100dvh; max-height: 100dvh; }
+
+  /* 4) Лог: воздух не съедает текст, прокрутка плавная */
+  .log { padding: 12px 12px 8px; gap: 10px; -webkit-overflow-scrolling: touch; }
+
+  /* 5) Ввод: крупные тапы, поле не уезжает под клавиатуру */
+  .input-row {
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+    gap: 8px;
+  }
+  .input-row input {
+    font-size: 16px;            /* 16px = iOS НЕ зумит страницу при фокусе */
+    min-height: 48px;
+    padding: 10px 12px;
+  }
+  .input-row .btn.primary {
+    min-width: 52px; min-height: 48px; font-size: 18px; flex: 0 0 auto;
+  }
+
+  /* 6) Кнопки-подсказки — в удобный «чипсовый» ряд, с горизонтальной прокруткой,
+        если их много (иначе три-четыре длинных варианта ломают раскладку).
+        ⚠ И «Быстрые действия», и «Рядом» — это ОДНА строка каждая: на скриншоте
+        телефона они выстраивались в столбик на пол-экрана и съедали чат.
+        Теперь это ленты, которые листаются пальцем по горизонтали. */
+  .suggestion-bar, .compass-bar {
+    display: flex; flex-wrap: nowrap; align-items: center;
+    gap: 8px; padding: 8px 12px;
+    overflow-x: auto; overflow-y: hidden;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    -webkit-mask-image: linear-gradient(to right, #000 92%, transparent 100%);
+            mask-image: linear-gradient(to right, #000 92%, transparent 100%);
+  }
+  .suggestion-bar::-webkit-scrollbar, .compass-bar::-webkit-scrollbar { display: none; }
+  .suggestion-bar > *, .compass-bar > * { flex: 0 0 auto; }
+  .suggestion-bar .btn.sug, .compass-bar .compass-btn {
+    white-space: nowrap; min-height: 40px; font-size: 14px; padding: 8px 14px;
+    max-width: 74vw; overflow: hidden; text-overflow: ellipsis;
+  }
+  .suggestion-bar .sug-label, .compass-bar .compass-label {
+    white-space: nowrap; flex: 0 0 auto; font-size: 13px;
+  }
+
+  /* 7) Сообщения: в одну колонку, читаемый размер, без горизонтальной прокрутки */
+  .msg { max-width: 100%; }
+  .msg .body { font-size: 16px; line-height: 1.6; overflow-wrap: anywhere; }
+  .msg .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .msg .actions button { min-height: 44px; }
+
+  /* 8) Ничего не должно вылезать за экран по горизонтали */
+  .panel-body, .world-head, .msg, .state-block, pre, code { overflow-wrap: anywhere; }
+  #screen-game, .chat, .log, .sidebar { overflow-x: hidden; }
+  .map-wrap { height: 58dvh; min-height: 240px; }
+
+  /* 8а) Кнопка открытия панели мира: на телефоне — единственный вход в карточки,
+        персонажа и инвентарь (на десктопе панель видна всегда, кнопка скрыта). */
+  .sidebar-open {
+    display: inline-flex; align-items: center; justify-content: center;
+    position: absolute; top: 6px; right: 8px; z-index: 6;
+    width: 46px; height: 46px; font-size: 22px; line-height: 1;
+    border-radius: 12px; background: var(--bg2); border: 1px solid var(--line);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, .45);
+  }
+  .sidebar-open:active { background: var(--bg3); }
+
+  /* Провидение: не перекрывает первую реплику и не наползает на админку */
+  #btn-divine { top: 6px; right: 8px; font-size: 13px; min-height: 36px; }
+  .log > :first-child { margin-top: 44px; }
+
+  /* Модалки — почти на весь экран, с внутренней прокруткой */
+  .modal-box {
+    width: 94vw; max-width: 94vw; max-height: 88dvh;
+    display: flex; flex-direction: column;
+  }
+  .modal-box .modal-body { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+}
+
+/* Очень узкие телефоны (iPhone SE и подобные, 320–400px) */
+@media (max-width: 420px) {
+  .msg .body { font-size: 15.5px; padding: 10px 12px; }
+  .log { padding: 10px 10px 6px; }
+  .world-head { padding: 12px 12px 6px; }
+  .world-head h2 { font-size: 16px; }
+  .input-row { padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px)); }
+  .map-wrap { height: 50dvh; min-height: 220px; }
+  .legend { gap: 8px; font-size: 11px; }
+  .tab { font-size: 13px; padding: 10px 10px; }
+}
+
+/* Телефон в горизонтальной ориентации: вертикали мало — ужимаем всё лишнее */
+@media (max-height: 460px) and (max-width: 900px) {
+  .map-wrap { height: 44dvh; min-height: 160px; }
+  .log { padding: 8px 10px; }
+  .input-row { padding: 6px 10px; }
+  .input-row input { min-height: 42px; }
+}
+
+/* Сенсорные устройства: hover-эффекты не «залипают» после тапа */
+@media (hover: none) {
+  .btn:hover { transform: none; }
 }
 
 .rewind-list { max-height: 240px; overflow-y: auto; }
