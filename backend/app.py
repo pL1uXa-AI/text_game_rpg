@@ -322,7 +322,23 @@ app = FastAPI(
     ],
 )
 
-app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+class _NoStaleStatic(StaticFiles):
+    """StaticFiles с `Cache-Control: no-cache` — чтобы правки фронта доходили сразу.
+
+    Проблема (сессия 85): `/static/style.css` отдавался БЕЗ Cache-Control. Мобильный
+    браузер по эвристике держал старую копию, и новый мобильный CSS «не применялся»:
+    игрок открывал игру с телефона и видел прежнюю вёрстку, хотя файл на сервере уже
+    обновился. `no-cache` (а не `no-store`) — файлы не перекачиваются целиком: браузер
+    обязан ПРОВЕРИТЬ по ETag и возьмёт 304, если правка не нужна.
+    """
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
+app.mount("/static", _NoStaleStatic(directory=FRONTEND_DIR), name="static")
 
 
 # ── Контекст запроса для лога (сессия 34): каждый HTTP-вызов получает request_id, а

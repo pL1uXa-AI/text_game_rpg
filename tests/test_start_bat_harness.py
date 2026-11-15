@@ -303,7 +303,9 @@ def test_harness_detects_broken_block_echo(sandbox):
     отличить сломанный launcher от целого (целой запускает, сломанный — нет).
     """
     src = BAT.read_text(encoding="utf-8")
-    guarded = ('    if "%GAME_NO_BROWSER%"=="" start "" http://127.0.0.1:8002\r\n'
+    # Сессия 85: ветка «игра уже запущена» открывает браузер по вычисленному адресу
+    # (%GAME_URL%), а не по жёсткому 127.0.0.1 — проба обновлена на актуальный вид.
+    guarded = ('    if "%GAME_NO_BROWSER%"=="" start "" %GAME_URL%\r\n'
                '    if "%GAME_NO_BROWSER%"=="" echo      открыл браузер. Закрой это окно.\r\n'
                '    if not "%GAME_NO_BROWSER%"=="" echo      браузер не открыт: '
                'GAME_NO_BROWSER задан\r\n')

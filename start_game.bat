@@ -11,14 +11,45 @@ REM Консоль НЕ закрывается при ошибке: показы
 setlocal
 cd /d %~dp0
 
+REM ── Адрес, по которому игра ПУБЛИКУЕТСЯ и открывается ──────────────────────
+REM Сессия 85 (жалоба: «запускается 127.0.0.1, а не 192.168.1.101»): лаунчер печатал
+REM и открывал в браузере жёстко http://127.0.0.1:8002, даже когда сервер слушал
+REM сетевой адрес. Игрок видел localhost и не понимал, что с телефона надо идти по IP.
+REM
+REM Теперь адрес считается из GAME_BIND: для «все интерфейсы» (0.0.0.0) и loopback
+REM подставляется LAN-адрес машины, а если сети нет — откатываемся на 127.0.0.1.
+REM GAME_PUBLIC_HOST можно задать явно, если адрес нужно опубликовать не тот, что в bind.
+if "%GAME_BIND%"=="" set "GAME_BIND=127.0.0.1"
+set "GAME_URL_HOST=%GAME_PUBLIC_HOST%"
+if not "%GAME_URL_HOST%"=="" goto url_ready
+echo %GAME_BIND% | findstr /b /c:"127.0.0.1" /c:"localhost" /c:"::1" >nul 2>&1
+if errorlevel 1 set "GAME_URL_HOST=%GAME_BIND%"
+if not "%GAME_URL_HOST%"=="" goto url_ready
+echo %GAME_BIND% | findstr /b /c:"0.0.0.0" /c:"::" >nul 2>&1
+if errorlevel 1 goto url_loopback
+REM «все интерфейсы»: берём LAN-адрес этой машины через scripts\lanip.ps1 (он отдаёт
+REM только 192.168.* / 10.* — VPN-туннель 198.18 и Hyper-V 172.27 с телефона не годятся).
+REM Отдельный .ps1, а не однострочник: внутри .bat экранирование кавычек ломалось, и в
+REM переменную попадал мусор либо пусто (проверено).
+set "GAME_URL_HOST="
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lanip.ps1"`) do set "GAME_URL_HOST=%%I"
+if not "%GAME_URL_HOST%"=="" goto url_ready
+:url_loopback
+set "GAME_URL_HOST=127.0.0.1"
+:url_ready
+REM ЖИВОЙ адрес игры: к нему идёт игрок (и в браузере, и с телефона).
+set "GAME_URL=http://%GAME_URL_HOST%:8002"
+
 REM 0. Если игра уже запущена — второй раз не запускаем
 netstat -ano | findstr ":8002" | findstr "LISTENING" >nul 2>&1
 if %errorlevel% equ 0 (
-    echo [OK] Игра уже запущена: http://127.0.0.1:8002
+    echo [OK] Игра уже запущена: %GAME_URL%
+    REM Показываем и loopback: на самом ПК всегда работает короткий адрес.
+    echo      локально: http://127.0.0.1:8002
     REM GAME_NO_BROWSER задан — вкладку НЕ открывать: нужно автотестам (харнесс
     REM tests/test_start_bat_harness.py) и автозапуску, где окно браузера — вредный
     REM побочный эффект. Игрок по умолчанию видит прежнее поведение.
-    if "%GAME_NO_BROWSER%"=="" start "" http://127.0.0.1:8002
+    if "%GAME_NO_BROWSER%"=="" start "" %GAME_URL%
     if "%GAME_NO_BROWSER%"=="" echo      открыл браузер. Закрой это окно.
     if not "%GAME_NO_BROWSER%"=="" echo      браузер не открыт: GAME_NO_BROWSER задан
     pause
@@ -95,9 +126,10 @@ if %errorlevel% neq 0 (
 :chroma_ok
 
 REM 3. Сервер игры
-REM ВАЖНО: слушаем ТОЛЬКО 127.0.0.1. В .env лежат живые API-ключи, у игры нет авторизации —
-REM доступ с чужого адреса отдаёт админку (/admin) и весь API всей локальной сети.
-if "%GAME_BIND%"=="" set GAME_BIND=127.0.0.1
+REM ВАЖНО: адрес по умолчанию — 127.0.0.1 (GAME_BIND уже задан в начале скрипта, см.
+REM блок «Адрес, по которому игра ПУБЛИКУЕТСЯ»). В .env лежат живые API-ключи, у игры
+REM нет авторизации — доступ с чужого адреса открывает весь API локальной сети,
+REM поэтому не-loopback адрес требует осознанного GAME_BIND_CONFIRM=1.
 
 REM B2 (аудит 41): этот launcher больше НЕ приглашает игрока «открыть наружу». Любой
 REM адрес, кроме localhost, теперь требует явного подтверждения GAME_BIND_CONFIRM=1:
@@ -160,7 +192,8 @@ echo         Установка зависимостей игры: scripts\\setu
 pause
 exit /b 1
 :py_ok
-echo [START] Text Game RPG: http://127.0.0.1:8002
+echo [START] Text Game RPG: %GAME_URL%
+echo         локально: http://127.0.0.1:8002  ^(если слушаем все интерфейсы^)
 echo [INFO]  bind=%GAME_BIND%  ^(правило 5 в AGENT.md: наружу — только осознанно^)
 echo [INFO]  интерпретатор: %GAME_PYTHON%
 %GAME_PYTHON% -X utf8 -m uvicorn backend.app:app --host %GAME_BIND% --port 8002
