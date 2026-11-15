@@ -1,5 +1,9 @@
 @echo off
 REM Text Game RPG — запуск сервера игры.
+REM Сессия 83: файлы .bat сохранены в UTF-8, а консоль Windows по умолчанию в cp866 —
+REM поэтому кириллица в окне лаунчера выглядела «кракозябрами» (Г—Р°РїСѓСЃРє). Ставим
+REM кодовую страницу UTF-8 и шрифт консоли; chcp влияет только на это окно.
+chcp 65001 >nul
 REM Требования: 1) провайдер модели из MAIN_BASE_URL в .env (локальная модель или облако)
 REM             2) своя ChromaDB на 8001 (поднимется сама).
 REM Консоль НЕ закрывается при ошибке: показываем сообщение и ждём Enter.
@@ -117,20 +121,49 @@ echo         Админка /api/admin/settings при этом остаётся
 :bind_ok
 
 REM D13 (аудит 38): вместо жёсткого абсолютного пути к python.exe — интерпретатор берётся
-REM из GAME_PYTHON (можно задать в .env-стиле/окружении), иначе из PATH. Раньше на любой
-REM другой машине bat падал с «система не может найти указанный файл» без внятного текста.
-if "%GAME_PYTHON%"=="" set "GAME_PYTHON=python"
-"%GAME_PYTHON%" -V >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Интерпретатор "%GAME_PYTHON%" не найден в PATH.
-    echo         Запусти с GAME_PYTHON=C:\\путь\\python.exe ^(нужен Python 3.11+^),
-    echo         либо добавь python в PATH. Установка зависимостей: scripts\\setup_env.bat
-    pause
-    exit /b 1
-)
+REM из GAME_PYTHON (можно задать в .env-стиле/окружении), иначе ищется сам.
+REM
+REM Сессия 83 (реальный сбой у игрока): в PATH первым стоит `python.exe` из
+REM %LOCALAPPDATA%\Microsoft\WindowsApps — это ЗАГЛУШКА Microsoft Store: она не запускает
+REM Python, а печатает «Python was not found; run without arguments to install from the
+REM Store». Проверка `python -V` при этом «успешна» (процесс-заглушка возвращает 0), и
+REM лаунчер уходил запускать uvicorn «успешным» python, который ничего не делает.
+REM Поэтому кандидаты перебираются по порядку и проверяются НАСТОЯЩИМ запуском Python.
+if not "%GAME_PYTHON%"=="" goto py_check
+REM Поиск в порядке надёжности: обычный python → py launcher → типовые места установки.
+REM Список путей собирается из %LOCALAPPDATA% (без зашитых букв диска), поэтому лаунчер
+REM работает на любой машине; GAME_PYTHON по-прежнему перекрывает всё.
+REM 1) обычный python (может быть заглушкой Store — отсеется проверкой ниже)
+set "GAME_PYTHON=python"
+%GAME_PYTHON% -c "import sys" >nul 2>&1
+if %errorlevel% equ 0 goto py_check
+REM 2) py launcher (штатный установщик Python с python.org)
+set "GAME_PYTHON=py -3"
+%GAME_PYTHON% -c "import sys" >nul 2>&1
+if %errorlevel% equ 0 goto py_check
+REM 3) типовые места установки для текущего пользователя
+set "GAME_PYTHON="
+for %%V in (314 313 312 311) do if not defined GAME_PYTHON if exist "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe" set "GAME_PYTHON=%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe"
+if not defined GAME_PYTHON goto py_missing
+:py_check
+REM ⚠ БЕЗ кавычек вокруг "%GAME_PYTHON%": при значении «py -3» кавычки склеивают «py -3» в
+REM ОДНО имя файла, и запуск проваливается (проверено). Пути с пробелами сюда не попадают —
+REM лаунчер сам берёт только существующие python.exe и py.exe.
+%GAME_PYTHON% -c "import sys" >nul 2>&1
+if %errorlevel% neq 0 goto py_missing
+goto py_ok
+:py_missing
+echo [ERROR] Python не найден или в PATH стоит заглушка Microsoft Store.
+echo         Поставь Python 3.11+ с python.org ^(галочка "Add python.exe to PATH"^)
+echo         или укажи свой: set GAME_PYTHON=C:\\путь\\python.exe
+echo         Установка зависимостей игры: scripts\\setup_env.bat
+pause
+exit /b 1
+:py_ok
 echo [START] Text Game RPG: http://127.0.0.1:8002
 echo [INFO]  bind=%GAME_BIND%  ^(правило 5 в AGENT.md: наружу — только осознанно^)
-"%GAME_PYTHON%" -X utf8 -m uvicorn backend.app:app --host %GAME_BIND% --port 8002
+echo [INFO]  интерпретатор: %GAME_PYTHON%
+%GAME_PYTHON% -X utf8 -m uvicorn backend.app:app --host %GAME_BIND% --port 8002
 if %errorlevel% neq 0 (
     echo.
     echo [ERROR] Сервер не запустился или упал ^(код %errorlevel%^).

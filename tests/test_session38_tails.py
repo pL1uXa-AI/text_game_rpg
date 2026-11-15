@@ -302,8 +302,11 @@ def test_d11_check_start_bat_green():
 
 
 @pytest.mark.parametrize("needle,replace,kind,expect", [
-    ('if "%GAME_PYTHON%"=="" set "GAME_PYTHON=python"',
-     'set GAME_PYTHON="D:\\Tools\\python.exe"', "abs_path", "абсолютный путь"),
+    # Сессия 83: лаунчер больше не «одна строка set GAME_PYTHON=python», а поиск кандидатов
+    # (python → py launcher → типовые места). Деградация-проба: подменяем ПЕРВЫЙ кандидат
+    # на абсолютный путь — чекер обязан поймать зашитый путь.
+    ('set "GAME_PYTHON=python"',
+     'set "GAME_PYTHON=D:\\Tools\\python.exe"', "abs_path", "абсолютный путь"),
     ("--host %GAME_BIND%", "--host 0.0.0.0", "public_bind", "0.0.0.0"),
     ('-w "%%{http_code}"', "", "errorlevel_style", "http_code"),
 ])

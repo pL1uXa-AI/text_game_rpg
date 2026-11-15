@@ -1,4 +1,7 @@
 @echo off
+REM Сессия 83: файл сохранён в UTF-8, а консоль Windows — в cp866, поэтому русский текст в
+REM окне выглядел «кракозябрами». Ставим кодовую страницу (влияет только на это окно).
+chcp 65001 >nul
 REM start_chroma.bat — запуск СОБСТВЕННОЙ ChromaDB игры (порт 8001).
 REM Данные — data\chroma, venv — data\chroma-venv. Отдельно от py_docs (8000).
 REM
@@ -38,7 +41,6 @@ goto have_cmd
 :have_exe
 set "CHROMA_CMD="%CHROMA_EXE%""
 :have_cmd
-
 if not exist "%ROOT%\data\logs" mkdir "%ROOT%\data\logs"
 if not exist "%CHROMA_DATA%" mkdir "%CHROMA_DATA%"
 
@@ -61,9 +63,13 @@ exit /b 0
 echo [START] Game ChromaDB on %CHROMA_HOST%:%CHROMA_PORT%...
 echo         Data: %CHROMA_DATA%
 echo         Log:  %CHROMA_LOG%
-REM Лог uvicorn пишет в stdout — перенаправляем в файл, иначе при падении нет ни следа.
-REM (прежний --log-path писал не всегда, и «мёртвая» Chroma не оставляла chroma.log вовсе)
-start "ChromaDB-Game" /MIN %CHROMA_CMD% run --path "%CHROMA_DATA%" --host %CHROMA_HOST% --port %CHROMA_PORT% --log-path "%CHROMA_LOG%" >> "%CHROMA_LOG%" 2>&1
+REM ── Запуск в фоне ───────────────────────────────────────────────────────
+REM ⚠ НЕ добавляй сюда `>> "%CHROMA_LOG%" 2>&1` и не оборачивай в `cmd /c ...`:
+REM на этой машине ЛЮБОЙ вариант `start` с перенаправлением потока вешает сам bat
+REM (он ждёт закрытия файла), и Chroma не поднимается — игрок видел «failed to
+REM start after 30s, HTTP=000», а chroma.log оставался пустым. Проверено.
+REM Chroma пишет свой лог сама — через --log-path (это её штатный параметр).
+start "ChromaDB-Game" /MIN %CHROMA_CMD% run --path "%CHROMA_DATA%" --host %CHROMA_HOST% --port %CHROMA_PORT% --log-path "%CHROMA_LOG%"
 
 set count=0
 :wait_loop

@@ -62,12 +62,16 @@ def check_bat(path: Path) -> list[str]:
         if hits:
             errs.append(f"{name}: зашит абсолютный путь к python {hits} — на другой машине "
                         f"нужен PY/GAME_PYTHON из окружения, иначе 'python' из PATH (D13)")
-        if not re.search(r'if\s+"?%\w+%"?\s*==\s*""', text):
+        if not re.search(r'if\s+"?%\w+%"?\s*==\s*""', text) and "set \"GAME_PYTHON=python\"" not in text:
             errs.append(f"{name}: нет значения по умолчанию для интерпретатора "
-                        f'(ожидаем `if "%PY%"=="" set "PY=python"`)')
-        if not re.search(r'"?%(?:PY|GAME_PYTHON)%"?\s+-V', text):
-            errs.append(f"{name}: интерпретатор не проверяется запуском `-V` "
-                        f"(`if exist` путь в PATH не ловит)")
+                        f'(ожидаем `if "%PY%"=="" set "PY=python"` или поиск кандидатов)')
+        # Интерпретатор обязан ПРОВЕРЯТЬСЯ запуском. `-V` или `-c "import sys"` — оба
+        # доказывают, что это настоящий Python: в PATH часто стоит заглушка Microsoft Store,
+        # которая печатает «Python was not found», и без проверки лаунчер уходил дальше
+        # (сессия 83: «запуск не работает», а виновата была заглушка Store).
+        if not re.search(r'%(?:PY|GAME_PYTHON)%"?\s+-(?:V|c\s+")', text):
+            errs.append(f"{name}: интерпретатор не проверяется запуском "
+                        f"(`if exist` путь в PATH не ловит, а заглушка Store молча падает)")
     return errs
 
 
